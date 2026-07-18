@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>InkMarshal — Startup problem</title>
+    <style>
+      :root { color-scheme: light dark; }
+      html, body { margin: 0; width: 100%; height: 100%; }
+      body {
+        display: grid;
+        place-items: center;
+        box-sizing: border-box;
+        padding: 28px;
+        background: #f7f1e3;
+        color: #2d2218;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(100%, 620px);
+        border: 1px solid #dbcba9;
+        background: #fffaf0;
+        box-shadow: 0 18px 55px rgba(54, 39, 20, 0.16);
+        padding: 30px;
+      }
+      .eyebrow { color: #9a6d25; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      h1 { margin: 8px 0 0; font-family: Georgia, serif; font-size: 25px; line-height: 1.25; }
+      p { margin: 12px 0 0; color: #6f604d; font-size: 14px; line-height: 1.6; }
+      .actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
+      button {
+        appearance: none;
+        border: 1px solid #b8852f;
+        background: transparent;
+        color: #6a4916;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 650;
+        padding: 9px 15px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.primary { background: #b77a22; color: #fff; }
+      button:hover { filter: brightness(.96); }
+      button[disabled] { opacity: .55; cursor: default; }
+      details { margin-top: 20px; border-top: 1px solid #e4d7bd; padding-top: 14px; }
+      summary { cursor: pointer; color: #6f604d; font-size: 13px; font-weight: 600; }
+      pre {
+        margin: 12px 0 0;
+        max-height: 210px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid #e3d6ba;
+        background: #f2ead8;
+        padding: 12px 14px;
+        color: #5a4a36;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #feedback { min-height: 18px; margin-top: 10px; font-size: 12px; color: #846124; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #17130f; color: #f3e9d8; }
+        main { background: #211b15; border-color: #4d3d29; box-shadow: 0 18px 55px #0008; }
+        p, summary { color: #c2b39f; }
+        button { color: #edc986; border-color: #8f672d; }
+        button.primary { color: #17130f; background: #d5a34f; }
+        details { border-color: #4d3d29; }
+        pre { background: #18130f; border-color: #4d3d29; color: #d9cbb8; }
+        #feedback { color: #d5a34f; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow" id="eyebrow">LOCAL STUDIO</div>
+      <h1 id="title">InkMarshal could not start</h1>
+      <p id="description">Your writing remains on this Mac. Retry the local studio, or install the latest verified InkMarshal release.</p>
+      <div class="actions">
+        <button class="primary" id="retry" type="button">Retry</button>
+        <button id="download" type="button">Download verified release</button>
+        <button id="copy" type="button">Copy diagnostics</button>
+      </div>
+      <div id="feedback" role="status" aria-live="polite"></div>
+      <details>
+        <summary id="details-label">Technical details</summary>
+        <pre id="message">Unknown error.</pre>
+      </details>
+    </main>
+    <script>
+      (function () {
+        "use strict";
+        var DOWNLOAD_URL = "https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg";
+        var copy = {
+          en: {
+            pageTitle: "InkMarshal — Startup problem", eyebrow: "LOCAL STUDIO", title: "InkMarshal could not start",
+            description: "Your writing remains on this Mac. Retry the local studio, or install the latest verified InkMarshal release.",
+            retry: "Retry", retrying: "Retrying…", download: "Download verified release", copy: "Copy diagnostics",
+            details: "Technical details", copied: "Diagnostics copied.", copyFailed: "Could not copy diagnostics.", openFailed: "Could not open the download page.", retryFailed: "Retry failed: "
+          },
+          "zh-CN": {
+            pageTitle: "InkMarshal — 启动问题", eyebrow: "本地工作室", title: "InkMarshal 无法启动",
+            description: "你的稿件仍安全保存在这台 Mac 上。请重试本地工作室，或安装最新的已验证版本。",
+            retry: "重试", retrying: "正在重试…", download: "下载已验证版本", copy: "复制诊断信息",
+            details: "技术详情", copied: "诊断信息已复制。", copyFailed: "无法复制诊断信息。", openFailed: "无法打开下载页面。", retryFailed: "重试失败："
+          },
+          "zh-TW": {
+            pageTitle: "InkMarshal — 啟動問題", eyebrow: "本機工作室", title: "InkMarshal 無法啟動",
+            description: "你的稿件仍安全保存在這台 Mac 上。請重試本機工作室，或安裝最新的已驗證版本。",
+            retry: "重試", retrying: "正在重試…", download: "下載已驗證版本", copy: "複製診斷資訊",
+            details: "技術詳情", copied: "診斷資訊已複製。", copyFailed: "無法複製診斷資訊。", openFailed: "無法開啟下載頁面。", retryFailed: "重試失敗："
+          }
+        };
+        function normalizeLocale(value) {
+          var normalized = String(value || "").replace(/_/g, "-").toLowerCase();
+          if (normalized.indexOf("zh") !== 0) return "en";
+          if (normalized.indexOf("hant") !== -1 || /-(tw|hk|mo)(-|$)/.test(normalized)) return "zh-TW";
+          return "zh-CN";
+        }
+        var params = new URLSearchParams(window.location.search);
+        var preferredLocale = params.get("locale") || (navigator.languages && navigator.languages[0]) || navigator.language;
+        var locale = normalizeLocale(preferredLocale);
+        var text = copy[locale];
+        document.documentElement.lang = locale;
+        document.title = text.pageTitle;
+        document.getElementById("eyebrow").textContent = text.eyebrow;
+        document.getElementById("title").textContent = text.title;
+        document.getElementById("description").textContent = text.description;
+        document.getElementById("retry").textContent = text.retry;
+        document.getElementById("download").textContent = text.download;
+        document.getElementById("copy").textContent = text.copy;
+        document.getElementById("details-label").textContent = text.details;
+
+        var message = params.get("msg") || "Unknown error.";
+        var diagnostics = "InkMarshal startup failure\n" + message + "\n\n" + navigator.userAgent;
+        document.getElementById("message").textContent = diagnostics;
+        var feedback = document.getElementById("feedback");
+        var retry = document.getElementById("retry");
+
+        function invoke(command, args) {
+          var internals = window.__TAURI_INTERNALS__;
+          if (internals && typeof internals.invoke === "function") return internals.invoke(command, args || {});
+          if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === "function") {
+            return window.__TAURI__.core.invoke(command, args || {});
+          }
+          return Promise.reject(new Error("Tauri bridge unavailable"));
+        }
+
+        retry.addEventListener("click", function () {
+          retry.disabled = true;
+          retry.textContent = text.retrying;
+          feedback.textContent = "";
+          Promise.resolve(invoke("retry_runtime", {})).catch(function (error) {
+            retry.disabled = false;
+            retry.textContent = text.retry;
+            feedback.textContent = text.retryFailed + (error && error.message ? error.message : String(error));
+          });
+        });
+
+        document.getElementById("download").addEventListener("click", function () {
+          feedback.textContent = "";
+          Promise.resolve(invoke("plugin:shell|open", { path: DOWNLOAD_URL, with: null })).catch(function () {
+            feedback.textContent = text.openFailed;
+          });
+        });
+
+        document.getElementById("copy").addEventListener("click", function () {
+          var done = navigator.clipboard && navigator.clipboard.writeText
+            ? navigator.clipboard.writeText(diagnostics)
+            : Promise.reject(new Error("Clipboard API unavailable"));
+          Promise.resolve(done).then(function () {
+            feedback.textContent = text.copied;
+          }).catch(function () {
+            var area = document.createElement("textarea");
+            area.value = diagnostics;
+            document.body.appendChild(area);
+            area.select();
+            var ok = document.execCommand("copy");
+            area.remove();
+            feedback.textContent = ok ? text.copied : text.copyFailed;
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>

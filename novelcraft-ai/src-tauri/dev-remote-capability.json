@@ -1,0 +1,28 @@
+{
+  "$schema": "./gen/schemas/desktop-schema.json",
+  "identifier": "dev-remote-1420",
+  "description": "DEV ONLY — never bundled into release. Grants the main window the same IPC permission sets as capabilities/default.json, but for the Vite/Next dev-server origin http://127.0.0.1:1420 (tauri.conf devUrl). This file lives OUTSIDE capabilities/ so Tauri never embeds it; it is injected at runtime under #[cfg(debug_assertions)] via app.add_capability() in src/lib.rs run() setup. Release artifacts trust only 1421/1422.",
+  "windows": [
+    "main"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:1420"
+    ]
+  },
+  "permissions": [
+    "core:app:default",
+    "core:event:default",
+    "core:path:default",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:webview:default",
+    "default",
+    "secrets",
+    "inference",
+    "models",
+    "vault-write",
+    "dialog:allow-open",
+    "shell:allow-open"
+  ]
+}

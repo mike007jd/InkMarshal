@@ -1,0 +1,32 @@
+'use client';
+
+import * as React from 'react';
+import { Tooltip as TooltipPrimitive } from 'radix-ui';
+import { cn } from '@/lib/utils';
+
+const TooltipProvider = TooltipPrimitive.Provider;
+const Tooltip = TooltipPrimitive.Root;
+const TooltipTrigger = TooltipPrimitive.Trigger;
+
+const TooltipContent = React.forwardRef<
+  React.ElementRef<typeof TooltipPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Content>
+>(({ className, sideOffset = 4, ...props }, ref) => (
+  <TooltipPrimitive.Portal>
+    <TooltipPrimitive.Content
+      ref={ref}
+      sideOffset={sideOffset}
+      className={cn(
+        'z-50 overflow-hidden rounded-md',
+        'bg-book-bg-card border border-book-border shadow-card',
+        'px-3 py-1.5 text-xs text-book-ink-primary',
+        'data-[state=instant-open]:animate-menu-in data-[state=delayed-open]:animate-menu-in data-[state=closed]:animate-menu-out',
+        className,
+      )}
+      {...props}
+    />
+  </TooltipPrimitive.Portal>
+));
+TooltipContent.displayName = TooltipPrimitive.Content.displayName;
+
+export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider };

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened Runtime entitlements for the Developer ID (notarized, non-sandboxed)
+  macOS build. Referenced from tauri.conf.json (bundle.macOS.entitlements);
+  hardenedRuntime is true by default in Tauri v2.
+
+  The release builder signs every bundled Mach-O with the same Developer ID
+  Team ID before signing this app. The app process itself does not JIT and must
+  not carry runtime exceptions. The separately spawned Node runtime receives
+  its own minimal allow-jit entitlement from node-entitlements.plist.
+
+  We deliberately do NOT enable App Sandbox or keychain-access-groups: this is a
+  Developer ID app, not a sandboxed App Store app, so it reaches the system
+  keychain (BYOK secret store) without a keychain entitlement, and sandboxing
+  would block the loopback servers and local model/data directories.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

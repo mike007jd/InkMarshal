@@ -1,0 +1,698 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* Tokens below intentionally forward to :root --book-* custom properties via
+     var(). This is deliberate: the .dark overrides of --book-* flow through at
+     runtime so every Tailwind utility (bg-book-*, shadow-book, etc.) is
+     dark-mode aware. Values are NOT statically known to the TW compiler. */
+
+  /* ── Fonts (existing) ── */
+  --font-sans: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-serif), ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-hand: var(--font-hand), cursive;
+
+  /* ── Color tokens — map every --book-* :root var ── */
+  /* Backgrounds */
+  --color-book-bg-primary:   var(--book-bg-primary);
+  --color-book-bg-secondary: var(--book-bg-secondary);
+  --color-book-bg-card:      var(--book-bg-card);
+  --color-book-bg-sidebar:   var(--book-bg-sidebar);
+  /* Ink */
+  --color-book-ink-primary:   var(--book-ink-primary);
+  --color-book-ink-secondary: var(--book-ink-secondary);
+  --color-book-ink-muted:     var(--book-ink-muted);
+  /* Gold */
+  --color-book-gold:       var(--book-gold);
+  --color-book-gold-dark:  var(--book-gold-dark);
+  --color-book-gold-light: var(--book-gold-light);
+  /* Accent — book primary accent (= gold); dark-aware via --book-gold override */
+  --color-book-accent:     var(--book-accent);
+  /* Borders */
+  --color-book-border:       var(--book-border);
+  --color-book-border-light: var(--book-border-light);
+  /* Semantic status */
+  --color-book-danger:         var(--book-danger);
+  --color-book-danger-light:   var(--book-danger-light);
+  --color-book-danger-border:  var(--book-danger-border);
+  --color-book-warning:        var(--book-warning);
+  --color-book-warning-light:  var(--book-warning-light);
+  --color-book-warning-border: var(--book-warning-border);
+  --color-book-success:        var(--book-success);
+  --color-book-success-light:  var(--book-success-light);
+  --color-book-success-border: var(--book-success-border);
+  --color-book-info:           var(--book-info);
+  --color-book-info-light:     var(--book-info-light);
+  --color-book-info-border:    var(--book-info-border);
+  --color-book-violet:         var(--book-violet);
+  --color-book-violet-light:   var(--book-violet-light);
+  /* Foreground for text/icons sitting on a --book-gold / --book-accent fill.
+     Dark mode flips to dark ink because the dark-theme gold is too light for white. */
+  --color-book-on-gold:        var(--book-on-gold);
+  /* Stage badges */
+  --color-book-stage-completed: var(--book-stage-completed);
+  --color-book-stage-writing:   var(--book-stage-writing);
+  --color-book-stage-ready:     var(--book-stage-ready);
+  --color-book-stage-default:   var(--book-stage-default);
+  /* Seal */
+  --color-book-seal: var(--book-seal);
+
+  /* ── shadcn bridge aliases ── */
+  --color-background:        var(--book-bg-primary);
+  --color-foreground:        var(--book-ink-primary);
+  --color-primary:           var(--book-gold);
+  --color-primary-foreground: var(--book-bg-card);
+  --color-muted:             var(--book-bg-secondary);
+  --color-muted-foreground:  var(--book-ink-muted);
+  --color-border:            var(--book-border);
+  --color-input:             var(--book-border);
+  --color-ring:              var(--book-gold);
+  --color-card:              var(--book-bg-card);
+  --color-card-foreground:   var(--book-ink-primary);
+  --color-popover:           var(--book-bg-card);
+  --color-popover-foreground: var(--book-ink-primary);
+  --color-accent:            var(--book-bg-secondary);
+  --color-accent-foreground: var(--book-ink-primary);
+  --color-secondary:           var(--book-bg-secondary);
+  --color-secondary-foreground: var(--book-ink-primary);
+  --color-destructive:       var(--book-danger);
+  --color-destructive-foreground: var(--book-on-gold);
+
+  /* ── Type scale additions ── */
+  /* Accessibility floor: no UI text below 12px (spec/DESIGN_RULES.md §3).
+     These tokens used to be 10px/11px; hierarchy now comes from weight,
+     color, caps, and tracking — not sub-12px sizing. */
+  --text-2xs: 12px;
+  --text-2xs--line-height: 1.4;
+  --text-xs-tight: 12px;
+  --text-sm-tight: 13px;
+  --text-chat: 15px;
+  --text-chat--line-height: 1.625;
+  --text-prose-ui: 16px;
+  --text-question: 17px;
+  --text-note: 12px;
+  /* Serif chapter-title display size — one size across reading view,
+     flipbook page and editor header so the manuscript reads as one book. */
+  --text-chapter-title: 26px;
+  --text-chapter-title--line-height: 1.25;
+
+  /* ── Letter-spacing tokens ── */
+  /* Exactly two letter-spacing voices: `tracking-label` for all-caps UI
+     captions (panel headers, badges, list section titles) and
+     `tracking-display` for literary display caps (chapter ornaments, cover
+     headers). Arbitrary bracketed letter-spacing values are banned by
+     design-system-contract.static.test.ts. */
+  --tracking-label: 0.15em;
+  --tracking-display: 0.3em;
+
+  /* ── Radius ── */
+  --radius: 0.5rem;
+  --radius-sharp: 2px;
+  --radius-md: 4px;
+
+  /* ── Semantic shadows ── */
+  /* Values byte-equivalent to .paper-card hardcoded rgba(0,0,0,.1) stacks */
+  --shadow-card:       0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+  --shadow-card-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  --shadow-overlay:    0 20px 25px -5px var(--book-shadow), 0 8px 10px -6px var(--book-shadow);
+  --shadow-seal:       0 2px 8px var(--book-shadow-strong);
+  --shadow-book:       var(--book-shadow);
+  --shadow-book-strong: var(--book-shadow-strong);
+  --shadow-focus-subtle: 0 0 0 1px var(--book-shadow);
+
+  /* ── Motion foundations ── */
+  --transition-duration-fast: 120ms;
+  --transition-duration-base: 180ms;
+  --transition-duration-slow: 240ms;
+  --transition-duration-progress: 500ms;
+
+  --ease-*: initial;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-enter: cubic-bezier(0, 0, 0.2, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+  --default-transition-duration: 120ms;
+  --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --motion-shift-menu: 4px;
+  --motion-shift-reveal: 8px;
+  --motion-scale-overlay: 0.98;
+
+  /* ── Semantic motion presets ── */
+  --animate-overlay-in: overlay-in var(--transition-duration-base) var(--ease-enter) both;
+  --animate-overlay-out: overlay-out var(--transition-duration-fast) var(--ease-exit) both;
+  --animate-pop-in: pop-in var(--transition-duration-slow) var(--ease-enter) both;
+  --animate-pop-out: pop-out var(--transition-duration-base) var(--ease-exit) both;
+  --animate-menu-in: menu-in var(--transition-duration-fast) var(--ease-enter) both;
+  --animate-menu-out: menu-out var(--transition-duration-fast) var(--ease-exit) both;
+  --animate-sheet-in: sheet-in var(--transition-duration-slow) var(--ease-enter) both;
+  --animate-sheet-out: sheet-out var(--transition-duration-base) var(--ease-exit) both;
+  --animate-toast-in: toast-in var(--transition-duration-base) var(--ease-enter) both;
+  --animate-toast-out: toast-out var(--transition-duration-fast) var(--ease-exit) forwards;
+  --animate-reveal: reveal var(--transition-duration-base) var(--ease-enter) both;
+}
+
+@utility transition-feedback {
+  transition-property: color, background-color, border-color, box-shadow, opacity;
+  transition-duration: var(--transition-duration-fast);
+  transition-timing-function: var(--ease-standard);
+}
+
+@utility transition-toggle {
+  transition-property: transform, opacity;
+  transition-duration: var(--transition-duration-base);
+  transition-timing-function: var(--ease-standard);
+}
+
+@utility transition-layout {
+  transition-property: transform, width, grid-template-columns;
+  transition-duration: var(--transition-duration-slow);
+  transition-timing-function: var(--ease-standard);
+}
+
+@utility transition-progress {
+  transition-property: width, stroke-dashoffset;
+  transition-duration: var(--transition-duration-progress);
+  transition-timing-function: var(--ease-standard);
+}
+
+@utility motion-essential {
+  --motion-essential: 1;
+}
+
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(var(--motion-scale-overlay));
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes pop-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(var(--motion-scale-overlay));
+  }
+}
+
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translate(var(--motion-menu-x, 0), var(--motion-menu-y, 0)) scale(var(--motion-scale-overlay));
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes menu-out {
+  from {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(var(--motion-menu-x, 0), var(--motion-menu-y, 0)) scale(var(--motion-scale-overlay));
+  }
+}
+
+@keyframes sheet-in {
+  from { transform: translate(var(--motion-sheet-x, 0), var(--motion-sheet-y, 0)); }
+  to { transform: translate(0, 0); }
+}
+
+@keyframes sheet-out {
+  from { transform: translate(0, 0); }
+  to { transform: translate(var(--motion-sheet-x, 0), var(--motion-sheet-y, 0)); }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--motion-shift-reveal));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(var(--motion-shift-reveal));
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(var(--motion-shift-menu));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+[data-side="bottom"] {
+  --motion-menu-x: 0;
+  --motion-menu-y: calc(var(--motion-shift-menu) * -1);
+}
+
+[data-side="top"] {
+  --motion-menu-x: 0;
+  --motion-menu-y: var(--motion-shift-menu);
+}
+
+[data-side="left"] {
+  --motion-menu-x: var(--motion-shift-menu);
+  --motion-menu-y: 0;
+}
+
+[data-side="right"] {
+  --motion-menu-x: calc(var(--motion-shift-menu) * -1);
+  --motion-menu-y: 0;
+}
+
+[data-motion-side="right"] {
+  --motion-sheet-x: 100%;
+  --motion-sheet-y: 0;
+}
+
+[data-motion-side="left"] {
+  --motion-sheet-x: -100%;
+  --motion-sheet-y: 0;
+}
+
+[data-motion-side="top"] {
+  --motion-sheet-x: 0;
+  --motion-sheet-y: -100%;
+}
+
+[data-motion-side="bottom"] {
+  --motion-sheet-x: 0;
+  --motion-sheet-y: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *:not(.motion-essential), ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Dark mode overrides */
+.dark {
+  color-scheme: dark;
+}
+
+/* ===== Book Style Color System — neutral editorial paper ===== */
+:root {
+  /* Backgrounds — paper-like without the yellow cast */
+  --book-bg-primary: #faf9f5;
+  --book-bg-secondary: #f1f0ea;
+  --book-bg-card: #fffefb;
+  --book-bg-sidebar: #efeee9;
+
+  /* Ink colors — warm charcoal, not sepia-heavy */
+  --book-ink-primary: #25231f;
+  --book-ink-secondary: #4a463d;
+  --book-ink-muted: #7d776b;
+
+  /* Gold accents — restrained brass */
+  --book-gold: #806928;
+  --book-gold-dark: #604c18;
+  --book-gold-light: #aa914d;
+
+  /* Primary accent — aliases the book gold accent; dark-aware: --book-gold self-overrides in .dark, so this resolves to the dark gold (#d4a843) without restatement */
+  --book-accent: var(--book-gold);
+
+  /* Borders — linen gray with a small warm note */
+  --book-border: #dedbd0;
+  --book-border-light: #ebe8dd;
+
+  /* Shadows — neutral, less tea-stained */
+  --book-shadow: rgba(48, 42, 31, 0.08);
+  --book-shadow-strong: rgba(48, 42, 31, 0.16);
+
+  /* Semantic status colors — readable on neutral paper */
+  --book-danger: #b03a26;
+  --book-danger-light: #f2ddd5;
+  --book-danger-border: #d9aaa0;
+  --book-warning: #755d28;
+  --book-warning-light: #f1eee5;
+  --book-warning-border: #d8cfb8;
+  --book-success: #4a6b30;
+  --book-success-light: #dfe8d1;
+  --book-success-border: #b8c99f;
+  --book-info: #2c5a8a;
+  --book-info-light: #dde6f0;
+  --book-info-border: #a9c2dc;
+  /* Worldbuilding / style-reference accent (replaces the bare purple palette) */
+  --book-violet: #6d28d9;
+  --book-violet-light: #ede9fe;
+
+  /* Text/icon color on a gold/accent fill (light-theme brass gold → near-white) */
+  --book-on-gold: #fffefb;
+
+  /* Stage badge colors — muted for warm bg */
+  --book-stage-completed: #4a6b30;
+  --book-stage-writing: #a06a14;
+  --book-stage-ready: #2c5a8a;
+  --book-stage-default: #8a7e64;
+
+  /* Seal stamp */
+  --book-seal: #a83320;
+}
+
+.dark {
+  /* Ink study backgrounds */
+  --book-bg-primary: #0f1419;
+  --book-bg-secondary: #161b22;
+  --book-bg-card: #1c2128;
+  --book-bg-sidebar: #0b0f14;
+
+  /* Warm white text */
+  --book-ink-primary: #e8e0d0;
+  --book-ink-secondary: #b0a898;
+  --book-ink-muted: #6e7681;
+
+  /* Gold (unchanged) */
+  --book-gold: #d4a843;
+  --book-gold-dark: #b8942e;
+  --book-gold-light: #e8c35a;
+
+  /* Blue-gray borders */
+  --book-border: #2a3040;
+  --book-border-light: #353d4a;
+
+  /* Cool blue shadows */
+  --book-shadow: rgba(0, 8, 22, 0.25);
+  --book-shadow-strong: rgba(0, 8, 22, 0.5);
+
+  /* Semantic status colors (dark) */
+  --book-danger: #f87171;
+  --book-danger-light: rgba(220, 38, 38, 0.15);
+  --book-danger-border: rgba(248, 113, 113, 0.3);
+  --book-warning: #fbbf24;
+  --book-warning-light: rgba(217, 119, 6, 0.12);
+  --book-warning-border: rgba(251, 191, 36, 0.3);
+  --book-success: #4ade80;
+  --book-success-light: rgba(22, 163, 74, 0.15);
+  --book-success-border: rgba(74, 222, 128, 0.3);
+  --book-info: #60a5fa;
+  --book-info-light: rgba(37, 99, 235, 0.15);
+  --book-info-border: rgba(96, 165, 250, 0.3);
+  --book-violet: #a78bfa;
+  --book-violet-light: rgba(167, 139, 250, 0.15);
+
+  /* Dark-theme gold is bright — text on it must be dark ink, not white */
+  --book-on-gold: #1c1606;
+
+  /* Stage badge colors (dark) */
+  --book-stage-completed: #4ade80;
+  --book-stage-writing: #fbbf24;
+  --book-stage-ready: #60a5fa;
+  --book-stage-default: #6e7681;
+
+  /* Seal stamp (dark) */
+  --book-seal: #f87171;
+}
+
+/* ===== Book Texture Utilities ===== */
+
+/* Parchment: very light fiber noise — just enough to read as paper, not aged. */
+.book-texture-parchment {
+  background-color: var(--book-bg-primary);
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.30  0 0 0 0 0.28  0 0 0 0 0.22  0 0 0 0.02 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 240px 240px;
+  background-blend-mode: multiply;
+  position: relative;
+}
+
+/* Leather: used for dark mode — keep simple, no parchment */
+.book-texture-leather {
+  background-color: var(--book-bg-primary);
+}
+
+.dark .book-texture-parchment {
+  background-image: none;
+  background-color: var(--book-bg-primary);
+}
+
+.book-btn {
+  background-color: var(--book-bg-card);
+  color: var(--book-ink-primary);
+  border: 1px solid var(--book-border);
+  border-radius: 4px;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  transition: border-color var(--transition-duration-fast) var(--ease-standard),
+    box-shadow var(--transition-duration-fast) var(--ease-standard);
+}
+
+.book-btn:hover {
+  border-color: var(--book-gold);
+  box-shadow: 0 0 0 1px var(--book-gold-light);
+}
+
+.book-ink-border {
+  border-left: 2px solid var(--book-ink-muted);
+  padding-left: 0.75rem;
+}
+
+.book-input {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--book-border);
+  color: var(--book-ink-primary);
+  padding: 0.5rem 0;
+  outline: none;
+  transition: border-color var(--transition-duration-fast) var(--ease-standard);
+}
+
+.book-input:focus {
+  border-bottom-color: var(--book-gold);
+}
+
+.book-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--book-ink-muted);
+}
+
+.book-divider::before,
+.book-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--book-border);
+}
+
+.book-progress-bar {
+  background-color: var(--book-gold);
+}
+
+.book-ribbon {
+  position: relative;
+}
+
+.book-ribbon::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 1.5rem;
+  width: 2px;
+  height: 2rem;
+  background: var(--book-gold);
+  border-radius: 0 0 1px 1px;
+  box-shadow: 0 2px 4px var(--book-shadow);
+}
+
+.font-hand {
+  font-family: var(--font-hand), cursive;
+}
+
+/* ===== Flip hint hand animation ===== */
+@keyframes flipHintSwipe {
+  0%, 100% {
+    opacity: 0.72;
+    transform: translateX(0) scale(1);
+  }
+  45% {
+    opacity: 1;
+    transform: translateX(-56px) scale(0.96);
+  }
+}
+
+@keyframes flipHintTrail {
+  0%, 100% {
+    opacity: 0.28;
+    transform: translateY(-50%) scaleX(0.5);
+    transform-origin: right center;
+  }
+  45% {
+    opacity: 0.9;
+    transform: translateY(-50%) scaleX(1);
+    transform-origin: right center;
+  }
+}
+
+.flip-hint-swipe {
+  animation: flipHintSwipe 1.8s var(--ease-standard) infinite;
+}
+
+.flip-hint-trail {
+  animation: flipHintTrail 1.8s var(--ease-standard) infinite;
+}
+
+/* react-pageflip book styling */
+.manuscript-flipbook {
+  border-radius: 0.5rem;
+  overflow: visible;
+}
+
+.manuscript-flipbook .stf__wrapper {
+  border-radius: 0.5rem;
+}
+
+.manuscript-flipbook .stf__item {
+  border: 1px solid var(--book-border-light);
+}
+
+/* Book pages — barely-there paper grain on the card colour. */
+.manuscript-page {
+  position: relative;
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='p'><feTurbulence type='fractalNoise' baseFrequency='1.0' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.42  0 0 0 0 0.30  0 0 0 0 0.13  0 0 0 0.04 0'/></filter><rect width='100%' height='100%' filter='url(%23p)'/></svg>");
+  background-size: 200px 200px;
+  background-blend-mode: multiply;
+}
+
+.dark .manuscript-page {
+  background-image: none;
+}
+
+/* ===== Paper Card — 1.0 "pinned to wall" aesthetic ===== */
+.paper-card {
+  background: var(--book-bg-card);
+  border: 1px solid var(--book-border);
+  border-radius: 2px;
+  box-shadow: var(--shadow-card);
+  padding: 1.25rem 1.5rem;
+  position: relative;
+  overflow: visible;
+  transition: box-shadow var(--transition-duration-fast) var(--ease-standard);
+}
+
+.paper-card:hover {
+  box-shadow: var(--shadow-card-hover);
+}
+
+/* Accent color variable — used by decorations */
+.paper-card-character { --card-accent-color: var(--book-gold-dark); }
+/* World uses the violet "worldbuilding" accent (see --book-violet) so it stays
+   distinct from plot's blue on the shared timeline axis — both were --book-info,
+   collapsing plot and world into one indistinguishable colour. */
+.paper-card-world { --card-accent-color: var(--book-violet); }
+.paper-card-timeline { --card-accent-color: var(--book-success); }
+.paper-card-style { --card-accent-color: var(--book-violet); }
+.paper-card-outline { --card-accent-color: var(--book-gold); }
+.paper-card-plot { --card-accent-color: var(--book-info); }
+.paper-card-backstory { --card-accent-color: var(--book-ink-muted); }
+
+/* Outline status accents */
+.paper-card-planned { --card-accent-color: var(--book-ink-muted); }
+.paper-card-drafted { --card-accent-color: var(--book-gold); }
+.paper-card-revised { --card-accent-color: var(--book-info); }
+.paper-card-final { --card-accent-color: var(--book-success); }
+
+/* ===== Custom Scrollbar ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--book-bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--book-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--book-gold);
+}
+
+/* Hide scrollbar but keep scrollable */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
+/* ===== Manuscript persistent highlight ===== */
+.manuscript-highlight {
+  background: rgba(184, 148, 46, 0.15);
+  border-bottom: 2px solid var(--book-gold);
+  border-radius: 2px;
+  transition: background var(--transition-duration-fast) var(--ease-standard);
+}
+
+/* ===== Selection ===== */
+::selection {
+  background: rgba(37, 99, 235, 0.15);
+  color: var(--book-ink-primary);
+}
+
+/* ===== Manuscript prose (W3-4) =====
+ * Components opt in via `className="manuscript-prose"`. Variables are written
+ * to <html> by `applySettingsToDocument()` + the inline blocking script in
+ * `app/layout.tsx`, so changes from SettingsPanel propagate without a re-render
+ * and the first paint already has the right font size / indent / spacing.
+ */
+.manuscript-prose {
+  font-size: var(--manuscript-font-size, 17px);
+  line-height: var(--manuscript-line-height, 1.75);
+  /* Literary measure cap (spec/DESIGN_RULES.md §3.4/§5/§9.4: max reading width
+     65ch at every breakpoint). Expressed in ch so it scales with the
+     user-adjustable --manuscript-font-size; centered within its (wider)
+     max-w-2xl column. Single source of truth for reading + editing + flipbook. */
+  max-width: 65ch;
+  margin-inline: auto;
+}
+
+.manuscript-prose > p,
+.manuscript-prose p.manuscript-paragraph {
+  text-indent: var(--manuscript-paragraph-indent, 0);
+  margin-bottom: var(--manuscript-paragraph-spacing, 0.4em);
+}

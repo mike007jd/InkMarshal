@@ -1,0 +1,42 @@
+"$schema" = "schemas/schema.json"
+
+# Phase 4 — the app-command surface is split into risk-grouped permission sets so
+# an audit sees the high-risk commands at a glance (keychain in secrets.toml,
+# process spawn in inference.toml, downloads/import in models.toml, file mutation
+# in vault-write.toml). The main window's capability loads ALL of them — Tauri's
+# window ACL is all-or-nothing per window, so this is audit/organisation clarity
+# + a seam for future restricted windows, NOT a runtime gate on the main window.
+#
+# This `default` set holds the low-risk surface: read-only status/probe/list,
+# user-confirmed export, locale, and the keychain/vault read paths.
+[default]
+description = "Low-risk app commands: status/probe/list, export, locale, read paths."
+permissions = [
+  "allow-desktop-status",
+  "allow-probe-default-runtimes",
+  "allow-retry-runtime",
+  "allow-write-app-locale",
+  "allow-save-export-file",
+  "allow-reveal-export-file",
+  "allow-read-local-file",
+  "allow-keychain-status",
+  "allow-runtime-health",
+  "allow-ollama-list-tags",
+  "allow-hf-search-models",
+  "allow-hf-list-gguf-files",
+  "allow-hf-get-endpoint",
+  "allow-cancel-download",
+  "allow-model-dir-free-bytes",
+  "allow-list-installed-local-models",
+  "allow-reveal-local-model",
+  "allow-engine-status",
+  "allow-engine-estimate-footprint",
+  "allow-engine-resource-budget",
+  "allow-engine-log-tail",
+  "allow-vault-walk",
+  "allow-vault-read-file",
+  "allow-vault-watch-start",
+  "allow-vault-watch-stop",
+  "allow-vault-reveal-in-finder",
+  "allow-vault-reachable",
+]

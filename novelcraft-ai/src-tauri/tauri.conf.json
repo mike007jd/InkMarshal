@@ -1,0 +1,77 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "InkMarshal",
+  "version": "0.1.0",
+  "identifier": "co.inkmarshal.studio",
+  "build": {
+    "frontendDist": "fallback",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "pnpm dev:desktop-web",
+    "beforeBuildCommand": "pnpm clean:desktop-build && pnpm fetch-engines && pnpm build:desktop-web && pnpm smoke:desktop"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "InkMarshal",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1040,
+        "minHeight": 720,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 18, "y": 18 }
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'wasm-unsafe-eval'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: https://*.hf.co https://huggingface.co https://*.githubusercontent.com",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://huggingface.co https://*.hf.co https://cdn-lfs*.hf.co",
+        "frame-src": "'none'",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'self'"
+      },
+      "dangerousDisableAssetCspModification": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": false,
+    "targets": ["app"],
+    "resources": {
+      "resources/next-server/": "next-server",
+      "resources/node/": "node",
+      "resources/engines/": "engines"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "entitlements": "entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5QTIzNzZDRjhDQTI2MDkKUldRSkpzcjRiRGVpS1Jab0pra2tGNFlPSTU1cXk3R2FiZmRsT1M2RjVDNVF5Y0w5b3kxaW9nUVgK",
+      "endpoints": [
+        "https://github.com/mike007jd/InkMarshal/releases/latest/download/latest.json"
+      ]
+    },
+    "shell": {
+      "open": "https://github\\.com/mike007jd/InkMarshal((/issues/new)?/?|/releases/latest/download/InkMarshal-mac-aarch64\\.dmg)"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+node_modules/
+.next/
+next-env.d.ts
+coverage/
+.worktrees/
+.playwright-mcp/
+.serena/
+.cargo-tools/
+.security-tools/
+output/
+artifacts/
+dist/release/
+.ui-audit/
+.superpowers/brainstorm/
+.DS_Store
+*.log
+*.tsbuildinfo
+.env*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+
+# Vendored engine binaries — fetched at build time via `pnpm fetch-engines`.
+# Keep the resource directory itself present for Tauri's fresh-clone build script.
+src-tauri/resources/engines/*
+!src-tauri/resources/engines/.gitkeep
+
+# Swift MLX server build artifacts (SwiftPM + xcodebuild derived data).
+# The package SOURCE (Package.swift, Sources/) IS committed.
+src-tauri/engines/mlx-server/.build/
+
+# Agent skills installed by `npx skills add` — generated from skills-lock.json
+.agents/
+.claude/skills/
+.vercel
+
+# Local Ralph run state.
+scripts/ralph/loop.json
+scripts/ralph/progress.txt
+scripts/ralph/.last-loop*
+scripts/ralph/archive/

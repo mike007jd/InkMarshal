@@ -1,0 +1,31 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the InkMarshal desktop shell. The bundled Next runtime in a PACKAGED desktop run is served from a FIXED 127.0.0.1 port candidate set (1421, then 1422 — see RUNTIME_PORT_CANDIDATES in src-tauri/src/lib.rs, which MUST stay in lockstep with the remote.urls below), so those exact local origins are allowed to use the window's IPC capabilities. The dev-server origin (127.0.0.1:1420) is deliberately NOT trusted here: it is injected at runtime only under #[cfg(debug_assertions)] from src-tauri/dev-remote-capability.json (see run() setup), so a release artifact never grants IPC to the dev port (AN-SEC-001). The runtime never falls back to an OS-random port, so no wildcard origin is needed. App-owned Tauri commands are exposed through risk-grouped permission sets (default = low-risk read/status/export; secrets = keychain; inference = engine process; models = downloads/import; vault-write = file mutation — see src-tauri/permissions/*.toml), all generated from src-tauri/build.rs and validated against generate_handler!. The main window loads every set (Tauri window ACL is all-or-nothing per window), so the split is audit/organisation clarity, not a runtime gate. Window navigation, model HTTP, model filesystem, and vault filesystem work are driven through Rust commands with their own validation. dialog:allow-open is required for native file/folder pickers. shell:allow-open is additionally constrained by tauri.conf.json plugins.shell.open to the product-owned GitHub help links; no shell execute/spawn is requested.",
+  "windows": [
+    "main"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:1421",
+      "http://127.0.0.1:1422"
+    ]
+  },
+  "permissions": [
+    "core:app:default",
+    "core:event:default",
+    "core:path:default",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:webview:default",
+    "default",
+    "secrets",
+    "inference",
+    "models",
+    "vault-write",
+    "dialog:allow-open",
+    "shell:allow-open",
+    "updater:default",
+    "process:allow-restart"
+  ]
+}

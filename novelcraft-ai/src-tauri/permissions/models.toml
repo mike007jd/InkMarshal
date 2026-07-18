@@ -1,0 +1,17 @@
+"$schema" = "schemas/schema.json"
+
+# Medium-risk: network + disk — multi-GB model downloads, local import/remove.
+[[set]]
+identifier = "models"
+description = "Model acquisition and local install/remove."
+permissions = [
+  "allow-ollama-pull",
+  "allow-hf-download-gguf",
+  "allow-hf-download-repo-snapshot",
+  "allow-hf-set-endpoint",
+  "allow-set-model-dir",
+  "allow-reset-model-dir",
+  "allow-reveal-model-dir",
+  "allow-import-local-model",
+  "allow-remove-installed-local-model",
+]

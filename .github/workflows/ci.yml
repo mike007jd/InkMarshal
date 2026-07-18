@@ -1,0 +1,92 @@
+# Pre-launch CI: enforce the complete quality gate on every push and pull request,
+# including pull requests from forks. Every job uses a fresh GitHub-hosted runner
+# and only the read-only GITHUB_TOKEN granted by the workflow permissions below.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: Web quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: novelcraft-ai
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.15.1
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: novelcraft-ai/.node-version
+          cache: pnpm
+          cache-dependency-path: novelcraft-ai/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: novelcraft-ai/src-tauri
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run Web quality gates
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+          pnpm verify:security
+          pnpm build
+
+  desktop:
+    name: Desktop Rust + macOS bundled boot smoke
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: novelcraft-ai/src-tauri
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.15.1
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: novelcraft-ai/.node-version
+          cache: pnpm
+          cache-dependency-path: novelcraft-ai/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: novelcraft-ai/src-tauri
+      # bundle.resources globs must resolve at build-script time; engines/ is
+      # fully gitignored (no .gitkeep) so recreate it on a fresh checkout.
+      - run: mkdir -p resources/engines
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Install dependencies
+        working-directory: novelcraft-ai
+        run: pnpm install --frozen-lockfile
+      - name: Build and smoke the macOS bundled runtime
+        working-directory: novelcraft-ai
+        run: |
+          pnpm build:desktop-web
+          pnpm smoke:desktop

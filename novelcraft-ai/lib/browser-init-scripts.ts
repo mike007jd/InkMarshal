@@ -1,0 +1,7 @@
+export const themeInitScriptContent = `(function(){try{var s=JSON.parse(localStorage.getItem('inkmarshal_settings')||'{}');var t=s.theme||'system';var d=t==='dark'||(t==='system'&&window.matchMedia('(prefers-color-scheme:dark)').matches);if(d)document.documentElement.classList.add('dark')}catch(e){}})()`;
+
+const localeNormalizerSnippet = `function n(v){try{v=decodeURIComponent(v||'')}catch(e){}if(v==='zh'||v==='zh-CN'||v==='zh-Hans')return'zh-CN';if(v==='zh-TW'||v==='zh-Hant'||v==='zh-HK')return'zh-TW';return'en'}`;
+
+export const localeInitScriptContent = `(function(){try{${localeNormalizerSnippet};var c=document.cookie.match(/(?:^|; )locale=([^;]*)/);document.documentElement.lang=n(c&&c[1])}catch(e){}})()`;
+
+export const manuscriptInitScriptContent = `(function(){try{${localeNormalizerSnippet};var s=JSON.parse(localStorage.getItem('inkmarshal_settings')||'{}');var c=document.cookie.match(/(?:^|; )locale=([^;]*)/);var locale=n(c&&c[1]);var isZh=locale==='zh-CN'||locale==='zh-TW';var fs={sm:'15px',md:'17px',lg:'19px'}[s.fontSize||'md']||'17px';var lh={compact:'1.5',normal:'1.75',relaxed:'2.0'}[s.lineSpacing||'normal']||'1.75';var indent=(typeof s.chineseTextIndent==='boolean'?s.chineseTextIndent:isZh);var st=document.documentElement.style;st.setProperty('--manuscript-font-size',fs);st.setProperty('--manuscript-line-height',lh);st.setProperty('--manuscript-paragraph-indent',indent?'2em':'0');st.setProperty('--manuscript-paragraph-spacing',indent?'0.6em':'0.4em')}catch(e){}})()`;

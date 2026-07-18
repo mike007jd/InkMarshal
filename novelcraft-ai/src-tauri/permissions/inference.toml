@@ -1,0 +1,12 @@
+"$schema" = "schemas/schema.json"
+
+# High-risk: spawns/kills inference-engine child processes and commits RAM
+# (admission-gated in Rust). Grouped so the process-control surface is auditable.
+[[set]]
+identifier = "inference"
+description = "Inference engine process lifecycle (start/stop)."
+permissions = [
+  "allow-engine-start",
+  "allow-engine-stop",
+  "allow-stop-others-for-path",
+]

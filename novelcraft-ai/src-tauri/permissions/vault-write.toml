@@ -1,0 +1,13 @@
+"$schema" = "schemas/schema.json"
+
+# High-risk: mutates the user's manuscript/outline files (init/write/delete/move).
+# Read/walk/watch stay in default.toml; only the mutating surface is grouped here.
+[[set]]
+identifier = "vault-write"
+description = "Vault file mutations (init/write/delete/move)."
+permissions = [
+  "allow-vault-init",
+  "allow-vault-write-file",
+  "allow-vault-delete-file",
+  "allow-vault-move",
+]
