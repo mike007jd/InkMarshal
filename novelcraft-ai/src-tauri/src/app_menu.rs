@@ -10,7 +10,7 @@
 //! Every clickable item carries a stable dotted id (`inkmarshal.file.new`
 //! etc.). Click events are emitted as a single `inkmarshal://menu` Tauri event
 //! whose payload is that id; the frontend's `DesktopShell` maps the id to the
-//! actual behaviour (open dialog, dispatch save-now, toggle panels, …).
+//! actual behaviour (open dialog, flush manuscript, toggle panels, …).
 //!
 //! Coexistence: this module only registers a menu. It does not touch vault,
 //! engine, or runtime state — appending `.menu()` + `.on_menu_event()` to the

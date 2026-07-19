@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 describe('backup settings surface', () => {
   it('saves pending editor state before export and restores only through verification', () => {
     const source = readFileSync(join(process.cwd(), 'components', 'BackupSettings.tsx'), 'utf8');
-    expect(source).toContain('await requestSaveNow()');
+    expect(source).toContain('await requestManuscriptFlush()');
     expect(source).toContain("fetch(`/api/novels/${novelId}/backup`");
     expect(source).toContain("fetch('/api/novels')");
     expect(source).toContain('await verifyBackupPackage(backupBytes)');

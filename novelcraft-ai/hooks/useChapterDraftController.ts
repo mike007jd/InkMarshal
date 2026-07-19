@@ -8,8 +8,7 @@ import { useSaveStatus } from '@/hooks/useSaveStatus';
 import { replaceEditorText, readEditorPlainText } from '@/components/editor/lexical-helpers';
 import type { ManuscriptChapter } from '@/components/ManuscriptShell';
 import type { SaveState } from '@/components/SaveStatusIndicator';
-import { SAVE_NOW_EVENT, type SaveNowEventDetail } from '@/lib/desktop-shell-bus';
-import { performKeepaliveChapterSave } from '@/hooks/keepalive-chapter-save';
+import { MANUSCRIPT_FLUSH_EVENT, type ManuscriptFlushEventDetail } from '@/lib/desktop-shell-bus';
 
 const AUTO_SAVE_DEBOUNCE_MS = 500;
 
@@ -82,6 +81,9 @@ export function useChapterDraftController({
   const versionRef = useRef<number>(chapter?.version ?? 0);
   const pendingContentRef = useRef<string>(chapter?.content ?? '');
   const isDirtyRef = useRef<boolean>(false);
+  // Monotonic editor revision. A save may resolve after the writer has typed
+  // more text; only the revision captured by that request is then durable.
+  const editRevisionRef = useRef(0);
   const [editorSync, setEditorSync] = useState(() => ({
     scopeKey: `${novelId}:${chapter?.id ?? 'none'}`,
     content: draftContent ?? chapter?.content ?? '',
@@ -127,61 +129,67 @@ export function useChapterDraftController({
   // reference. We keep the impl inside useCallback to keep deps clean for the
   // chapter-switch + unmount effects below.
   const flushSaveRef = useRef<() => Promise<boolean>>(async () => true);
-  // True while a debounced/explicit flushSave PATCH is awaiting the server.
-  // The close-path (beforeunload keepalive) reads this to avoid racing an
-  // in-flight write for the same dirty buffer — see the beforeunload effect.
-  const flushInFlightRef = useRef(false);
-  // True while a beforeunload keepalive PATCH is in flight, so the unmount
-  // cleanup doesn't fire a second writer for the same dirty buffer. Unlike the
-  // old optimistic isDirtyRef clear, this does not lose the buffer if the
-  // keepalive PATCH fails — isDirtyRef is only cleared on PATCH success.
-  const beforeUnloadClaimedRef = useRef(false);
-  const flushSave = useCallback(async (): Promise<boolean> => {
+  // All callers share one drain promise. This prevents Cmd+S, autosave, chapter
+  // switches, and unmount from issuing overlapping optimistic-version PATCHes.
+  const flushPromiseRef = useRef<Promise<boolean> | null>(null);
+  const flushSave = useCallback((): Promise<boolean> => {
     if (flushTimerRef.current) {
       clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
-    if (!isDirtyRef.current) return true;
-    const targetNovelId = activeNovelIdRef.current;
-    const chapterNumber = activeChapterNumberRef.current;
-    if (chapterNumber == null) return true;
-    const content = pendingContentRef.current;
-    const expectedVersion = versionRef.current;
-    saveMarkSaving();
-    flushInFlightRef.current = true;
-    let result: 'ok' | 'conflict' | 'fail';
-    try {
-      result = await persistChapter(targetNovelId, content, chapterNumber, expectedVersion);
-    } finally {
-      flushInFlightRef.current = false;
-    }
-    if (result === 'ok') {
-      isDirtyRef.current = false;
-      onDraftContentChange?.(chapterNumber, content, false);
-      if (targetNovelId === novelId) onChaptersChange?.();
-      saveMarkSaved();
-      return true;
-    }
-    if (result === 'conflict') {
-      // Keep the local dirty buffer as the user's source of truth. A refetch
-      // here would push the newer DB text into ContentSyncPlugin and overwrite
-      // the unsaved editor contents.
-      toast(t.versionConflict, 'error', {
-        action: { label: t.toastRetry, onClick: () => { flushSaveRef.current(); } },
-      });
-      if (flushTimerRef.current) {
-        clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
+    if (flushPromiseRef.current) return flushPromiseRef.current;
+
+    const drain = async (): Promise<boolean> => {
+      while (isDirtyRef.current) {
+        const targetNovelId = activeNovelIdRef.current;
+        const chapterNumber = activeChapterNumberRef.current;
+        if (chapterNumber == null) return true;
+        const content = pendingContentRef.current;
+        const expectedVersion = versionRef.current;
+        const revision = editRevisionRef.current;
+        saveMarkSaving();
+        const result = await persistChapter(targetNovelId, content, chapterNumber, expectedVersion);
+        if (result === 'ok') {
+          // A newer edit landed while this request was in flight. The response
+          // advances the optimistic base version, but it must not clear that
+          // newer dirty buffer; loop immediately and persist the latest text.
+          if (revision !== editRevisionRef.current) continue;
+          isDirtyRef.current = false;
+          onDraftContentChange?.(chapterNumber, content, false);
+          if (targetNovelId === novelId) onChaptersChange?.();
+          saveMarkSaved();
+          return true;
+        }
+        if (result === 'conflict') {
+          // Keep the local dirty buffer as the user's source of truth. A refetch
+          // here would push the newer DB text into ContentSyncPlugin and overwrite
+          // the unsaved editor contents.
+          toast(t.versionConflict, 'error', {
+            action: { label: t.toastRetry, onClick: () => { flushSaveRef.current(); } },
+          });
+          if (flushTimerRef.current) {
+            clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
+          saveMarkFailed(() => { flushSaveRef.current(); });
+          return false;
+        }
+        // Hard failure — surface in indicator + toast with retry action.
+        saveMarkFailed(() => { flushSaveRef.current(); });
+        toast(t.editorSaveError, 'error', {
+          action: { label: t.toastRetry, onClick: () => { flushSaveRef.current(); } },
+        });
+        return false;
       }
-      saveMarkFailed(() => { flushSaveRef.current(); });
-      return false;
-    }
-    // Hard failure — surface in indicator + toast with retry action.
-    saveMarkFailed(() => { flushSaveRef.current(); });
-    toast(t.editorSaveError, 'error', {
-      action: { label: t.toastRetry, onClick: () => { flushSaveRef.current(); } },
+      return true;
+    };
+
+    const promise = drain();
+    flushPromiseRef.current = promise;
+    void promise.finally(() => {
+      if (flushPromiseRef.current === promise) flushPromiseRef.current = null;
     });
-    return false;
+    return promise;
   }, [novelId, onChaptersChange, onDraftContentChange, persistChapter, saveMarkSaving, saveMarkSaved, saveMarkFailed, t.editorSaveError, t.toastRetry, t.versionConflict, toast]);
   useEffect(() => { flushSaveRef.current = flushSave; }, [flushSave]);
 
@@ -200,17 +208,15 @@ export function useChapterDraftController({
     }
   }, [novelId, chapter?.id, chapter?.version, chapter?.content, chapter?.chapterNumber]);
 
-  // Cmd+S / macOS menu "Save" bridge. Wave 3 commit 4 wires the menu event
-  // to `window.dispatchEvent(new CustomEvent('inkmarshal:save-now'))`; we
-  // listen pre-emptively so the menu can land independently. Surface the
+  // Cmd+S / macOS menu "Save" bridge. Surface the
   // chapter identity when the flush fails so callers (export, snapshot)
   // can show which chapter still has unsaved work.
   useEffect(() => {
     const saveNow = (event: Event) => {
       const chapterRef = chapter;
-      const detail = (event as CustomEvent<SaveNowEventDetail>).detail;
+      const detail = (event as CustomEvent<ManuscriptFlushEventDetail>).detail;
       const promise = flushSaveRef.current().then(async ok => {
-        if (!ok || !detail?.createRecoveryPoint || !chapterRef) {
+        if (!ok || !detail?.createSnapshot || !chapterRef) {
           return {
             ok,
             chapterNumber: chapterRef?.chapterNumber,
@@ -235,68 +241,21 @@ export function useChapterDraftController({
       });
       detail?.waitUntil?.(promise);
     };
-    window.addEventListener(SAVE_NOW_EVENT, saveNow);
-    return () => window.removeEventListener(SAVE_NOW_EVENT, saveNow);
+    window.addEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
+    return () => window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
   }, [chapter, novelId, t.snapshotCreateFailed, toast]);
 
-  // Best-effort flush on unmount / window close. There are two possible
-  // close-path writers — the `beforeunload` keepalive PATCH and the unmount
-  // cleanup's `flushSave()` — and in a Tauri window close BOTH can fire. We
-  // make this a single writer to avoid the un-coordinated double PATCH that,
-  // under optimistic-concurrency (`version`), would land out of order and
-  // either 409 silently or clobber. The first path to claim the dirty buffer
-  // flips `isDirtyRef` to false so the other no-ops. (Stream aborts on unmount
-  // are owned by the AI-assist hooks' own cleanups.)
+  // Closing the window is not a save command. The shell's recovery store owns
+  // unload durability; this hook only cancels its pending autosave timer so it
+  // cannot start a chapter PATCH while the webview is being torn down.
   useEffect(() => {
-    const beforeUnload = () => {
-      if (!isDirtyRef.current || activeChapterNumberRef.current == null) return;
-      // A normal debounced/explicit flush is already mid-flight for this same
-      // buffer — let it complete rather than racing it with a second write.
-      if (flushInFlightRef.current) return;
-      // Claim the write so the unmount cleanup below won't also fire a second
-      // writer for the same dirty buffer. NOTE: we do NOT clear isDirtyRef here
-      // — beforeunload can fire for non-close reasons (history navigation,
-      // webview re-parenting) where the page stays alive. Clearing it optimistically
-      // meant a failed keepalive PATCH permanently lost the dirty buffer with no
-      // retry. Instead we mark the claim and only clear isDirtyRef once the
-      // keepalive PATCH actually succeeds; on failure the debounced autosave can
-      // still retry (the claim is released so the unmount path can take over too).
-      beforeUnloadClaimedRef.current = true;
+    return () => {
       if (flushTimerRef.current) {
         clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
       }
-      // keepalive lets the browser deliver this PATCH even after the tab is
-      // being unloaded. The dirty buffer is cleared ONLY on a 2xx response —
-      // a 409 (version conflict) or 5xx must keep the buffer so the debounced
-      // autosave / unmount flush can retry instead of silently dropping edits.
-      // (fetch resolves for any HTTP status; see performKeepaliveChapterSave.)
-      void performKeepaliveChapterSave(
-        fetch,
-        `/api/novels/${activeNovelIdRef.current}/chapters/${activeChapterNumberRef.current}`,
-        JSON.stringify({ content: pendingContentRef.current, version: versionRef.current }),
-        () => {
-          isDirtyRef.current = false;
-        },
-        () => {
-          beforeUnloadClaimedRef.current = false;
-        },
-      );
     };
-    window.addEventListener('beforeunload', beforeUnload);
-    return () => {
-      window.removeEventListener('beforeunload', beforeUnload);
-      // Flush on view unmount too — but only if no close-path writer already
-      // claimed the dirty buffer. flushSave is the richer writer
-      // (version/conflict handling, indicator) so it's the preferred path when
-      // the view simply unmounts without a window close.
-      if (isDirtyRef.current && !beforeUnloadClaimedRef.current && activeChapterNumberRef.current != null) {
-        // fire-and-forget
-        flushSave();
-      }
-      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
-    };
-  }, [flushSave, novelId]);
+  }, []);
 
   const scheduleSave = useCallback(() => {
     if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
@@ -309,6 +268,7 @@ export function useChapterDraftController({
   const handleContentChange = useCallback((content: string) => {
     pendingContentRef.current = content;
     isDirtyRef.current = true;
+    editRevisionRef.current += 1;
     const chapterNumber = activeChapterNumberRef.current;
     if (chapterNumber != null) onDraftContentChange?.(chapterNumber, content, true, versionRef.current);
     scheduleSave();

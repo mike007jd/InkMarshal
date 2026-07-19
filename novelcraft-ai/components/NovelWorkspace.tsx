@@ -50,7 +50,7 @@ import {
 import { useNovel } from '@/lib/use-storage';
 import { useManuscriptSession } from '@/lib/use-manuscript-session';
 import { resolveManuscriptShellMode } from '@/lib/manuscript-mode';
-import { requestSaveNow } from '@/lib/desktop-shell-bus';
+import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
 import type { KnowledgeFilterTab } from '@/lib/knowledge-workspace';
 
@@ -229,7 +229,7 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
     bundleAbortRef.current?.abort();
     bundleAbortRef.current = controller;
     try {
-      const saveOutcome = await requestSaveNow();
+      const saveOutcome = await requestManuscriptFlush();
       if (!saveOutcome.ok) {
         const where = saveOutcome.chapterNumber
           ? ` (Ch.${saveOutcome.chapterNumber}${saveOutcome.title ? ` — ${saveOutcome.title}` : ''})`

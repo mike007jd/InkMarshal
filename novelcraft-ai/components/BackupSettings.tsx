@@ -8,7 +8,7 @@ import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
-import { requestSaveNow } from '@/lib/desktop-shell-bus';
+import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import { isTauriRuntime, readLocalFile } from '@/lib/desktop-runtime';
 import { parseDownloadFilename, saveBlob } from '@/lib/download';
 import {
@@ -57,7 +57,7 @@ export function BackupSettings({ novelId }: { novelId: string | null }) {
     if (!novelId || busy) return;
     setBusy('backup');
     try {
-      const saveOutcome = await requestSaveNow();
+      const saveOutcome = await requestManuscriptFlush();
       if (!saveOutcome.ok) throw new Error(t.editorSaveError);
       const response = await fetch(`/api/novels/${novelId}/backup`, { method: 'POST' });
       if (!response.ok) throw new Error(t.backupCreateFailed);
@@ -81,7 +81,7 @@ export function BackupSettings({ novelId }: { novelId: string | null }) {
     setLibraryProgress(null);
     try {
       if (novelId) {
-        const saveOutcome = await requestSaveNow();
+        const saveOutcome = await requestManuscriptFlush();
         if (!saveOutcome.ok) throw new Error(t.editorSaveError);
       }
       const novelsResponse = await fetch('/api/novels');

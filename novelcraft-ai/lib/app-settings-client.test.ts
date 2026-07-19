@@ -80,6 +80,22 @@ describe('app-settings-client', () => {
     });
   });
 
+  it('writes manuscript recovery through the current-only SQLite allowlist', async () => {
+    isTauri.mockReturnValue(true);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', fetchMock);
+    const { setStoredSetting } = await load();
+    const value = '{"novel-1":{"1":{"content":"draft","version":2,"savedAt":1}}}';
+
+    setStoredSetting('inkmarshal_manuscript_recovery_v1', value);
+
+    await vi.waitFor(() => expect(patchCalls(fetchMock)).toContainEqual({
+      key: 'inkmarshal_manuscript_recovery_v1',
+      value,
+    }));
+    expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).toBe(value);
+  });
+
   it('serializes desktop writes to the same key', async () => {
     isTauri.mockReturnValue(true);
     let finishFirst!: (value: { ok: boolean }) => void;

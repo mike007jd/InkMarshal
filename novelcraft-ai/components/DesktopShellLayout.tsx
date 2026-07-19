@@ -13,7 +13,7 @@ import {
   toggleLeftSidebar,
   toggleRightPanel,
   setNovelView,
-  requestSaveNow,
+  requestManuscriptFlush,
 } from '@/lib/desktop-shell-bus';
 
 import { DeleteNovelDialog } from '@/components/DeleteNovelDialog';
@@ -87,7 +87,6 @@ export function DesktopShell({ children }: DesktopShellProps) {
   const [capabilityProfile, setCapabilityProfile] = useState<CapabilityProfile>(EMPTY_CAPABILITY_PROFILE);
   const readinessSeqRef = useRef(0);
   const deletingNovelIdsRef = useRef<Set<string>>(new Set());
-  const closingWindowRef = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   // Off-canvas drawer state for narrow viewports (browser/webview preview;
   // the Tauri window enforces a 1040px minWidth so this is a safety net for
@@ -187,50 +186,6 @@ export function DesktopShell({ children }: DesktopShellProps) {
     };
   }, [locale]);
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let cancelled = false;
-    let unlisten: (() => void) | null = null;
-    void (async () => {
-      try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        const currentWindow = getCurrentWindow();
-        unlisten = await currentWindow.onCloseRequested(async event => {
-          event.preventDefault();
-          if (closingWindowRef.current) return;
-          closingWindowRef.current = true;
-          const saveOutcome = await requestSaveNow();
-          if (!saveOutcome.ok) {
-            closingWindowRef.current = false;
-            toast(t.editorSaveError, 'error');
-            return;
-          }
-          try {
-            await currentWindow.destroy();
-          } catch (err) {
-            closingWindowRef.current = false;
-            toast(t.editorSaveError, 'error');
-            if (typeof console !== 'undefined') {
-              console.warn('Failed to close window after saving:', err);
-            }
-          }
-        });
-        if (cancelled) {
-          unlisten();
-          unlisten = null;
-        }
-      } catch (err) {
-        if (typeof console !== 'undefined') {
-          console.warn('Failed to register close guard:', err);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [t.editorSaveError, toast]);
-
   const searchScope = useMemo<NovelListScope>(() => ({
     kind: 'novel-list',
     id: 'desktop:novel-list',
@@ -285,8 +240,8 @@ export function DesktopShell({ children }: DesktopShellProps) {
         return;
       case 'inkmarshal.file.save':
         // Save is silent on success and also captures the persisted chapter as
-        // a recovery point. The editor surfaces either failure explicitly.
-        void requestSaveNow({ createRecoveryPoint: true });
+        // a snapshot. The editor surfaces either failure explicitly.
+        void requestManuscriptFlush({ createSnapshot: true });
         return;
       case 'inkmarshal.file.export':
         window.dispatchEvent(new CustomEvent('inkmarshal:export-bundle'));

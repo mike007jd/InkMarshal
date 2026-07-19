@@ -1414,10 +1414,7 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if matches!(
-                event,
-                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
-            ) {
+            if matches!(event, WindowEvent::Destroyed) {
                 terminate_next_runtime(window.app_handle());
                 if let Some(reg) = window.app_handle().try_state::<engine::EngineRegistry>() {
                     engine::stop_all(&reg);

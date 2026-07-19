@@ -29,6 +29,7 @@ export const APP_SETTINGS_KEYS = [
 export const APP_SETTINGS_CURRENT_ONLY_KEYS = [
   'inkmarshal_workspace_views_v1', // last top-level workspace mode per novel
   AUTOMATIC_UPDATE_CHECK_SETTING_KEY, // default-on startup update checks
+  'inkmarshal_manuscript_recovery_v1', // unsaved chapter recovery across runtime ports
 ] as const;
 
 export type AppSettingKey =

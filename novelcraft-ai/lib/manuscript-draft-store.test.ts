@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   buildPersistPayload,
+  loadPersistedDrafts,
+  persistDrafts,
   reconcilePersistedDrafts,
   type PersistedDraftMap,
 } from './manuscript-draft-store';
@@ -9,6 +13,40 @@ const chapter = (chapterNumber: number, content: string, version?: number) => ({
   chapterNumber,
   content,
   version,
+});
+
+beforeEach(() => {
+  localStorage.clear();
+});
+
+describe('durable manuscript recovery store', () => {
+  it('keeps every novel under one fixed app-setting key', () => {
+    persistDrafts('novel-1', {
+      '1': { content: 'first draft', version: 2, savedAt: 100 },
+    });
+    persistDrafts('novel-2', {
+      '4': { content: 'second draft', version: 7, savedAt: 200 },
+    });
+
+    expect(loadPersistedDrafts('novel-1')['1']?.content).toBe('first draft');
+    expect(loadPersistedDrafts('novel-2')['4']?.content).toBe('second draft');
+    expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).not.toBeNull();
+    expect(localStorage.getItem('inkmarshal:manuscript-drafts:v1:novel-1')).toBeNull();
+  });
+
+  it('removes only the cleared novel from the shared recovery envelope', () => {
+    persistDrafts('novel-1', {
+      '1': { content: 'first draft', version: 2, savedAt: 100 },
+    });
+    persistDrafts('novel-2', {
+      '4': { content: 'second draft', version: 7, savedAt: 200 },
+    });
+
+    persistDrafts('novel-1', {});
+
+    expect(loadPersistedDrafts('novel-1')).toEqual({});
+    expect(loadPersistedDrafts('novel-2')['4']?.content).toBe('second draft');
+  });
 });
 
 describe('buildPersistPayload', () => {

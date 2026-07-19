@@ -7,7 +7,7 @@ import type { Update } from '@tauri-apps/plugin-updater';
 import { useLanguage } from '@/components/LanguageProvider';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
-import { requestSaveNow } from '@/lib/desktop-shell-bus';
+import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import { isTauriRuntime } from '@/lib/desktop-runtime';
 import { isCriticalDesktopUpdate, updateProgressPercent } from '@/lib/desktop-updates';
 import {
@@ -112,8 +112,8 @@ export function DesktopUpdateCoordinator() {
       });
 
       // Installing can replace files while the current process is alive. Flush
-      // the editor and create a recovery point immediately before relaunch.
-      const save = await requestSaveNow({ createRecoveryPoint: true });
+      // the editor and create a snapshot immediately before relaunch.
+      const save = await requestManuscriptFlush({ createSnapshot: true });
       if (!save.ok) throw new Error(t.updateSaveFailed);
       const { relaunch } = await import('@tauri-apps/plugin-process');
       await relaunch();

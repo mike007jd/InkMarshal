@@ -77,6 +77,14 @@ The manuscript route must preserve these behaviors:
 5. **Selection-driven editing** — Editing tools operate from selected text and explicit user intent.
 6. **Diff confirmation before apply** — AI-assisted edits are reviewed before they are committed.
 7. **Revert path exists** — Reverting to original content remains possible where `originalContent` exists.
+8. **Close is not Save** — Closing a window never blocks on manuscript persistence and never turns transient UI state into committed product data.
+9. **Manuscript-only recovery** — Dirty chapter text is mirrored to the local recovery store and restored only when its chapter version still matches; it is not presented as a successful manuscript save.
+
+### Commit boundaries
+
+- Chapter edits become committed data only through the chapter autosave/explicit Save pipeline. Export, backup, update/relaunch, and accepting an AI diff flush that pipeline before using the manuscript.
+- A typed but unsent chat message, an unsubmitted knowledge form, and an unaccepted AI diff are transient UI state. Closing discards them without a prompt.
+- Completed API/SQLite writes remain committed. In-flight AI generation is cancelled when its owning view closes; any resumable writing session continues from its already committed progress after relaunch.
 
 ### Current constraints
 

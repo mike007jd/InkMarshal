@@ -8,7 +8,7 @@ import { applyChanges, locateOriginalText, type ChangeItem } from '@/lib/diff-ut
 import { readEditorPlainText } from '@/components/editor/lexical-helpers';
 import type { HighlightRange } from '@/components/editor/types';
 import type { ManuscriptChapter } from '@/components/ManuscriptShell';
-import { requestSaveNow } from '@/lib/desktop-shell-bus';
+import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 
 interface UseDiffConfirmationArgs {
   novelId: string;
@@ -98,7 +98,7 @@ export function useDiffConfirmation({
     if (accepted.length === 0) return;
     applyingRef.current = true;
     try {
-      const saveOutcome = await requestSaveNow();
+      const saveOutcome = await requestManuscriptFlush();
       if (!saveOutcome.ok) throw new Error(t.editorSaveError);
       const snapshotResponse = await fetch(
         `/api/novels/${novelId}/chapters/${chapter.chapterNumber}/snapshots`,

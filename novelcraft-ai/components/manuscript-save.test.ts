@@ -5,9 +5,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
-  SAVE_NOW_EVENT,
-  requestSaveNow,
-  type SaveNowEventDetail,
+  MANUSCRIPT_FLUSH_EVENT,
+  requestManuscriptFlush,
+  type ManuscriptFlushEventDetail,
 } from '@/lib/desktop-shell-bus';
 import {
   applyDraftContentToChapters,
@@ -23,59 +23,62 @@ const chapters: ManuscriptChapter[] = [
 ];
 
 describe('manuscript save barriers', () => {
-  it('intercepts native close until the active editor has saved successfully', () => {
+  it('does not turn ordinary window close into a manuscript save workflow', () => {
     const shell = readFileSync(join(process.cwd(), 'components/DesktopShellLayout.tsx'), 'utf8');
 
-    expect(shell).toContain('currentWindow.onCloseRequested(async event =>');
-    expect(shell).toContain('event.preventDefault();');
-    expect(shell).toContain('const saveOutcome = await requestSaveNow();');
-    expect(shell).toContain('if (!saveOutcome.ok) {');
-    expect(shell).toContain('await currentWindow.destroy();');
-    expect(shell.indexOf('const saveOutcome = await requestSaveNow();'))
-      .toBeLessThan(shell.indexOf('await currentWindow.destroy();'));
+    expect(shell).not.toContain('onCloseRequested');
+    expect(shell).not.toContain('currentWindow.destroy');
   });
 
-  it('returns the first failed SaveNow listener outcome', async () => {
+  it('tears down the bundled runtime only after the window is destroyed', () => {
+    const rust = readFileSync(join(process.cwd(), 'src-tauri/src/lib.rs'), 'utf8');
+
+    expect(rust).toContain('.on_window_event(|window, event|');
+    expect(rust).toContain('WindowEvent::Destroyed');
+    expect(rust).not.toContain('WindowEvent::CloseRequested');
+  });
+
+  it('returns the first failed manuscript flush outcome', async () => {
     const okListener = (event: Event) => {
-      (event as CustomEvent<SaveNowEventDetail>).detail.waitUntil(Promise.resolve({ ok: true }));
+      (event as CustomEvent<ManuscriptFlushEventDetail>).detail.waitUntil(Promise.resolve({ ok: true }));
     };
     const failedListener = (event: Event) => {
-      (event as CustomEvent<SaveNowEventDetail>).detail.waitUntil(Promise.resolve({
+      (event as CustomEvent<ManuscriptFlushEventDetail>).detail.waitUntil(Promise.resolve({
         ok: false,
         chapterNumber: 2,
         title: 'Two',
       }));
     };
-    window.addEventListener(SAVE_NOW_EVENT, okListener);
-    window.addEventListener(SAVE_NOW_EVENT, failedListener);
+    window.addEventListener(MANUSCRIPT_FLUSH_EVENT, okListener);
+    window.addEventListener(MANUSCRIPT_FLUSH_EVENT, failedListener);
 
     try {
-      await expect(requestSaveNow()).resolves.toEqual({
+      await expect(requestManuscriptFlush()).resolves.toEqual({
         ok: false,
         chapterNumber: 2,
         title: 'Two',
       });
     } finally {
-      window.removeEventListener(SAVE_NOW_EVENT, okListener);
-      window.removeEventListener(SAVE_NOW_EVENT, failedListener);
+      window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, okListener);
+      window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, failedListener);
     }
   });
 
-  it('marks an explicit save request as a recovery-point save', async () => {
+  it('marks an explicit save request as a snapshot save', async () => {
     const listener = (event: Event) => {
-      const detail = (event as CustomEvent<SaveNowEventDetail>).detail;
-      expect(detail.createRecoveryPoint).toBe(true);
+      const detail = (event as CustomEvent<ManuscriptFlushEventDetail>).detail;
+      expect(detail.createSnapshot).toBe(true);
       detail.waitUntil(Promise.resolve({ ok: true, chapterNumber: 1 }));
     };
-    window.addEventListener(SAVE_NOW_EVENT, listener);
+    window.addEventListener(MANUSCRIPT_FLUSH_EVENT, listener);
     try {
-      await expect(requestSaveNow({ createRecoveryPoint: true })).resolves.toEqual({ ok: true });
+      await expect(requestManuscriptFlush({ createSnapshot: true })).resolves.toEqual({ ok: true });
     } finally {
-      window.removeEventListener(SAVE_NOW_EVENT, listener);
+      window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, listener);
     }
   });
 
-  it('blocks global save/export on the lowest-numbered orphaned dirty draft', () => {
+  it('blocks manuscript flush/export on the lowest-numbered orphaned dirty draft', () => {
     const drafts = new Map([
       [3, 'dirty three'],
       [2, 'dirty two'],

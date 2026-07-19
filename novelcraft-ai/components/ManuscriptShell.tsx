@@ -11,7 +11,9 @@ import { SaveStatusIndicator, type SaveState } from './SaveStatusIndicator';
 import { WritingModelDotBadge } from './WritingModelDotBadge';
 import { useRegisterSearchScope, type ManuscriptScope } from './search/GlobalSearchProvider';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
-import { SAVE_NOW_EVENT, type SaveNowEventDetail } from '@/lib/desktop-shell-bus';
+import { MANUSCRIPT_FLUSH_EVENT, type ManuscriptFlushEventDetail } from '@/lib/desktop-shell-bus';
+import { onAppSettingsHydrated } from '@/lib/app-settings-client';
+import { isTauriRuntime } from '@/lib/desktop-runtime';
 import {
   buildPersistPayload,
   loadPersistedDrafts,
@@ -68,8 +70,8 @@ interface ManuscriptShellProps {
 }
 
 const LAYOUT_STORAGE_KEY = 'manuscript:readingLayout';
-/** Crash-safety window: unsaved drafts hit localStorage at most this far behind. */
-const DRAFT_PERSIST_DEBOUNCE_MS = 800;
+/** Crash-safety window: unsaved drafts hit the recovery store at most this far behind. */
+const DRAFT_PERSIST_DEBOUNCE_MS = 250;
 
 function readPersistedLayout(): ReadingLayout {
   if (typeof window === 'undefined') return 'continuous';
@@ -137,6 +139,8 @@ export function ManuscriptShell({
   const [saveState, setSaveState] = useState<SaveState>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [draftContentByChapter, setDraftContentByChapter] = useState<Map<number, string>>(() => new Map());
+  const draftContentRef = useRef(new Map<number, string>());
+  const [draftStoreReady, setDraftStoreReady] = useState(() => !isTauriRuntime());
   // Live optimistic-concurrency base per dirty chapter, reported by the
   // editing view (more current than the chapter prop after a save round-trip).
   const draftVersionsRef = useRef(new Map<number, number>());
@@ -148,6 +152,11 @@ export function ManuscriptShell({
   const appliedRequestedChapterKeyRef = useRef<string | null>(null);
   const searchJumpSeqRef = useRef(0);
   const appliedRequestedSearchKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    return onAppSettingsHydrated(() => setDraftStoreReady(true));
+  }, []);
 
   useEffect(() => {
     const wide = window.matchMedia('(min-width: 1024px)');
@@ -163,10 +172,10 @@ export function ManuscriptShell({
     setLastSavedAt(at);
   }, []);
   const handleSaveRetry = useCallback(() => {
-    // The editing view also listens for `inkmarshal:save-now` and re-fires
+    // The editing view also listens for `inkmarshal:manuscript-flush` and re-fires
     // the failed flush — using the same channel here keeps menus, the toast
     // action, and this indicator in lock-step.
-    window.dispatchEvent(new CustomEvent(SAVE_NOW_EVENT));
+    window.dispatchEvent(new CustomEvent(MANUSCRIPT_FLUSH_EVENT));
   }, []);
 
   const setLayout = useCallback((next: ReadingLayout) => {
@@ -195,11 +204,11 @@ export function ManuscriptShell({
       // error can point the user at the specific tab to revisit.
       const outcome = failedDraftSaveOutcome(draftContentByChapter, chapters);
       if (outcome) {
-        (event as CustomEvent<SaveNowEventDetail>).detail?.waitUntil?.(Promise.resolve(outcome));
+        (event as CustomEvent<ManuscriptFlushEventDetail>).detail?.waitUntil?.(Promise.resolve(outcome));
       }
     };
-    window.addEventListener(SAVE_NOW_EVENT, saveNow);
-    return () => window.removeEventListener(SAVE_NOW_EVENT, saveNow);
+    window.addEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
+    return () => window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
   }, [draftContentByChapter, effectiveViewMode, chapters]);
 
   useLayoutEffect(() => {
@@ -210,6 +219,7 @@ export function ManuscriptShell({
     searchJumpSeqRef.current += 1;
     editingViewRef.current = null;
     draftVersionsRef.current = new Map();
+    draftContentRef.current = new Map();
     queueMicrotask(() => {
       if (cancelled) return;
       setActiveChapter(null);
@@ -228,6 +238,10 @@ export function ManuscriptShell({
     return [...chapters.filter(ch => ch.chapterNumber !== liveChapter.chapterNumber), liveChapter]
       .sort((a, b) => a.chapterNumber - b.chapterNumber);
   }, [chapters, liveChapter]);
+  const combinedChaptersRef = useRef(combinedChapters);
+  useLayoutEffect(() => {
+    combinedChaptersRef.current = combinedChapters;
+  }, [combinedChapters]);
 
   const combinedChaptersWithDrafts = useMemo(() =>
     applyDraftContentToChapters(combinedChapters, draftContentByChapter),
@@ -237,27 +251,21 @@ export function ManuscriptShell({
   const handleDraftContentChange = useCallback((chapterNumber: number, content: string, dirty: boolean, version?: number) => {
     if (dirty && version !== undefined) draftVersionsRef.current.set(chapterNumber, version);
     else if (!dirty) draftVersionsRef.current.delete(chapterNumber);
-    setDraftContentByChapter(prev => {
-      const next = new Map(prev);
-      if (dirty) next.set(chapterNumber, content);
-      else next.delete(chapterNumber);
-      return next;
-    });
+    const next = new Map(draftContentRef.current);
+    if (dirty) next.set(chapterNumber, content);
+    else next.delete(chapterNumber);
+    // Update synchronously so pagehide/beforeunload always sees the keystroke
+    // that triggered this callback, even before React commits the state update.
+    draftContentRef.current = next;
+    setDraftContentByChapter(next);
   }, []);
 
   // --- Crash-safe draft persistence -------------------------------------
-  // Mirror unsaved drafts into localStorage so a crash/force-quit (where
+  // Mirror unsaved drafts into the app-settings recovery store so a crash/force-quit (where
   // beforeunload never fires) can't lose more than the debounce window.
   // The draft map is read through a ref so persistDraftMapNow stays stable
   // across keystrokes — otherwise the beforeunload listener below would be
   // removed and re-added on every edit.
-  const combinedChaptersRef = useRef(combinedChapters);
-  const draftContentRef = useRef(draftContentByChapter);
-  useEffect(() => {
-    combinedChaptersRef.current = combinedChapters;
-    draftContentRef.current = draftContentByChapter;
-  });
-
   const persistDraftMapNow = useCallback(() => {
     if (activeNovelRef.current !== novelId) return;
     persistDrafts(novelId, buildPersistPayload(
@@ -271,24 +279,28 @@ export function ManuscriptShell({
   // draftContentByChapter is deliberately a dependency: every edit must
   // reset the debounce timer (that IS the debounce).
   useEffect(() => {
-    if (draftRestoreTarget !== null || readOnly) return;
+    if (!draftStoreReady || draftRestoreTarget !== null || readOnly) return;
     const handle = setTimeout(persistDraftMapNow, DRAFT_PERSIST_DEBOUNCE_MS);
     return () => clearTimeout(handle);
-  }, [persistDraftMapNow, draftContentByChapter, draftRestoreTarget, readOnly]);
+  }, [persistDraftMapNow, draftContentByChapter, draftRestoreTarget, draftStoreReady, readOnly]);
 
   useEffect(() => {
-    if (readOnly) return;
+    if (!draftStoreReady || readOnly) return;
     const flush = () => persistDraftMapNow();
     window.addEventListener('beforeunload', flush);
-    return () => window.removeEventListener('beforeunload', flush);
-  }, [persistDraftMapNow, readOnly]);
+    window.addEventListener('pagehide', flush);
+    return () => {
+      window.removeEventListener('beforeunload', flush);
+      window.removeEventListener('pagehide', flush);
+    };
+  }, [draftStoreReady, persistDraftMapNow, readOnly]);
 
   // Restore persisted drafts once the chapter list for this novel is loaded.
   // Version-guarded: a draft is only restored when the chapter is still at
   // the version the draft was taken against, so a recovered draft can never
   // clobber newer DB content (see lib/manuscript-draft-store.ts).
   useEffect(() => {
-    if (readOnly || draftRestoreTarget === null || draftRestoreTarget !== novelId) return;
+    if (!draftStoreReady || readOnly || draftRestoreTarget === null || draftRestoreTarget !== novelId) return;
     if (chapters.length === 0 && liveChapter === null) return;
     const stored = loadPersistedDrafts(novelId);
     const { restored, hadStaleEntries } = reconcilePersistedDrafts(stored, combinedChaptersRef.current);
@@ -298,6 +310,7 @@ export function ManuscriptShell({
         for (const [chapterNumber, content] of restored) {
           if (!next.has(chapterNumber)) next.set(chapterNumber, content);
         }
+        draftContentRef.current = next;
         return next;
       });
     }
@@ -310,7 +323,7 @@ export function ManuscriptShell({
       ));
     }
     setDraftRestoreTarget(null);
-  }, [draftRestoreTarget, novelId, chapters, liveChapter, readOnly]);
+  }, [draftRestoreTarget, draftStoreReady, novelId, chapters, liveChapter, readOnly]);
 
   /** Add wordCount for sidebar */
   const sidebarChapters = useMemo(() =>

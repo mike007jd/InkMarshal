@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LocaleProvider } from '@/components/LanguageProvider';
@@ -50,6 +50,46 @@ describe('useChapterDraftController persistence', () => {
     expect(onSaveStatusChange).toHaveBeenCalledWith('saved', expect.any(Number));
   });
 
+  it('drains edits typed while an older save is in flight before reporting success', async () => {
+    let resolveFirst!: (response: Response) => void;
+    const firstResponse = new Promise<Response>(resolve => {
+      resolveFirst = resolve;
+    });
+    fetchMock
+      .mockImplementationOnce(() => firstResponse)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ version: 4 }) } as Response);
+    const onDraftContentChange = vi.fn();
+    const editorRef = { current: null };
+
+    const { result } = renderHook(() => useChapterDraftController({
+      novelId: 'novel-1',
+      chapter,
+      storageReady: true,
+      editorRef,
+      onDraftContentChange,
+    }), { wrapper });
+
+    act(() => { result.current.handleContentChange('first edit'); });
+    let flush!: Promise<boolean>;
+    act(() => { flush = result.current.flushSave(); });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    act(() => { result.current.handleContentChange('newer edit'); });
+    resolveFirst({ ok: true, status: 200, json: async () => ({ version: 3 }) } as Response);
+
+    await act(async () => { await expect(flush).resolves.toBe(true); });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      '/api/novels/novel-1/chapters/1',
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({ content: 'newer edit', version: 3 }),
+      }),
+    ]);
+    expect(onDraftContentChange).toHaveBeenLastCalledWith(1, 'newer edit', false);
+  });
+
   it('keeps the buffer dirty and surfaces a failed status on a 409 conflict', async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 409, json: async () => ({}) } as Response);
     const onSaveStatusChange = vi.fn();
@@ -69,6 +109,22 @@ describe('useChapterDraftController persistence', () => {
 
     expect(ok).toBe(false);
     expect(onSaveStatusChange).toHaveBeenCalledWith('failed', null);
+  });
+
+  it('does not issue a chapter PATCH while the window is unloading', () => {
+    const editorRef = { current: null };
+    const { result, unmount } = renderHook(() => useChapterDraftController({
+      novelId: 'novel-1',
+      chapter,
+      storageReady: true,
+      editorRef,
+    }), { wrapper });
+
+    act(() => { result.current.handleContentChange('close-time draft'); });
+    window.dispatchEvent(new Event('beforeunload'));
+    unmount();
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('flushes the outgoing chapter before repointing scope on a chapter switch', async () => {

@@ -2,21 +2,21 @@
 
 const SHELL_TOGGLE_LEFT = 'inkmarshal:shell:toggle-left';
 const SHELL_TOGGLE_RIGHT = 'inkmarshal:shell:toggle-right';
-export const SAVE_NOW_EVENT = 'inkmarshal:save-now';
+export const MANUSCRIPT_FLUSH_EVENT = 'inkmarshal:manuscript-flush';
 
-export interface SaveNowOutcome {
+export interface ManuscriptFlushOutcome {
   ok: boolean;
   chapterNumber?: number;
   title?: string;
 }
 
-export interface SaveNowEventDetail {
-  createRecoveryPoint?: boolean;
-  waitUntil(promise: Promise<SaveNowOutcome>): void;
+export interface ManuscriptFlushEventDetail {
+  createSnapshot?: boolean;
+  waitUntil(promise: Promise<ManuscriptFlushOutcome>): void;
 }
 
-export interface RequestSaveNowOptions {
-  createRecoveryPoint?: boolean;
+export interface RequestManuscriptFlushOptions {
+  createSnapshot?: boolean;
 }
 
 function safeDispatch(event: string, detail?: unknown) {
@@ -39,21 +39,23 @@ export function setNovelView(view: 'agent' | 'story-deck' | 'read-edit' | 'chat'
 /**
  * Ask the active editing surface to flush unsaved draft text before another
  * action snapshots, exports, searches, or mutates the same chapter. Always
- * returns a {@link SaveNowOutcome}; on failure the surface that failed first
+ * returns a {@link ManuscriptFlushOutcome}; on failure the surface that failed first
  * gets attributed so callers can name the affected chapter in their error.
  */
-export async function requestSaveNow(options: RequestSaveNowOptions = {}): Promise<SaveNowOutcome> {
+export async function requestManuscriptFlush(
+  options: RequestManuscriptFlushOptions = {},
+): Promise<ManuscriptFlushOutcome> {
   if (typeof window === 'undefined') return { ok: true };
-  const waits: Promise<SaveNowOutcome>[] = [];
-  const detail: SaveNowEventDetail = {
-    createRecoveryPoint: options.createRecoveryPoint,
+  const waits: Promise<ManuscriptFlushOutcome>[] = [];
+  const detail: ManuscriptFlushEventDetail = {
+    createSnapshot: options.createSnapshot,
     waitUntil(promise) {
       waits.push(
-        Promise.resolve(promise).catch(() => ({ ok: false } satisfies SaveNowOutcome)),
+        Promise.resolve(promise).catch(() => ({ ok: false } satisfies ManuscriptFlushOutcome)),
       );
     },
   };
-  window.dispatchEvent(new CustomEvent<SaveNowEventDetail>(SAVE_NOW_EVENT, { detail }));
+  window.dispatchEvent(new CustomEvent<ManuscriptFlushEventDetail>(MANUSCRIPT_FLUSH_EVENT, { detail }));
   if (waits.length === 0) return { ok: true };
   const results = await Promise.all(waits);
   return results.find(r => !r.ok) ?? { ok: true };

@@ -3,16 +3,22 @@
  *
  * The editing view keeps unsaved text in memory (pendingContentRef) and the
  * shell mirrors it in draftContentByChapter, but neither survives a crash or
- * force-quit. This store mirrors that map into localStorage so a draft whose
- * save failed (or that was mid-debounce when the app died) can be recovered
- * on the next launch.
+ * force-quit. This store mirrors every novel's draft map into the fixed
+ * SQLite-backed app-setting key so recovery is independent of the desktop
+ * runtime port. The app-settings client also maintains a localStorage mirror.
  *
  * Safety rule: a stored draft is only restored when the chapter's current
  * version still equals the version the draft was taken against AND the
  * content differs. If the DB moved on (a later save landed, another window
- * wrote, the beforeunload keepalive PATCH succeeded), the stale draft is
- * dropped instead of clobbering newer text.
+ * wrote, or a later autosave succeeded), the stale draft is dropped instead
+ * of clobbering newer text.
  */
+
+import {
+  getStoredSetting,
+  removeStoredSetting,
+  setStoredSetting,
+} from '@/lib/app-settings-client';
 
 export interface PersistedDraft {
   content: string;
@@ -22,6 +28,7 @@ export interface PersistedDraft {
 }
 
 export type PersistedDraftMap = Record<string, PersistedDraft>;
+type PersistedRecoveryEnvelope = Record<string, PersistedDraftMap>;
 
 interface ChapterLike {
   chapterNumber: number;
@@ -29,40 +36,34 @@ interface ChapterLike {
   version?: number;
 }
 
-const KEY_PREFIX = 'inkmarshal:manuscript-drafts:v1:';
+export const MANUSCRIPT_RECOVERY_SETTING_KEY = 'inkmarshal_manuscript_recovery_v1';
 
-function draftStorageKey(novelId: string): string {
-  return `${KEY_PREFIX}${novelId}`;
-}
-
-function safeStorage(): Storage | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
+function sanitizeDraftMap(value: unknown): PersistedDraftMap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out: PersistedDraftMap = {};
+  for (const [key, candidate] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^\d+$/.test(key) || !candidate || typeof candidate !== 'object') continue;
+    const draft = candidate as Partial<PersistedDraft>;
+    if (typeof draft.content !== 'string' || typeof draft.version !== 'number') continue;
+    out[key] = {
+      content: draft.content,
+      version: draft.version,
+      savedAt: typeof draft.savedAt === 'number' ? draft.savedAt : 0,
+    };
   }
+  return out;
 }
 
-export function loadPersistedDrafts(novelId: string): PersistedDraftMap {
-  const storage = safeStorage();
-  if (!storage) return {};
+function loadRecoveryEnvelope(): PersistedRecoveryEnvelope {
   try {
-    const raw = storage.getItem(draftStorageKey(novelId));
+    const raw = getStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY);
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: PersistedDraftMap = {};
-    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!/^\d+$/.test(key)) continue;
-      if (!value || typeof value !== 'object') continue;
-      const draft = value as Partial<PersistedDraft>;
-      if (typeof draft.content !== 'string' || typeof draft.version !== 'number') continue;
-      out[key] = {
-        content: draft.content,
-        version: draft.version,
-        savedAt: typeof draft.savedAt === 'number' ? draft.savedAt : 0,
-      };
+    const out: PersistedRecoveryEnvelope = {};
+    for (const [novelId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const drafts = sanitizeDraftMap(value);
+      if (Object.keys(drafts).length > 0) out[novelId] = drafts;
     }
     return out;
   } catch {
@@ -70,18 +71,20 @@ export function loadPersistedDrafts(novelId: string): PersistedDraftMap {
   }
 }
 
+export function loadPersistedDrafts(novelId: string): PersistedDraftMap {
+  return loadRecoveryEnvelope()[novelId] ?? {};
+}
+
 export function persistDrafts(novelId: string, drafts: PersistedDraftMap): void {
-  const storage = safeStorage();
-  if (!storage) return;
-  try {
-    if (Object.keys(drafts).length === 0) {
-      storage.removeItem(draftStorageKey(novelId));
-    } else {
-      storage.setItem(draftStorageKey(novelId), JSON.stringify(drafts));
-    }
-  } catch {
-    // Quota / private-mode failures are non-fatal: in-memory state and the
-    // normal save pipeline still protect the draft for this session.
+  const envelope = loadRecoveryEnvelope();
+  const sanitized = sanitizeDraftMap(drafts);
+  if (Object.keys(sanitized).length === 0) delete envelope[novelId];
+  else envelope[novelId] = sanitized;
+
+  if (Object.keys(envelope).length === 0) {
+    removeStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY);
+  } else {
+    setStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY, JSON.stringify(envelope));
   }
 }
 
