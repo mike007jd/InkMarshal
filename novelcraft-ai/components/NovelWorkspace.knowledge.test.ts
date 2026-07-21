@@ -131,6 +131,12 @@ describe('NovelWorkspace knowledge outline wiring', () => {
     expect(chatArea).toContain("void sendMessage(autoSubmitText, { repairStoryDeck: true })");
   });
 
+  it('keeps Continue single-owned by the visible batch or resume notice', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+
+    expect(workspace).toContain('onResume: !batchDone && !resumePromptVisible');
+  });
+
   it('never projects Story Deck coverage from the previously opened novel', () => {
     const workspace = source('components/NovelWorkspace.tsx');
 

@@ -896,7 +896,11 @@ function ManuscriptPaneBody({
         }}
         writingRunControls={{
           onPause: isStreaming ? pauseWriting : undefined,
-          onResume: () => { void startWriting({ chapters: 1 }); },
+          // The batch/resume notice owns Continue while it is visible. Keep the
+          // run panel action only for reconstructed paused states without a notice.
+          onResume: !batchDone && !resumePromptVisible
+            ? () => { void startWriting({ chapters: 1 }); }
+            : undefined,
           onRetry: () => { void startWriting({ chapters: 1 }); },
         }}
       />
