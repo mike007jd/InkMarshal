@@ -8,24 +8,19 @@ interface StopStreamingButtonProps {
   onStop: () => void;
   /** Localized label — "Pause" in the workspace, "Stop" in the edit chatbox. */
   label: string;
-  /** Stretch to fill its container (stage action column). */
-  fullWidth?: boolean;
   /** Icon scale — the chatbox uses a slightly larger glyph. */
   iconSize?: 'sm' | 'md';
 }
 
 /**
- * Shared danger-styled "stop the stream" affordance for NovelWorkspace,
- * StageBar and EditChatbox. The role has exactly one geometry — it rides
+ * Shared danger-styled "stop the stream" affordance for manuscript editing
+ * and EditChatbox. The role has exactly one geometry — it rides
  * the canonical Button radius so a stop control never reads as a pill in one
- * surface and a box in another. Full-width stage actions use the stage row's
- * comfortable height; inline chat actions use compact height. Call sites vary
- * label, width and icon scale only.
+ * surface and a box in another. Call sites vary label and icon scale only.
  */
 export function StopStreamingButton({
   onStop,
   label,
-  fullWidth = false,
   iconSize = 'sm',
 }: StopStreamingButtonProps) {
   return (
@@ -36,7 +31,6 @@ export function StopStreamingButton({
       onClick={onStop}
       className={cn(
         'h-auto cursor-pointer gap-1.5 px-3 py-2 text-xs font-medium transition',
-        fullWidth && 'w-full py-2.5',
         iconSize === 'md' && 'shrink-0 px-4',
       )}
     >

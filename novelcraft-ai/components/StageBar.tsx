@@ -26,9 +26,9 @@ import {
  * English literals (marked TODO(i18n) — wired when the keys land).
  */
 
-export type StageBarStepKey = 'brainstorm' | 'story_ready' | 'approval' | 'writing';
+type StageBarStepKey = 'brainstorm' | 'story_ready' | 'approval' | 'writing';
 
-export interface StageBarLabels {
+interface StageBarLabels {
   /** Nav landmark label. Defaults to t.projectStatus ("Writing Stage"). */
   navAriaLabel?: string;
   stepBrainstorm?: string;

@@ -52,8 +52,7 @@ export interface ManuscriptChapter {
   originalContent?: string | null;
 }
 
-export type { WritingPhase, WritingRunState } from '@/lib/writing-session';
-export type { WritingRunControls } from './WritingRunStatus';
+export type { WritingRunState } from '@/lib/writing-session';
 export { formatRunElapsed } from './WritingRunStatus';
 
 /** True while the run is preparing/planning and nothing is on the page yet —

@@ -14,7 +14,7 @@ export type BrainstormFinalizationEntry = {
   tags: string[];
 };
 
-export type BrainstormEntryMutation = {
+type BrainstormEntryMutation = {
   action: 'created' | 'updated' | 'unchanged';
   before: KnowledgeEntryRow | null;
   after: KnowledgeEntryRow;
