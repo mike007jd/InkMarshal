@@ -76,9 +76,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: novelcraft-ai/src-tauri
-      # bundle.resources globs must resolve at build-script time; engines/ is
-      # fully gitignored (no .gitkeep) so recreate it on a fresh checkout.
-      - run: mkdir -p resources/engines
+      # bundle.resources paths must exist before cargo checks; node/ and
+      # next-server/ are generated later by build:desktop-web.
+      - run: mkdir -p resources/next-server resources/node resources/engines
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
