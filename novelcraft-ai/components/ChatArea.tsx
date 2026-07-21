@@ -1,8 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
+import type { ChatStatus } from 'ai';
 import { useLanguage } from '@/components/LanguageProvider';
 import { EmptyChatInterviewGuide } from '@/components/EmptyChatInterviewGuide';
 import { WritingModelStatusBar } from '@/components/WritingModelStatusBar';
@@ -17,10 +18,20 @@ export function ChatArea({
   novelId,
   onUpdate,
   initialCreativity = null,
+  onStatusChange,
+  composerCollapsed = false,
+  completionContent,
+  autoSubmitRequest = 0,
+  autoSubmitText,
 }: {
   novelId: string;
   onUpdate: () => void;
   initialCreativity?: CreativityLevel | null;
+  onStatusChange?: (status: ChatStatus) => void;
+  composerCollapsed?: boolean;
+  completionContent?: ReactNode;
+  autoSubmitRequest?: number;
+  autoSubmitText?: string;
 }) {
   const { t, locale } = useLanguage();
   const { toast } = useToast();
@@ -86,7 +97,7 @@ export function ChatArea({
     }
   }, [novelId, onUpdate, t, toast]);
 
-  const { runtime, refresh, errorMessage, retry } = useNovelChatRuntime({
+  const { runtime, status, loading, refresh, errorMessage, retry, sendMessage } = useNovelChatRuntime({
     novelId,
     locale,
     creativity,
@@ -110,6 +121,21 @@ export function ChatArea({
   useEffect(() => {
     refreshRef.current = refresh;
   }, [refresh]);
+  useEffect(() => {
+    onStatusChange?.(status);
+  }, [onStatusChange, status]);
+  const submittedRequestRef = useRef(0);
+  useEffect(() => {
+    if (
+      autoSubmitRequest <= 0
+      || autoSubmitRequest === submittedRequestRef.current
+      || !autoSubmitText
+      || loading
+      || status !== 'ready'
+    ) return;
+    submittedRequestRef.current = autoSubmitRequest;
+    void sendMessage(autoSubmitText, { repairStoryDeck: true });
+  }, [autoSubmitRequest, autoSubmitText, loading, sendMessage, status]);
 
   return (
     <div className="flex-1 flex flex-col h-full book-texture-parchment relative overflow-hidden">
@@ -128,6 +154,8 @@ export function ChatArea({
             composerFooter={t.aiWarning}
             errorMessage={errorMessage}
             onRetry={() => void retry()}
+            hideComposer={composerCollapsed}
+            completionContent={completionContent}
           />
         </AssistantRuntimeProvider>
       </div>

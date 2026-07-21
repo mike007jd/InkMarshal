@@ -46,7 +46,7 @@ describe('NovelWorkspace knowledge outline wiring', () => {
     const en = source('lib/i18n/en.ts');
     const zhCN = source('lib/i18n/zh-CN.ts');
 
-    expect(workspace).toContain('const PRE_WRITING_STAGES');
+    expect(workspace).toContain('isPostInterviewStage(liveNovel?.stage)');
     expect(workspace).toContain('conversationThreadsUnlocked={conversationThreadsUnlocked}');
     // Story Deck is a first-class mode surfaced by the top-bar segmented tabs.
     expect(novelTopBar).toContain("view: 'story-deck'");
@@ -85,6 +85,60 @@ describe('NovelWorkspace knowledge outline wiring', () => {
     expect(workspace).toContain('refreshNovel()');
     expect(workspace).toContain('fetchManuscriptNovel()');
     expect(workspace).toContain('onUpdate={handleAgentTurnComplete}');
+  });
+
+  it('splits Story Deck coverage refresh from the panel list refresh so one mutation never double-fetches', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const panel = source('components/knowledge/KnowledgePanel.tsx');
+
+    // The panel refreshes its own list on save/edit and fires ONE callback;
+    // the parent answers with a coverage-only token bump.
+    expect(panel).toContain('onEntriesMutated?.()');
+    expect(panel).toContain('void fetchEntries();');
+    expect(workspace).toContain('onEntriesMutated={handleDeckEntriesMutated}');
+    expect(workspace).toContain('const handleDeckEntriesMutated = useCallback(() => {');
+    expect(workspace).toContain('setCoverageRefreshToken(current => current + 1)');
+    // Coverage loading keys off the coverage token, NOT the panel list
+    // token — the mutation callback must not echo back into the panel's
+    // refreshToken or the list would fetch twice for one save.
+    expect(workspace).toContain('}, [coverageRefreshToken, novelId])');
+    expect(workspace).not.toContain('}, [deckRefreshToken, novelId])');
+    // External changes (agent turns, window focus) still refresh both.
+    expect(workspace).toContain('setDeckRefreshToken(current => current + 1);');
+  });
+
+  it('keeps the main Assistant runtime mounted while switching workspace views', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const chatArea = source('components/ChatArea.tsx');
+    const runtime = source('components/assistant-ui/useNovelChatRuntime.ts');
+
+    expect(workspace).toContain("className={view === 'agent' ? 'flex min-h-0 flex-1' : 'hidden'}");
+    expect(workspace).not.toContain("{view === 'agent' && (");
+    expect(workspace).toContain('onStatusChange={setAssistantStatus}');
+    expect(chatArea).toContain('onStatusChange?.(status)');
+    expect(runtime).toContain('status: chat.status');
+  });
+
+  it('keeps the Story Deck repair action enabled after coverage finishes loading', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const chatArea = source('components/ChatArea.tsx');
+
+    expect(workspace).toContain('storyDeckComplete={deckComplete}');
+    expect(workspace).toContain('approveDisabled={deckCoverageLoading}');
+    expect(workspace).not.toContain('approveDisabled={deckLoading || !deckComplete}');
+    expect(workspace).toContain('autoSubmitRequest={proposalAdjustRequest}');
+    expect(workspace).toContain('autoSubmitText={t.storyDeckCompletePrompt}');
+    expect(chatArea).toContain("void sendMessage(autoSubmitText, { repairStoryDeck: true })");
+  });
+
+  it('never projects Story Deck coverage from the previously opened novel', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+
+    expect(workspace).toContain('deckCountsNovelId === novelId');
+    expect(workspace).toContain('deckCountsNovelId !== novelId');
+    expect(workspace).toContain('setDeckCountsNovelId(novelId)');
+    expect(workspace).toContain('deckCounts={activeDeckCounts}');
+    expect(workspace).toContain('coverageCounts={activeDeckCounts}');
   });
 
   it('preserves outline chapter deep-links into the manuscript shell', () => {

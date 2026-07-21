@@ -127,6 +127,20 @@ describe('writeChapter', () => {
     expect(h.recordUsage).toHaveBeenCalledTimes(1);
   });
 
+  it('returns the saved chapter when usage recording fails after persistence', async () => {
+    const h = harness();
+    h.recordUsage.mockRejectedValueOnce(new Error('usage ledger unavailable'));
+
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(outcome.status).toBe('saved_failed');
+    expect(outcome.savedChapter).not.toBeNull();
+    expect(outcome.errorMessage).toBe('usage ledger unavailable');
+    expect(h.upsertChapter).toHaveBeenCalledTimes(1);
+    expect(h.frames.some(frame => frame.type === 'chapter_done')).toBe(false);
+    expect(h.frames.some(frame => frame.type === 'error')).toBe(false);
+  });
+
   it('settles the chapter run as cancelled (not failed) when the user stops mid-generation', async () => {
     // AI-01: a Stop during generation must record `cancelled`, exactly once,
     // and must not be logged as a provider failure.
@@ -212,16 +226,17 @@ describe('writeChapter', () => {
     expect(h.upsertChapter).toHaveBeenCalledTimes(2); // original + revision
   });
 
-  it('returns lock_failed (and emits an error frame) when the lock is lost after saving', async () => {
+  it('returns lock_failed for the batch owner to emit after persistence', async () => {
     const h = harness({}, { renewLock: async () => false });
     const outcome = await writeChapter(h.deps, input());
 
     expect(outcome.status).toBe('lock_failed');
-    expect(h.frames.some(f => f.type === 'error')).toBe(true);
+    expect(outcome.errorMessage).toBe('Writing lock lost after saving the chapter.');
+    expect(h.frames.some(f => f.type === 'error')).toBe(false);
     expect(h.frames.some(f => f.type === 'chapter_done')).toBe(false);
   });
 
-  it('returns empty (no persist, no usage, hard error) when the model yields no usable content', async () => {
+  it('returns empty with the terminal error for the batch owner to emit after persistence', async () => {
     // Draft + all 3 continuation passes return empty → below EMPTY_CHAPTER_WORD_FLOOR.
     // This is the fake-success guard: an empty result must never be persisted as
     // 'written', advance the batch, or bill usage. It must fail honestly.
@@ -236,8 +251,12 @@ describe('writeChapter', () => {
     // Never persisted, never billed for content the user never received.
     expect(h.upsertChapter).not.toHaveBeenCalled();
     expect(h.recordUsage).not.toHaveBeenCalled();
-    // Honest error surfaced to the user; no false 'chapter_done' success frame.
-    expect(h.frames.some(f => f.type === 'error')).toBe(true);
+    expect(outcome.errorMessage).toBe(
+      'Chapter 1 failed: the model produced no usable content (0 words); writing was aborted.',
+    );
+    // Terminal emission belongs to the batch owner after durable state/job
+    // persistence; the chapter engine never races that ordering.
+    expect(h.frames.some(f => f.type === 'error')).toBe(false);
     expect(h.frames.some(f => f.type === 'chapter_done')).toBe(false);
   });
 

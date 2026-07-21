@@ -63,7 +63,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const expiryRef = useRef<Map<string, { expiresAt: number; remaining: number | null }>>(new Map());
   // Discover the optional `#toast-anchor` element rendered by the desktop
   // shell. When present, toasts portal into it so they stay clear of the
-  // floating StageActionPill / ManuscriptSidebar. The anchor belongs to routed
+  // persistent StageBar / ManuscriptSidebar. The anchor belongs to routed
   // layout content, so retaining it in state can leave portals attached to a
   // detached node after navigation. Resolve it afresh whenever toast state
   // renders and fall back to the fixed container when it is absent or stale.

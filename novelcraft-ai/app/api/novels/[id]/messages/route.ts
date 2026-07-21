@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server';
-import { stepCountIs } from 'ai';
+import {
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  hasToolCall,
+  stepCountIs,
+} from 'ai';
 import { addMessageWithId, getMessages } from '@/lib/db';
 import { type ChatMessage } from '@/lib/ai';
 import { buildAIContext } from '@/lib/ai-context-builder';
@@ -12,7 +17,11 @@ import { normalizeLocale, type Locale } from '@/lib/i18n';
 import { readCreativityHeader, resolvePreset } from '@/lib/ai/generation-presets';
 import { resolveEmbeddingEndpointFromRequest } from '@/lib/knowledge/embedding';
 import { parseRequiredMessageContent } from '@/lib/message-content';
-import { brainstormAgentSystemAddon, createBrainstormTools } from '@/lib/brainstorm-agent';
+import {
+  brainstormAgentSystemAddon,
+  createBrainstormTools,
+  finalizeApprovedStoryDeck,
+} from '@/lib/brainstorm-agent';
 import { beginBrainstormReceipt } from '@/lib/brainstorm-receipts';
 import { buildUserMessageContentWithAttachments } from '@/lib/chat-attachments.server';
 import {
@@ -54,9 +63,11 @@ export async function POST(
     language?: unknown;
     messages?: unknown;
     stoppedLabel?: unknown;
+    repairStoryDeck?: unknown;
   }>(request, { maxBytes: 20 * 1024 * 1024 });
   if (parsed.error) return parsed.error as NextResponse;
   const { language } = parsed.data;
+  const repairStoryDeck = parsed.data.repairStoryDeck === true;
   const requestMessages = parseNovelChatUIMessages(parsed.data.messages);
   const submittedUserMessage = findLatestUserMessage(requestMessages);
   const submittedContent = submittedUserMessage
@@ -82,6 +93,51 @@ export async function POST(
   };
   const userMessageAlreadyPersisted = userMessage.metadata?.persisted === true;
   const originalMessages = requestMessages.length > 0 ? requestMessages : [userMessage];
+
+  if (repairStoryDeck) {
+    const receiptId = beginBrainstormReceipt(id);
+    const result = await finalizeApprovedStoryDeck(id, locale, receiptId);
+    if (!result.ok) {
+      return NextResponse.json({
+        code: 'STORY_DECK_REPAIR_FAILED',
+        error: 'The approved Story Deck could not be completed.',
+        reason: result.reason,
+      }, { status: 409 });
+    }
+    if (!userMessageAlreadyPersisted) {
+      await addMessageWithId(id, userMessage.id, 'user', content);
+    }
+    const responseMessageId = crypto.randomUUID();
+    const completionText = locale === 'en'
+      ? 'Story Deck completed: character, world, and outline cards are ready for review.'
+      : locale === 'zh-TW'
+        ? 'Story Deck 已補全：角色、世界觀與大綱卡片已可供審閱。'
+        : 'Story Deck 已补全：角色、世界观和大纲卡片已可供审阅。';
+    const assistantMessage = await addMessageWithId(
+      id,
+      responseMessageId,
+      'assistant',
+      completionText,
+    );
+    const textId = crypto.randomUUID();
+    const metadata = {
+      createdAt: assistantMessage.createdAt,
+      conversationId: assistantMessage.conversationId ?? null,
+      persisted: true,
+    };
+    const stream = createUIMessageStream<NovelChatUIMessage>({
+      originalMessages,
+      generateId: () => responseMessageId,
+      execute: ({ writer }) => {
+        writer.write({ type: 'start', messageId: responseMessageId, messageMetadata: metadata });
+        writer.write({ type: 'text-start', id: textId });
+        writer.write({ type: 'text-delta', id: textId, delta: completionText });
+        writer.write({ type: 'text-end', id: textId });
+        writer.write({ type: 'finish', finishReason: 'stop', messageMetadata: metadata });
+      },
+    });
+    return createUIMessageStreamResponse({ stream });
+  }
 
   let aiUsage;
   try {
@@ -117,7 +173,7 @@ export async function POST(
       return NextResponse.json({ error: 'Novel not found' }, { status: 404 });
     }
     contextResult = resolvedContext;
-    systemPrompt = `${contextResult.systemPrompt}\n\n${brainstormAgentSystemAddon(locale)}`;
+    systemPrompt = `${contextResult.systemPrompt}\n\n${brainstormAgentSystemAddon(locale, novel.stage)}`;
     aiUsage.addPromptText(systemPrompt + JSON.stringify({ language: locale, novelTitle: novel.title, history }));
   } catch (error) {
     await aiUsage.fail();
@@ -133,7 +189,7 @@ export async function POST(
     history,
     preset: resolvePreset('chat', readCreativityHeader(request)),
     tools: createBrainstormTools(id, brainstormReceiptId),
-    stopWhen: stepCountIs(3),
+    stopWhen: [hasToolCall('finalizeBrainstorm'), stepCountIs(3)],
     originalMessages,
     submittedUserMessage: userMessage,
     responseMessageId: crypto.randomUUID(),

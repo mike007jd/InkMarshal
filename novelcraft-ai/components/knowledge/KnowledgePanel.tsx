@@ -10,6 +10,7 @@ import {
   Plus,
   Search,
   Layers,
+  MessageSquare,
 } from 'lucide-react';
 import type { KnowledgeEntry, KnowledgeType, OutlineEntry } from '@/lib/types/knowledge';
 import { KnowledgeEntryForm } from './KnowledgeEntryForm';
@@ -18,6 +19,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
   Empty,
+  EmptyContent,
   EmptyDescription,
   EmptyHeader,
   EmptyMedia,
@@ -40,8 +42,24 @@ interface KnowledgePanelProps {
    *  `controlledFilter` and hides its internal tab row. Backwards-compatible:
    *  callers that don't pass this prop keep the old self-tabbed behaviour. */
   controlledFilter?: KnowledgeFilterTab;
+  /** Bumped by the parent when entries may have changed outside the panel
+   *  (e.g. a brainstorm turn wrote new cards). Any change refetches
+   *  immediately. */
   refreshToken?: number;
   variant?: 'workspace' | 'deck';
+  /** Coverage across the three Story Deck collections, resolved by the
+   *  parent (the panel only fetches the active filter). Rendered as count
+   *  badges on the internal tabs and on the deck header. */
+  coverageCounts?: Partial<Record<'character' | 'world' | 'outline', number>>;
+  /** When provided, empty tabs offer a path back to the Assistant so the
+   *  user can finish the brainstorm instead of hand-authoring cards. */
+  onReturnToAssistant?: () => void;
+  returnToAssistantLabel?: string;
+  /** Fired once after a successful entry save/edit from the inline form. The
+   *  panel refreshes its own list; this callback lets the parent refresh the
+   *  coverage/CTA derived from the same entries WITHOUT round-tripping the
+   *  panel's `refreshToken` (which would double-fetch the list). */
+  onEntriesMutated?: () => void;
 }
 
 const TAB_ICONS: Record<KnowledgeFilterTab, React.ComponentType<{ size?: number }>> = {
@@ -151,6 +169,10 @@ export function KnowledgePanel({
   controlledFilter,
   refreshToken = 0,
   variant = 'workspace',
+  coverageCounts,
+  onReturnToAssistant,
+  returnToAssistantLabel,
+  onEntriesMutated,
 }: KnowledgePanelProps) {
   const { t } = useLocale();
   const { toast } = useToast();
@@ -162,6 +184,7 @@ export function KnowledgePanel({
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [entries, setEntries] = useState<KnowledgeEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
   const [editingEntry, setEditingEntry] = useState<KnowledgeEntry | null>(null);
   const [creating, setCreating] = useState(false);
@@ -186,6 +209,7 @@ export function KnowledgePanel({
       setDebouncedQuery('');
       setEntries([]);
       setLoading(false);
+      setLoadError(false);
       setEditingEntry(null);
       setCreating(false);
       if (controlledFilter === undefined) setInternalTab('all');
@@ -215,6 +239,7 @@ export function KnowledgePanel({
     const isCurrentRequest = () =>
       activeNovelRef.current === requestNovelId && fetchSeqRef.current === requestSeq;
     setLoading(true);
+    setLoadError(false);
     try {
       const res = await fetch(buildKnowledgeEntriesUrl(novelId, {
         filter: activeTab,
@@ -227,6 +252,9 @@ export function KnowledgePanel({
       if (isCurrentRequest()) {
         console.error('Failed to fetch knowledge entries:', error);
         setEntries([]);
+        // Panel-local error + Retry keeps the failure where the user is
+        // looking; the toast remains as the ambient heads-up.
+        setLoadError(true);
         toast(t.errorLoadKnowledge, 'error', {
           action: { label: t.toastRetry, onClick: () => setRetryToken(value => value + 1) },
         });
@@ -249,7 +277,12 @@ export function KnowledgePanel({
   const handleSaved = () => {
     setEditingEntry(null);
     setCreating(false);
+    // Split responsibilities: the panel refreshes its own list exactly once,
+    // the parent hears about the mutation exactly once to re-resolve
+    // coverage/CTA. The parent must NOT echo this back through
+    // `refreshToken` or the list would fetch twice for one mutation.
     void fetchEntries();
+    onEntriesMutated?.();
   };
 
   const handleClose = () => {
@@ -295,6 +328,9 @@ export function KnowledgePanel({
           <TabsList className="grid w-full grid-cols-3 gap-1 rounded-lg border-0 bg-book-bg-secondary p-1 lg:grid-cols-6">
             {KNOWLEDGE_FILTER_TABS.map(tab => {
               const Icon = TAB_ICONS[tab.key];
+              const coverage = tab.key === 'character' || tab.key === 'world' || tab.key === 'outline'
+                ? coverageCounts?.[tab.key]
+                : undefined;
               return (
                 <TabsTrigger
                   key={tab.key}
@@ -303,6 +339,9 @@ export function KnowledgePanel({
                 >
                   <Icon size={12} />
                   <span className="truncate">{t[tab.labelKey]}</span>
+                  {coverage !== undefined && (
+                    <span className="shrink-0 tabular-nums text-2xs opacity-70">{coverage}</span>
+                  )}
                 </TabsTrigger>
               );
             })}
@@ -325,14 +364,67 @@ export function KnowledgePanel({
           </div>
         )}
 
-        {/* Loading */}
+        {/* Deck coverage summary — the three Story Deck collections at a
+            glance, resolved by the parent (the panel only fetches the
+            active filter). */}
+        {isDeck && coverageCounts && (
+          <div className="mb-2 flex items-center gap-3 px-1 pt-1 text-2xs font-medium text-book-ink-muted">
+            <span className="tabular-nums">{t.storyDeckCharacters} {coverageCounts.character ?? 0}</span>
+            <span className="tabular-nums">{t.storyDeckWorld} {coverageCounts.world ?? 0}</span>
+            <span className="tabular-nums">{t.storyDeckOutline} {coverageCounts.outline ?? 0}</span>
+          </div>
+        )}
+
+        {/* Loading — skeleton cards mirror the paper-card grid so the panel
+            never flashes blank between filters. */}
         {loading && !entries.length && (
-          <p className="py-8 text-center text-xs text-book-ink-muted">{t.loading}...</p>
+          <div
+            aria-busy="true"
+            aria-label={t.loading}
+            className={isDeck ? 'grid grid-cols-1 gap-3 pt-2 md:grid-cols-2 xl:grid-cols-3' : 'grid grid-cols-1 sm:grid-cols-2 gap-5 pt-2'}
+          >
+            {[0, 1, 2].map(index => (
+              <div
+                key={index}
+                className="motion-essential animate-pulse rounded-lg border border-book-border bg-book-bg-card p-4"
+              >
+                <div className="mb-3 flex items-center gap-2.5 border-b border-book-border pb-2">
+                  <div className="h-7 w-7 rounded-lg bg-book-bg-secondary" />
+                  <div className="flex-1">
+                    <div className="mb-1 h-2 w-16 rounded bg-book-bg-secondary" />
+                    <div className="h-3 w-24 rounded bg-book-bg-secondary" />
+                  </div>
+                </div>
+                <div className="mb-1.5 h-2.5 w-full rounded bg-book-bg-secondary" />
+                <div className="h-2.5 w-2/3 rounded bg-book-bg-secondary" />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Panel-local load failure — retry stays where the user is looking. */}
+        {!loading && loadError && (
+          <div
+            role="alert"
+            className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-book-danger-border bg-book-danger-light px-3 py-2"
+          >
+            <p className="text-xs text-book-danger">{t.errorLoadKnowledge}</p>
+            <Button
+              variant="outline"
+              type="button"
+              onClick={() => setRetryToken(value => value + 1)}
+              className="h-auto shrink-0 px-3 py-1.5 text-xs font-medium"
+            >
+              {t.toastRetry}
+            </Button>
+          </div>
         )}
 
         {/* Empty state — distinguish "no matches for this search" from the
-            genuine first-run "nothing here yet". */}
-        {!loading && !entries.length && !creating && (
+            genuine first-run "nothing here yet". Every tab names what is
+            missing and, when the brainstorm is the intended source, offers a
+            path back to the Assistant to finish it. */}
+        {!loading && !loadError && !entries.length && !creating && (
           <Empty className="border-0 p-0 py-12 md:p-0 md:py-12">
             <EmptyHeader>
               <EmptyMedia>
@@ -359,6 +451,19 @@ export function KnowledgePanel({
                 </>
               )}
             </EmptyHeader>
+            {!debouncedQuery.trim() && onReturnToAssistant && (
+              <EmptyContent className="mt-3">
+                <Button
+                  variant="outline"
+                  type="button"
+                  onClick={onReturnToAssistant}
+                  className="h-auto gap-1.5 px-3 py-2 text-xs font-medium"
+                >
+                  <MessageSquare size={14} />
+                  {returnToAssistantLabel ?? t.storyDeckReturnAssistant}
+                </Button>
+              </EmptyContent>
+            )}
           </Empty>
         )}
 
@@ -396,7 +501,7 @@ export function KnowledgePanel({
                     role="treeitem"
                     aria-level={depth + 1}
                     onClick={() => { setEditingEntry(entry); setCreating(false); }}
-                    className={`group flex w-full items-center gap-3 border border-transparent ${indent} pr-3 py-2 text-left transition hover:border-book-border hover:bg-book-bg-card`}
+                    className={`group flex w-full items-center gap-3 border border-transparent ${indent} pr-3 py-2 text-left transition-feedback hover:border-book-border hover:bg-book-bg-card`}
                   >
                     <span className="w-16 shrink-0 text-2xs font-semibold uppercase tracking-wider text-book-gold-dark">
                       {level === 'chapter'
@@ -413,7 +518,7 @@ export function KnowledgePanel({
                         </span>
                       )}
                     </span>
-                    <FileText size={14} className="shrink-0 text-book-ink-muted opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
+                    <FileText size={14} className="shrink-0 text-book-ink-muted opacity-0 transition-feedback group-hover:opacity-100 group-focus-visible:opacity-100" />
                   </Button>
                 );
               })}
