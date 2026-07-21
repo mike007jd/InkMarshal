@@ -27,7 +27,7 @@ export interface ReadyRunDetails {
   estimatedCostLabel?: string | null;
 }
 
-export interface ReadyCompletionCardLabels {
+interface ReadyCompletionCardLabels {
   title?: string;
   reviewDeck?: string;
   adjustProposal?: string;

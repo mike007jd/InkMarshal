@@ -481,8 +481,8 @@ describe('business UI uses design-system primitives', () => {
     expect(primitive).not.toMatch(/\bshape\s*[?:=]/);
     expect(primitive).not.toMatch(RADIUS_PATTERN);
     expect(primitive).not.toMatch(/\bclassName\??:/);
+    expect(primitive).not.toMatch(/\bfullWidth\b/);
     expect(primitive).toContain('size="unstyled"');
-    expect(primitive).toContain("fullWidth && 'w-full py-2.5'");
 
     const forkedCallers: string[] = [];
     for (const root of SOURCE_ROOTS) {
