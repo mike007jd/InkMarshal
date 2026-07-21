@@ -14,7 +14,7 @@
 import type { ModelTokenPricing } from '@/lib/model-supply/types';
 import type { Translations } from '@/lib/i18n';
 
-export type ProviderNameKey =
+type ProviderNameKey =
   | 'providerNameDeepseek'
   | 'providerNameMoonshot'
   | 'providerNameDashscope'
