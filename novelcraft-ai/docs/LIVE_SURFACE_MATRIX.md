@@ -16,7 +16,7 @@
 | `/desktop-studio/series`, `/series/[id]` | Desktop | `app/desktop-studio/series/*` | Series / shared-world management |
 | `/desktop-studio/workflows` | Desktop | `components/workflows/WorkflowStudioSurface` | Workflow / template surface |
 | `/novel/[id]` | Desktop | `components/NovelWorkspace` | Active-novel workspace (chat interview, greenlight, blueprint, autonomous writing) |
-| `/novel/[id]/manuscript` | Desktop | `app/novel/[id]/manuscript/page.tsx` → `components/ManuscriptShell` | Writer desk / chapter editor |
+| `/novel/[id]/manuscript` | Desktop | `app/novel/[id]/manuscript/page.tsx` → redirect `/novel/[id]?view=manuscript` (`NovelWorkspace` / `ManuscriptShell`) | Compatibility redirect (preserves `autostart` / `chapter`) |
 
 The public landing, download, examples, privacy, and terms routes live in sibling
 repository `../../../AiNovelSite`. If this desktop app is accidentally served as
