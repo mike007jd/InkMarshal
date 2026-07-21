@@ -69,12 +69,3 @@ const POST_INTERVIEW_STAGES: ReadonlySet<NovelStage> = new Set<NovelStage>([
 export function isPostInterviewStage(stage: NovelStage | null | undefined): boolean {
   return !!stage && POST_INTERVIEW_STAGES.has(stage);
 }
-
-export function shouldShowStageActionPill(
-  view: NovelView,
-  stage: NovelStage | null | undefined,
-): boolean {
-  if (view === 'agent') return stage === 'ready_for_greenlight';
-  if (view === 'read-edit') return stage === 'whole_book_unification' || stage === 'completed';
-  return false;
-}

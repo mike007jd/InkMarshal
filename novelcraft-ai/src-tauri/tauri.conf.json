@@ -16,7 +16,7 @@
         "title": "InkMarshal",
         "width": 1280,
         "height": 820,
-        "minWidth": 1040,
+        "minWidth": 768,
         "minHeight": 720,
         "resizable": true,
         "fullscreen": false,

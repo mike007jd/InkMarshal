@@ -228,10 +228,62 @@ describe('novel messages API', () => {
         system: string;
         tools: Record<string, unknown>;
         stopWhen: unknown;
+        toolChoice?: unknown;
       };
       expect(options.system).toContain('You are running a novel Brainstorm');
-      expect(Object.keys(options.tools)).toEqual(['updateBrainstormProfile', 'upsertStoryDeckEntries']);
+      expect(Object.keys(options.tools)).toEqual([
+        'updateBrainstormProfile',
+        'upsertStoryDeckEntries',
+        'finalizeBrainstorm',
+      ]);
       expect(options.stopWhen).toBeDefined();
+      expect(options.toolChoice).toBeUndefined();
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('repairs an approved Story Deck deterministically without calling the model', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions, '');
+
+    const {
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      getMessages,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Repair Story Deck' });
+
+    try {
+      await updateNovel(novel.id, {
+        stage: 'ready_for_greenlight',
+        genre: 'Fantasy',
+        storySummary: 'Two sisters uncover a haunted archive.',
+        characterSummary: 'The sisters disagree about whether to trust the archive.',
+        arcSummary: 'They reconcile while sealing the archive.',
+      });
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          language: 'en',
+          repairStoryDeck: true,
+          messages: [{ id: 'repair-user-1', role: 'user', parts: [{ type: 'text', text: 'Complete the approved Story Deck.' }] }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      const body = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(body).toContain('Story Deck completed');
+      expect(streamOptions).toHaveLength(0);
+      const entries = await getKnowledgeEntries(novel.id);
+      expect(entries.map(entry => entry.type).sort()).toEqual(['character', 'outline', 'world']);
+      expect((await getMessages(novel.id)).map(message => message.role)).toEqual(['user', 'assistant']);
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }

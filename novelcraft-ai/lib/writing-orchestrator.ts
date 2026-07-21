@@ -52,8 +52,28 @@ export const EMPTY_CHAPTER_WORD_FLOOR = 10;
 // ── Wire protocol ───────────────────────────────────────────────────────────
 /** The NDJSON frames the writing stream emits. Typed so the server `send` and
  *  the client reducer (lib/writing-session.ts) share one definition. */
+export type WritingPhase =
+  | 'preparing'
+  | 'planning'
+  | 'drafting'
+  | 'saving'
+  | 'chapter_complete'
+  | 'paused'
+  | 'failed'
+  | 'complete';
+
 export type WritingFrame =
-  | { type: 'heartbeat' }
+  | { type: 'heartbeat'; at?: string }
+  | {
+      type: 'phase';
+      phase: WritingPhase;
+      message: string;
+      progress?: number;
+      chapterNumber?: number;
+      chapterTitle?: string;
+      completedChapters?: number;
+      totalChapters?: number;
+    }
   | { type: 'progress'; progress: number; message: string }
   | { type: 'blueprint'; blueprint: NovelBlueprint; total: number }
   | { type: 'writing'; chapterNumber: number; chunk: string; title: string }
@@ -66,6 +86,8 @@ export type WritingFrame =
       qualityIssues: ChapterQualityIssue[] | null;
       ralphRevisions: number;
       progress: number;
+      completedChapters: number;
+      totalChapters: number;
     }
   | {
       type: 'batch_done';
@@ -156,10 +178,11 @@ export interface WriteChapterInput {
   progress: number;
 }
 
-export type ChapterOutcomeStatus = 'written' | 'aborted' | 'lock_failed' | 'empty';
+export type ChapterOutcomeStatus = 'written' | 'aborted' | 'lock_failed' | 'saved_failed' | 'empty';
 
 export interface ChapterOutcome {
   status: ChapterOutcomeStatus;
+  errorMessage: string | null;
   content: string;
   actualWords: number;
   attempts: number;
@@ -243,6 +266,7 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
   function buildOutcome(status: ChapterOutcomeStatus, over: Partial<ChapterOutcome> = {}): ChapterOutcome {
     return {
       status,
+      errorMessage: null,
       content: chapterContent,
       actualWords: countWords(chapterContent),
       attempts: chapterAttempts,
@@ -371,13 +395,18 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
   // a sub-floor result is a generation failure, not a cosmetic drift.
   if (actualWords < EMPTY_CHAPTER_WORD_FLOOR) {
     await failChapterUsageOnce();
-    deps.emit({
-      type: 'error',
-      error: isZhLocale(language)
-        ? `第 ${plan.chapterNumber} 章生成失败：模型未产出有效内容（${actualWords} 字），已中止本次写作。`
-        : `Chapter ${plan.chapterNumber} failed: the model produced no usable content (${actualWords} words); writing was aborted.`,
+    const errorMessage = isZhLocale(language)
+      ? `第 ${plan.chapterNumber} 章生成失败：模型未产出有效内容（${actualWords} 字），已中止本次写作。`
+      : `Chapter ${plan.chapterNumber} failed: the model produced no usable content (${actualWords} words); writing was aborted.`;
+    // The batch use case owns terminal ordering. Returning the exact message
+    // lets it persist novel + job truth before exposing the error frame, so the
+    // client's single terminal refresh cannot observe a still-running job.
+    return buildOutcome('empty', {
+      content: chapterContent,
+      actualWords,
+      generationMeta,
+      errorMessage,
     });
-    return buildOutcome('empty', { content: chapterContent, actualWords, generationMeta });
   }
 
   // CRITICAL: record usage strictly AFTER the chapter content is persisted, so a
@@ -385,6 +414,11 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
   let savedChapter: Chapter;
   try {
     savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent);
+  } catch (error) {
+    await failChapterUsageOnce();
+    throw error;
+  }
+  try {
     await chapterUsage.recordUsage({
       inputTokens: aggregatedInputTokens || undefined,
       outputTokens: aggregatedOutputTokens || undefined,
@@ -392,13 +426,24 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
     });
     chapterUsageSettled = true;
   } catch (error) {
-    await failChapterUsageOnce();
-    throw error;
+    await failChapterUsageOnce().catch(() => {});
+    return buildOutcome('saved_failed', {
+      content: chapterContent,
+      actualWords,
+      generationMeta,
+      savedChapter,
+      errorMessage: sanitizeError(error, 'The chapter was saved, but its usage record failed.'),
+    });
   }
 
   if (!(await deps.renewLock())) {
-    deps.emit({ type: 'error', error: 'Writing lock lost after saving the chapter.' });
-    return buildOutcome('lock_failed', { content: chapterContent, actualWords, generationMeta, savedChapter });
+    return buildOutcome('lock_failed', {
+      content: chapterContent,
+      actualWords,
+      generationMeta,
+      savedChapter,
+      errorMessage: 'Writing lock lost after saving the chapter.',
+    });
   }
 
   const deferredPostChapterUsages: DeferredUsage[] = [];
@@ -436,8 +481,14 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
     });
     if (!(await deps.renewLock())) {
       await failSettledUsages(summarizeOutcome, validateOutcome);
-      deps.emit({ type: 'error', error: 'Writing lock lost before Ralph revision.' });
-      return buildOutcome('lock_failed', { content: chapterContent, actualWords, qualityIssues: chapterQualityIssues, generationMeta, savedChapter });
+      return buildOutcome('lock_failed', {
+        content: chapterContent,
+        actualWords,
+        qualityIssues: chapterQualityIssues,
+        generationMeta,
+        savedChapter,
+        errorMessage: 'Writing lock lost before Ralph revision.',
+      });
     }
     let repairOutcome: ReviseOutcome | null;
     try {
@@ -548,6 +599,7 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
 
   return {
     status: 'written',
+    errorMessage: null,
     content: chapterContent,
     actualWords,
     attempts: chapterAttempts,

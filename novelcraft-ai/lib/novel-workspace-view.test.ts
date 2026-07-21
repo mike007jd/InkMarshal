@@ -5,7 +5,6 @@ import {
   buildNovelViewHref,
   isPostInterviewStage,
   parseViewParam,
-  shouldShowStageActionPill,
 } from '@/lib/novel-workspace-view';
 
 describe('buildNovelEntryHref', () => {
@@ -92,30 +91,5 @@ describe('isPostInterviewStage', () => {
   it('is null/undefined-safe', () => {
     expect(isPostInterviewStage(null)).toBe(false);
     expect(isPostInterviewStage(undefined)).toBe(false);
-  });
-});
-
-describe('shouldShowStageActionPill', () => {
-  it('hides passive discovery status on Agent so it does not compete with model status', () => {
-    expect(shouldShowStageActionPill('agent', 'discovery_interview')).toBe(false);
-  });
-
-  it('keeps the greenlight CTA visible on Agent', () => {
-    expect(shouldShowStageActionPill('agent', 'ready_for_greenlight')).toBe(true);
-  });
-
-  it('keeps Read/Edit focused on text controls before export-ready stages', () => {
-    expect(shouldShowStageActionPill('read-edit', 'discovery_interview')).toBe(false);
-    expect(shouldShowStageActionPill('read-edit', 'ready_for_greenlight')).toBe(false);
-    expect(shouldShowStageActionPill('read-edit', 'autonomous_writing')).toBe(false);
-  });
-
-  it('shows the export ZIP action on Read/Edit once the manuscript is export-ready', () => {
-    expect(shouldShowStageActionPill('read-edit', 'whole_book_unification')).toBe(true);
-    expect(shouldShowStageActionPill('read-edit', 'completed')).toBe(true);
-  });
-
-  it('keeps Story Deck focused on structured cards instead of a floating stage pill', () => {
-    expect(shouldShowStageActionPill('story-deck', 'ready_for_greenlight')).toBe(false);
   });
 });

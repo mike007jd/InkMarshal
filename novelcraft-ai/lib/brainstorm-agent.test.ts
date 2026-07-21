@@ -24,21 +24,27 @@ type ExecutableTool = {
 };
 
 describe('brainstorm agent tools', () => {
-  it('marks a brainstorm ready with a greenlight-compatible proposal state', async () => {
-    const { createNovel, deleteNovelCascade, getNovel } = await import('@/lib/db');
+  it('only marks a brainstorm ready after atomically saving a complete Story Deck', async () => {
+    const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
     const { getInterviewState } = await import('@/lib/interview-state-server');
     const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Ready' });
 
     try {
       const tools = createBrainstormTools(novel.id);
-      await (tools.updateBrainstormProfile as unknown as ExecutableTool).execute({
-        genre: 'Mystery',
-        targetWords: 60000,
-        storySummary: 'Two sisters investigate a haunted archive.',
-        characterSummary: 'One skeptic, one believer.',
-        arcSummary: 'The haunting reveals a family betrayal.',
-        readyForGreenlight: true,
+      await (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
+        profile: {
+          genre: 'Mystery',
+          targetWords: 60000,
+          storySummary: 'Two sisters investigate a haunted archive.',
+          characterSummary: 'One skeptic, one believer.',
+          arcSummary: 'The haunting reveals a family betrayal.',
+        },
+        entries: [
+          { type: 'character', title: 'Mira', summary: 'A skeptical archivist.', details: {} },
+          { type: 'world', title: 'The Archive', summary: 'Erased histories speak at night.', details: {} },
+          { type: 'outline', title: 'The Locked Shelf', summary: 'The sisters expose a family betrayal.', details: { chapterNumber: '1' } },
+        ],
       });
 
       const updated = await getNovel(novel.id);
@@ -47,6 +53,31 @@ describe('brainstorm agent tools', () => {
       expect(updated?.progress).toBe(0);
       expect(state?.mode).toBe('proposal_review');
       expect(state?.collectedProfile.storySummary).toContain('haunted archive');
+      const entries = await getKnowledgeEntries(novel.id);
+      expect(new Set(entries.map(entry => entry.type))).toEqual(new Set(['character', 'world', 'outline']));
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('does not advance the stage when finalization omits a required Deck category', async () => {
+    const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const novel = await createNovel({ userId: 'local-user', title: 'Incomplete Brainstorm' });
+
+    try {
+      const tools = createBrainstormTools(novel.id);
+      const result = await (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
+        profile: { storySummary: 'A proposal that is not structurally complete.' },
+        entries: [
+          { type: 'character', title: 'Mira', summary: 'An archivist.', details: {} },
+          { type: 'world', title: 'Archive', summary: 'A haunted library.', details: {} },
+        ],
+      });
+
+      expect(result).toEqual({ ok: false, reason: 'incomplete' });
+      expect((await getNovel(novel.id))?.stage).toBe('discovery_interview');
+      expect(await getKnowledgeEntries(novel.id)).toEqual([]);
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }

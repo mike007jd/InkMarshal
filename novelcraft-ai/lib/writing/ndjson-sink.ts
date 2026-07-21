@@ -37,7 +37,12 @@ export function createNdjsonWritingStream(opts: NdjsonWritingStreamOptions): Rea
     async start(controller) {
       let controllerClosed = false;
       const send = (frame: WritingFrame) => {
-        if (controllerClosed || opts.signal.aborted) return;
+        // A timer-driven lock loss aborts generation before the use case can
+        // durably settle the failure. Keep business terminal frames deliverable
+        // after that abort; an actually closed consumer is still protected by
+        // controllerClosed/the enqueue catch below.
+        const isBusinessTerminal = frame.type === 'error' || frame.type === 'done' || frame.type === 'batch_done';
+        if (controllerClosed || (opts.signal.aborted && !isBusinessTerminal)) return;
         try {
           controller.enqueue(encoder.encode(JSON.stringify(frame) + '\n'));
         } catch {
@@ -48,7 +53,7 @@ export function createNdjsonWritingStream(opts: NdjsonWritingStreamOptions): Rea
       const sink: WritingEventSink = { emit: send, isClosed: () => controllerClosed };
 
       // Heartbeat keeps proxies/clients from timing out during slow model calls.
-      const heartbeat = setInterval(() => send({ type: 'heartbeat' }), 5000);
+      const heartbeat = setInterval(() => send({ type: 'heartbeat', at: new Date().toISOString() }), 5000);
       // Renew on a timer too, not only at chapter boundaries: a single chapter
       // can exceed the lock TTL on slow local engines, which would let another
       // session steal the lock mid-generation. If renewal reports the lock is

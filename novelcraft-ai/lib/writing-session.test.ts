@@ -44,10 +44,10 @@ function createHarness() {
     appendLiveChapter: vi.fn(),
     setLiveChapter: vi.fn(chapter => calls.push(`live:${chapter?.chapterNumber ?? 'null'}`)),
     upsertChapter: vi.fn(chapter => calls.push(`chapter:${chapter.chapterNumber}`)),
-    refreshNovel: vi.fn(async () => { calls.push('refreshNovel'); }),
     refreshChapters: vi.fn(async () => { calls.push('refreshChapters'); }),
     onDone: vi.fn(() => calls.push('done')),
     onError: vi.fn(message => calls.push(`error:${message}`)),
+    updateRunState: vi.fn(),
   };
   return { calls, batcher, handlers };
 }
@@ -85,6 +85,34 @@ describe('chapterFromWritingDoneEvent', () => {
 });
 
 describe('applyWritingSessionEvent', () => {
+  it('surfaces explicit planning phase and heartbeat activity', async () => {
+    const h = createHarness();
+
+    await applyWritingSessionEvent({
+      type: 'phase',
+      phase: 'planning',
+      progress: 5,
+      completedChapters: 0,
+      totalChapters: 12,
+      message: 'Planning chapter blueprint...',
+    }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
+    await applyWritingSessionEvent({
+      type: 'heartbeat',
+      at: '2026-07-21T00:00:00.000Z',
+    }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
+
+    expect(h.handlers.setStatusLabel).toHaveBeenCalledWith('Planning chapter blueprint...');
+    expect(h.handlers.updateRunState).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      phase: 'planning',
+      progress: 5,
+      completedChapters: 0,
+      totalChapters: 12,
+    }));
+    expect(h.handlers.updateRunState).toHaveBeenNthCalledWith(2, {
+      lastActivityAt: '2026-07-21T00:00:00.000Z',
+    });
+  });
+
   it('flushes pending prose before progress and patches the novel stage', async () => {
     const h = createHarness();
 
@@ -163,7 +191,6 @@ describe('applyWritingSessionEvent', () => {
       'cancel',
       'live:null',
       'error:provider failed',
-      'refreshNovel',
       'refreshChapters',
     ]);
   });

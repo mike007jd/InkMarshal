@@ -6,6 +6,7 @@ import { projectBlueprintFromOutline } from '@/lib/ai/blueprint-projection';
 import { updateNovelRequestSchema, type UpdateNovelRequest } from '@/lib/types/novel';
 import type { Novel } from '@/lib/db-types';
 import { getNovelSeriesId, reprojectSharedEntriesForSeries } from '@/lib/db/queries-series';
+import { getLatestWritingJob } from '@/lib/db/queries-writing-jobs';
 
 const LOCK_TTL_SEC = 60;
 
@@ -29,7 +30,8 @@ export async function GET(
   // the streaming `blueprint` event keep working. Project it on demand from
   // outline knowledge entries (cheap: a single index/canonical table scan).
   const blueprint = await projectBlueprintFromOutline(id);
-  return NextResponse.json({ ...ownerCheck.novel, blueprint });
+  const writingJob = getLatestWritingJob(id);
+  return NextResponse.json({ ...ownerCheck.novel, blueprint, writingJob });
 }
 
 export async function PATCH(

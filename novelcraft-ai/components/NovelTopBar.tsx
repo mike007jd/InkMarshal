@@ -6,6 +6,7 @@ import { BookOpenText, ListChecks, MessageSquare, Pencil } from 'lucide-react';
 import { useLanguage } from '@/components/LanguageProvider';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Spinner } from '@/components/ui/spinner';
 import type { NovelStage } from '@/lib/novel-stages';
 import type { NovelView } from '@/lib/novel-workspace-view';
 
@@ -18,6 +19,8 @@ interface NovelTopBarProps {
   handleTitleSave: () => void;
   view: NovelView;
   setView: (view: NovelView) => void;
+  assistantActive?: boolean;
+  manuscriptActive?: boolean;
 }
 
 export function NovelTopBar({
@@ -29,6 +32,8 @@ export function NovelTopBar({
   handleTitleSave,
   view,
   setView,
+  assistantActive = false,
+  manuscriptActive = false,
 }: NovelTopBarProps) {
   const { t } = useLanguage();
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -78,7 +83,7 @@ export function NovelTopBar({
               <h1 className="truncate text-left font-serif text-base tracking-tight text-book-ink-primary lg:text-lg">
                 {novel?.title || t.untitledNovel}
               </h1>
-              <Pencil className="w-3.5 h-3.5 text-book-ink-muted opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+              <Pencil className="w-3.5 h-3.5 text-book-ink-muted opacity-0 group-hover:opacity-100 transition-feedback shrink-0" />
             </Button>
           )}
           {novel?.genre && !editingTitle && (
@@ -92,6 +97,9 @@ export function NovelTopBar({
         >
           {modeItems.map(({ view: itemView, label, Icon }) => {
             const active = view === itemView;
+            const busy = itemView === 'agent'
+              ? assistantActive
+              : itemView === 'read-edit' && manuscriptActive;
             return (
               <Button
                 key={itemView}
@@ -103,7 +111,7 @@ export function NovelTopBar({
                 aria-label={label}
                 aria-current={active ? 'page' : undefined}
                 className={[
-                  'flex items-center gap-1.5 rounded px-2.5 py-1 text-sm font-medium transition-colors',
+                  'flex items-center gap-1.5 rounded px-2.5 py-1 text-sm font-medium transition-feedback',
                   active
                     ? 'bg-book-bg-card text-book-ink-primary shadow-sm'
                     : 'text-book-ink-muted hover:bg-book-bg-card/60 hover:text-book-ink-primary',
@@ -111,6 +119,11 @@ export function NovelTopBar({
               >
                 <Icon className="h-4 w-4 shrink-0" />
                 <span className="hidden whitespace-nowrap sm:inline">{label}</span>
+                {busy ? (
+                  <span role="status" aria-label={t.activityActive.replace('{label}', label)}>
+                    <Spinner size="sm" className="shrink-0 text-book-gold" />
+                  </span>
+                ) : null}
               </Button>
             );
           })}

@@ -434,9 +434,10 @@ export function KnowledgeEntryForm({ novelId, entry, initialPrefill, onClose, on
           size="unstyled"
           type="button"
           onClick={onClose}
+          aria-label={t.dismiss}
           className="rounded p-1 text-book-ink-muted hover:bg-book-bg-secondary hover:text-book-ink-primary"
         >
-          <X size={16} />
+          <X size={16} aria-hidden="true" />
         </Button>
       </div>
 

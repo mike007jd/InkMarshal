@@ -16,7 +16,7 @@ interface StopStreamingButtonProps {
 
 /**
  * Shared danger-styled "stop the stream" affordance for NovelWorkspace,
- * StageActionPill and EditChatbox. The role has exactly one geometry — it rides
+ * StageBar and EditChatbox. The role has exactly one geometry — it rides
  * the canonical Button radius so a stop control never reads as a pill in one
  * surface and a box in another. Full-width stage actions use the stage row's
  * comfortable height; inline chat actions use compact height. Call sites vary

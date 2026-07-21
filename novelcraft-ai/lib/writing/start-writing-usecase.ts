@@ -86,7 +86,7 @@ export interface StartWritingContext {
 
 function jobStatusForReason(reason: StartWritingEndReason): 'completed' | 'paused' | 'failed' {
   if (reason === 'complete') return 'completed';
-  if (reason === 'error') return 'failed';
+  if (reason === 'error' || reason === 'lock_failed') return 'failed';
   return 'paused';
 }
 
@@ -124,6 +124,16 @@ export async function executeStartWriting(
   let seq = 0;
   let abortedReason: StartWritingEndReason = 'unknown';
   let errorMessage: string | null = null;
+  let latestProgress = novel.progress;
+  let jobFinalized = false;
+  let jobFinalizationAttempted = false;
+
+  const finalizeJob = () => {
+    if (jobFinalized || jobFinalizationAttempted) return;
+    jobFinalizationAttempted = true;
+    jobs.finalize(jobStatusForReason(abortedReason), abortedReason, errorMessage);
+    jobFinalized = true;
+  };
 
   // Independent persisted fact: whether this novel already had chapters before
   // this run. `completedChapters` is only populated from `existingChapters`
@@ -135,7 +145,7 @@ export async function executeStartWriting(
   const originalStage = novel.stage;
   const originalProgress = novel.progress;
 
-  const resetColdAbort = async () => {
+  const persistPausedRun = async () => {
     if (completedChapters > 0) return;
     if (hadPersistedChapters) {
       // A resume aborted before the blueprint established the true completed
@@ -145,14 +155,104 @@ export async function executeStartWriting(
       errorMessage ??= coldAbortMessage(abortedReason);
       return;
     }
-    await updateNovel(id, { stage: 'ready_for_greenlight', progress: 0 });
+    // Approval is durable. Closing the app or pressing Pause cancels the HTTP
+    // generation stream, but it must not send the project back through the
+    // approval gate. Persist the last real phase so relaunch reconstructs a
+    // truthful paused WritingRunState with a Resume action.
+    await updateNovel(id, { stage: 'autonomous_writing', progress: latestProgress });
     errorMessage ??= coldAbortMessage(abortedReason);
+  };
+
+  const persistFailedRun = async () => {
+    await updateNovel(id, completedChapters > 0
+      ? { stage: 'autonomous_writing', progress: latestProgress }
+      : hadPersistedChapters
+        ? { stage: originalStage, progress: originalProgress }
+        : { stage: 'autonomous_writing', progress: latestProgress });
+  };
+
+  const settlePausedRun = async () => {
+    try {
+      await persistPausedRun();
+    } catch (persistenceError) {
+      console.error('Failed to persist paused writing state:', persistenceError);
+      errorMessage = isZhLocale(language)
+        ? '写作已暂停，但无法保存最新暂停状态。'
+        : 'Writing paused, but its latest paused state could not be saved.';
+    }
+    try {
+      finalizeJob();
+    } catch (finalizeError) {
+      console.error('Failed to finalize paused writing job:', finalizeError);
+    }
+  };
+
+  const emitFailedTerminal = (publicError: string) => {
+    sink.emit({
+      type: 'phase',
+      phase: 'failed',
+      progress: latestProgress,
+      completedChapters,
+      message: publicError,
+    });
+    sink.emit({ type: 'error', error: publicError });
+  };
+
+  const settleFailedRun = async (publicError: string) => {
+    try {
+      await persistFailedRun();
+    } catch (persistenceError) {
+      console.error('Failed to persist writing terminal state:', persistenceError);
+      const settlementMessage = isZhLocale(language)
+        ? '写作失败，且无法保存最终状态。请重试。'
+        : 'Writing failed and its terminal state could not be saved. Please retry.';
+      emitFailedTerminal(settlementMessage);
+      return;
+    }
+    try {
+      finalizeJob();
+    } catch (finalizeError) {
+      console.error('Failed to finalize writing job:', finalizeError);
+      const finalizeMessage = isZhLocale(language)
+        ? '写作失败，内容状态已保存，但运行记录无法完成。请重试。'
+        : 'Writing failed; its content state was saved, but the run record could not be finalized. Please retry.';
+      emitFailedTerminal(finalizeMessage);
+      return;
+    }
+    emitFailedTerminal(publicError);
+  };
+
+  const finalizeBeforeTerminal = (failureMessage: string): boolean => {
+    try {
+      finalizeJob();
+      return true;
+    } catch (finalizeError) {
+      console.error('Failed to finalize writing job:', finalizeError);
+      errorMessage = failureMessage;
+      sink.emit({ type: 'error', error: failureMessage });
+      return false;
+    }
   };
 
   try {
     log(START_WRITING_EVENTS.begin, { stage: novel.stage, messages: ctx.messageCount });
 
+    sink.emit({
+      type: 'phase',
+      phase: 'preparing',
+      progress: Math.max(0, novel.progress),
+      completedChapters: existingChapters.length,
+      message: isZhLocale(language) ? '正在准备写作上下文...' : 'Preparing writing context...',
+    });
     await updateNovel(id, { stage: 'autonomous_writing', progress: 5 });
+    latestProgress = 5;
+    sink.emit({
+      type: 'phase',
+      phase: 'planning',
+      progress: 5,
+      completedChapters: existingChapters.length,
+      message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...',
+    });
     sink.emit({ type: 'progress', progress: 5, message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...' });
 
     const blueprint = await loadOrGenerateBlueprint({
@@ -183,6 +283,7 @@ export async function executeStartWriting(
     completedChapters = blueprint.chapters.filter(c => existingByNumber.has(c.chapterNumber)).length;
     const progressForCompleted = (count: number) =>
       15 + Math.floor((count / blueprint.chapters.length) * 75);
+    latestProgress = progressForCompleted(completedChapters);
 
     // Hoist adaptive digest sizing — inputs (target words, chapter count)
     // don't change across the loop, no point recomputing per chapter.
@@ -251,7 +352,9 @@ export async function executeStartWriting(
       }
 
       if (!(await lease.renew())) {
-        sink.emit({ type: 'error', error: 'Writing lock lost (another session took over).' });
+        errorMessage = isZhLocale(language)
+          ? '写作锁已丢失（另一个会话已接管）。'
+          : 'Writing lock lost (another session took over).';
         abortedReason = 'lock_failed';
         break;
       }
@@ -264,6 +367,18 @@ export async function executeStartWriting(
       );
       const chapterStartedAt = Date.now();
       log(START_WRITING_EVENTS.chapterStart, { ch: plan.chapterNumber, title: plan.title });
+      sink.emit({
+        type: 'phase',
+        phase: 'drafting',
+        progress: progressForCompleted(completedChapters),
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `正在创作第 ${plan.chapterNumber} 章：${plan.title}`
+          : `Writing Chapter ${plan.chapterNumber}: ${plan.title}`,
+      });
       sink.emit({
         type: 'progress',
         progress: progressForCompleted(completedChapters),
@@ -279,13 +394,13 @@ export async function executeStartWriting(
             chapterUsage = await createAIUsageSession(request, { userId, operation: 'chapter' });
           } catch (error) {
             const response = aiUsageErrorResponse(error);
-            sink.emit({
-              type: 'error',
-              error: response
-                ? (await response.json().catch(() => ({})))?.error || 'AI usage error'
-                : sanitizeError(error, 'AI usage error'),
-            });
-            throw error;
+            const message = response
+              ? (await response.json().catch(() => ({})))?.error || 'AI usage error'
+              : sanitizeError(error, 'AI usage error');
+            // The outer use-case catch owns durable terminal ordering. Preserve
+            // the provider-specific message without exposing an early error
+            // frame that could refresh before novel/job persistence.
+            throw new Error(message, { cause: error });
           }
           chapterUsage.addPromptText(systemPrompt);
           chapterUsage.addPromptText(JSON.stringify(plan));
@@ -367,26 +482,20 @@ export async function executeStartWriting(
         log,
       };
 
-      let outcome;
-      try {
-        outcome = await writeChapter(chapterDeps, {
-          plan,
-          targetWordsPerChapter,
-          language,
-          earlierDigest: digest.earlierDigest,
-          recentTails: digest.recentTails,
-          progress: progressForCompleted(completedChapters),
-        });
-      } catch (error) {
-        sink.emit({ type: 'error', error: sanitizeError(error, 'Writing failed') });
-        throw error;
-      }
+      const outcome = await writeChapter(chapterDeps, {
+        plan,
+        targetWordsPerChapter,
+        language,
+        earlierDigest: digest.earlierDigest,
+        recentTails: digest.recentTails,
+        progress: progressForCompleted(completedChapters),
+      });
 
       if (outcome.status === 'aborted') {
         abortedReason = 'aborted';
         break;
       }
-      if (outcome.status === 'lock_failed') {
+      if (outcome.status === 'lock_failed' || outcome.status === 'saved_failed') {
         // The lock can be lost immediately after writeChapter persisted the raw
         // draft but before summarize/validate/Ralph completed. Preserve that
         // durable fact in batch progress so resetColdAbort cannot roll the novel
@@ -399,17 +508,27 @@ export async function executeStartWriting(
           existingByNumber.set(plan.chapterNumber, outcome.savedChapter);
           const persistedProgress = progressForCompleted(completedChapters);
           await updateNovel(id, { stage: 'autonomous_writing', progress: persistedProgress });
+          latestProgress = persistedProgress;
           jobs.bumpProgress(plan.chapterNumber, ++seq);
         }
-        abortedReason = 'lock_failed';
+        errorMessage = outcome.errorMessage ?? (outcome.status === 'lock_failed'
+          ? (isZhLocale(language)
+              ? '写作锁已丢失（另一个会话已接管）。'
+              : 'Writing lock lost (another session took over).')
+          : (isZhLocale(language)
+              ? '章节已保存，但用量记录失败。'
+              : 'The chapter was saved, but its usage record failed.'));
+        abortedReason = outcome.status === 'lock_failed' ? 'lock_failed' : 'error';
         break;
       }
       // `empty` = the model produced no usable content after all continuation
-      // passes (fake-success guard in the orchestrator). The orchestrator has
-      // already emitted a user-facing error frame and failed usage; here we stop
-      // the batch and finalize the job as a generation error so the run ends
-      // honestly instead of advancing past an empty chapter.
+      // passes (fake-success guard in the orchestrator). It returns the exact
+      // error identity without emitting; this use case persists/finalizes first
+      // and only then exposes the terminal frame.
       if (outcome.status === 'empty') {
+        errorMessage = outcome.errorMessage ?? (isZhLocale(language)
+          ? '模型未生成可用的章节内容。'
+          : 'The model produced no usable chapter content.');
         abortedReason = 'error';
         break;
       }
@@ -421,6 +540,18 @@ export async function executeStartWriting(
       const chapterKeyFacts = outcome.keyFacts;
       const chapterQualityIssues = outcome.qualityIssues;
       const ralphRevisionCount = outcome.ralphRevisions;
+      sink.emit({
+        type: 'phase',
+        phase: 'saving',
+        progress: progressForCompleted(completedChapters),
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `正在保存第 ${plan.chapterNumber} 章...`
+          : `Saving Chapter ${plan.chapterNumber}...`,
+      });
       completedChapters++;
       writtenThisBatch++;
       existingByNumber.set(plan.chapterNumber, outcome.savedChapter!);
@@ -457,6 +588,7 @@ export async function executeStartWriting(
       }
 
       const newProgress = progressForCompleted(completedChapters);
+      latestProgress = newProgress;
       sink.emit({
         type: 'chapter_done',
         chapterNumber: plan.chapterNumber,
@@ -466,6 +598,20 @@ export async function executeStartWriting(
         qualityIssues: chapterQualityIssues,
         ralphRevisions: ralphRevisionCount,
         progress: newProgress,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+      });
+      sink.emit({
+        type: 'phase',
+        phase: 'chapter_complete',
+        progress: newProgress,
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `第 ${plan.chapterNumber} 章已完成`
+          : `Chapter ${plan.chapterNumber} complete`,
       });
 
       await updateNovel(id, { progress: newProgress });
@@ -496,6 +642,10 @@ export async function executeStartWriting(
       const missing = missingChapterNumbers(blueprint.chapters, existingByNumber);
       const remaining = missing.length;
       const nextChapter = missing[0] ?? null;
+      const finalizeMessage = isZhLocale(language)
+        ? '章节已保存，但无法完成本次写作记录。请重试。'
+        : 'The chapter was saved, but this writing run could not be finalized. Please retry.';
+      if (!finalizeBeforeTerminal(finalizeMessage)) return;
       sink.emit({
         type: 'batch_done',
         nextChapter,
@@ -503,23 +653,39 @@ export async function executeStartWriting(
         completedChapters,
         totalChapters: blueprint.chapters.length,
       });
+      sink.emit({
+        type: 'phase',
+        phase: 'paused',
+        progress: progressForCompleted(completedChapters),
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language) ? '写作已暂停，可随时继续' : 'Writing paused — ready to continue',
+      });
       log(START_WRITING_EVENTS.complete, {
         chapters: writtenThisBatch,
         batchComplete: true,
         durationMs: Date.now() - requestStartedAt,
       });
+      return;
+    }
+
+    // A chapter failure or lock loss is already a determined terminal result.
+    // Settle it before consulting cancellation so a concurrent abort cannot
+    // rewrite a real failure as a clean pause.
+    if (abortedReason === 'error' || abortedReason === 'lock_failed') {
+      const publicError = errorMessage ?? 'Writing failed';
+      await settleFailedRun(publicError);
+      return;
     }
 
     if (lifecycle.isCancelled()) {
       abortedReason = 'aborted';
-      await resetColdAbort();
+      await settlePausedRun();
       return;
     }
 
     if (!shouldFinalizeStartWriting(abortedReason)) {
-      if (abortedReason !== 'batch_complete') {
-        await resetColdAbort();
-      }
+      await settlePausedRun();
       return;
     }
 
@@ -553,8 +719,20 @@ export async function executeStartWriting(
     if (!finalNovel) {
       throw new Error('Novel not found');
     }
-    sink.emit({ type: 'done', novel: finalNovel, message: finalMsg });
     abortedReason = 'complete';
+    const finalizeMessage = isZhLocale(language)
+      ? '全书初稿已保存，但无法完成写作记录。请重试。'
+      : 'The full draft was saved, but its writing run could not be finalized. Please retry.';
+    if (!finalizeBeforeTerminal(finalizeMessage)) return;
+    sink.emit({ type: 'done', novel: finalNovel, message: finalMsg });
+    sink.emit({
+      type: 'phase',
+      phase: 'complete',
+      progress: 100,
+      completedChapters: blueprint.chapters.length,
+      totalChapters: blueprint.chapters.length,
+      message: finalMsg,
+    });
     log(START_WRITING_EVENTS.complete, {
       chapters: blueprint.chapters.length,
       durationMs: Date.now() - requestStartedAt,
@@ -563,7 +741,7 @@ export async function executeStartWriting(
     if (lifecycle.isCancelled()) {
       abortedReason = 'aborted';
       log(START_WRITING_EVENTS.aborted, { message: err instanceof Error ? err.message : String(err) });
-      await resetColdAbort();
+      await settlePausedRun();
       return;
     }
     abortedReason = 'error';
@@ -573,19 +751,19 @@ export async function executeStartWriting(
       durationMs: Date.now() - requestStartedAt,
     });
     console.error('Writing error:', err);
-    await updateNovel(id, completedChapters > 0
-      ? { stage: 'autonomous_writing' }
-      : hadPersistedChapters
-        ? { stage: originalStage, progress: originalProgress }
-        : { stage: 'ready_for_greenlight', progress: 0 });
-    sink.emit({ type: 'error', error: sanitizeError(err, 'Writing failed') });
+    // Fresh approved runs (no chapters yet) already advanced to autonomous_writing
+    // at prepare. A real pre-first-chapter error must stay there with the last
+    // progress so reload reconstructs failed + Retry — never demote back through
+    // the greenlight gate. Resumes with existing chapters restore pre-run truth.
+    const publicError = sanitizeError(err, 'Writing failed');
+    await settleFailedRun(publicError);
   } finally {
     log(START_WRITING_EVENTS.end, {
       reason: abortedReason,
       durationMs: Date.now() - requestStartedAt,
     });
-    // The single terminal run-history write. batch_complete/aborted/lock_failed
-    // → paused (a clean pause point); error → failed; full book → completed.
-    jobs.finalize(jobStatusForReason(abortedReason), abortedReason, errorMessage);
+    // Failed runs finalize only after their novel state persists. If that write
+    // fails, leave the job unfinalized rather than claim durable terminal truth.
+    if (abortedReason !== 'error' && abortedReason !== 'lock_failed') finalizeJob();
   }
 }

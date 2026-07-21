@@ -121,11 +121,19 @@ describe('Models surface IA', () => {
   it('lets repair links open the routing tab without breaking default local opens', () => {
     const modelsPanel = readFileSync(join(process.cwd(), 'components/ModelsPanel.tsx'), 'utf8');
     const statusBar = readFileSync(join(process.cwd(), 'components/WritingModelStatusBar.tsx'), 'utf8');
-    const dotBadge = readFileSync(join(process.cwd(), 'components/WritingModelDotBadge.tsx'), 'utf8');
 
     expect(modelsPanel).toContain("export type ModelsPanelTab = 'local' | 'providers';");
     expect(modelsPanel).toContain("new CustomEvent(OPEN_MODELS_EVENT, { detail: { defaultTab } })");
     expect(statusBar).toContain("openModelsPanel('providers')");
-    expect(dotBadge).toContain('onClick={() => openModelsPanel()}');
+  });
+
+  it('keeps healthy manuscript model status silent and collapses its empty wrappers', () => {
+    const notice = readFileSync(join(process.cwd(), 'components/WritingModelDotBadge.tsx'), 'utf8');
+    const manuscript = readFileSync(join(process.cwd(), 'components/ManuscriptShell.tsx'), 'utf8');
+
+    expect(notice).toContain("health === 'down'");
+    expect(notice).toContain('return null;');
+    expect(notice).not.toContain('model-health-dot');
+    expect(manuscript.match(/empty:hidden/g)).toHaveLength(2);
   });
 });

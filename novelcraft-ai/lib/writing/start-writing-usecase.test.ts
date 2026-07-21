@@ -16,6 +16,10 @@ const steps = vi.hoisted(() => ({
   runRalphRevision: vi.fn(),
 }));
 const orch = vi.hoisted(() => ({ writeChapter: vi.fn() }));
+const usage = vi.hoisted(() => ({
+  createAIUsageSession: vi.fn(),
+  aiUsageErrorResponse: vi.fn(() => null as Response | null),
+}));
 const db = vi.hoisted(() => ({
   completeWritingDraft: vi.fn(async () => ({ id: 'n1' })),
   getVolumeSummaries: vi.fn(async () => []),
@@ -37,8 +41,8 @@ vi.mock('@/lib/writing-orchestrator', () => orch);
 vi.mock('@/lib/db', () => db);
 vi.mock('@/lib/ai', () => ai);
 vi.mock('@/lib/ai-usage', () => ({
-  createAIUsageSession: vi.fn(),
-  aiUsageErrorResponse: vi.fn(() => null),
+  createAIUsageSession: usage.createAIUsageSession,
+  aiUsageErrorResponse: usage.aiUsageErrorResponse,
 }));
 
 function blueprint(chapterCount: number) {
@@ -97,6 +101,7 @@ function makeCtx(overrides: Partial<StartWritingContext> = {}): {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  db.updateNovel.mockReset().mockResolvedValue({});
   steps.maybeRunVolumeSummary.mockResolvedValue(undefined);
   db.completeWritingDraft.mockResolvedValue({ id: 'n1' });
   db.getVolumeSummaries.mockResolvedValue([]);
@@ -118,6 +123,28 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
     expect(jobs.finalize).toHaveBeenCalledWith('completed', 'complete', null);
     expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
+    const doneCall = sink.emit.mock.calls.findIndex(([frame]) => frame.type === 'done');
+    expect(jobs.finalize.mock.invocationCallOrder[0])
+      .toBeLessThan(sink.emit.mock.invocationCallOrder[doneCall]);
+  });
+
+  it('never demotes a completed draft when job finalization throws', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockResolvedValue(writtenOutcome(1));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+    jobs.finalize.mockImplementation(() => { throw new Error('job db unavailable'); });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(db.completeWritingDraft).toHaveBeenCalledWith('n1', expect.any(String));
+    expect(db.updateNovel).not.toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
+    expect(jobs.finalize).toHaveBeenCalledTimes(1);
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
+    expect(sink.emit).toHaveBeenCalledWith({
+      type: 'error',
+      error: 'The full draft was saved, but its writing run could not be finalized. Please retry.',
+    });
   });
 
   it('finalizes the job as paused at a batch boundary', async () => {
@@ -133,6 +160,26 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
     expect(jobs.finalize).toHaveBeenCalledWith('paused', 'batch_complete', null);
     expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'batch_done' }));
+    const batchDoneCall = sink.emit.mock.calls.findIndex(([frame]) => frame.type === 'batch_done');
+    expect(jobs.finalize.mock.invocationCallOrder[0])
+      .toBeLessThan(sink.emit.mock.invocationCallOrder[batchDoneCall]);
+  });
+
+  it('keeps a batch boundary truthful when job finalization throws', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(2));
+    orch.writeChapter.mockResolvedValue(writtenOutcome(1));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx({ chaptersLimit: 1 });
+    jobs.finalize.mockImplementation(() => { throw new Error('job db unavailable'); });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.finalize).toHaveBeenCalledTimes(1);
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'batch_done' }));
+    expect(sink.emit).toHaveBeenCalledWith({
+      type: 'error',
+      error: 'The chapter was saved, but this writing run could not be finalized. Please retry.',
+    });
   });
 
   it('finalizes the job as failed and stops on a writeChapter error', async () => {
@@ -143,11 +190,94 @@ describe('executeStartWriting — writing_jobs wiring', () => {
 
     await executeStartWriting(ctx, sink);
 
+    expect(db.updateNovel).toHaveBeenNthCalledWith(1, 'n1', { stage: 'autonomous_writing', progress: 5 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
+    expect(db.updateNovel).not.toHaveBeenCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
     expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', 'boom');
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'failed', progress: 15 }));
     expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'phase' && frame.phase === 'failed')).toHaveLength(1);
+    expect(jobs.finalize).toHaveBeenCalledTimes(1);
+    const persistOrder = db.updateNovel.mock.invocationCallOrder.at(-1)!;
+    const terminalEmit = sink.emit.mock.calls.findIndex(([frame]) => frame.type === 'error');
+    expect(persistOrder).toBeLessThan(jobs.finalize.mock.invocationCallOrder[0]);
+    expect(jobs.finalize.mock.invocationCallOrder[0])
+      .toBeLessThan(sink.emit.mock.invocationCallOrder[terminalEmit]);
   });
 
-  it('does not bump progress and finalizes paused when the lock is lost', async () => {
+  it('persists and finalizes before exposing an AI usage setup failure exactly once', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    usage.createAIUsageSession.mockRejectedValueOnce(new Error('raw quota failure'));
+    usage.aiUsageErrorResponse.mockReturnValueOnce(new Response(JSON.stringify({ error: 'Chapter quota denied' })));
+    orch.writeChapter.mockImplementationOnce(async (deps: { createChapterUsage: () => Promise<unknown> }) => {
+      await deps.createChapterUsage();
+    });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.finalize).toHaveBeenCalledOnce();
+    expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', 'Chapter quota denied');
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: 'Chapter quota denied' });
+    const persistOrder = db.updateNovel.mock.invocationCallOrder.at(-1)!;
+    const finalizeOrder = jobs.finalize.mock.invocationCallOrder[0];
+    const terminalEmit = sink.emit.mock.calls.findIndex(([frame]) => frame.type === 'error');
+    expect(persistOrder).toBeLessThan(finalizeOrder);
+    expect(finalizeOrder).toBeLessThan(sink.emit.mock.invocationCallOrder[terminalEmit]);
+  });
+
+  it('keeps an empty chapter as one failed terminal instead of rewriting it as a batch pause', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    const emptyError = 'Chapter 1 failed: the model produced no usable content (0 words); writing was aborted.';
+    orch.writeChapter.mockResolvedValue({ status: 'empty', errorMessage: emptyError });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.finalize).toHaveBeenCalledWith(
+      'failed',
+      'error',
+      emptyError,
+    );
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'batch_done' }));
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'paused' }));
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'failed' }));
+    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: emptyError });
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'phase' && frame.phase === 'failed')).toHaveLength(1);
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
+    expect(jobs.finalize).toHaveBeenCalledTimes(1);
+    const persistOrder = db.updateNovel.mock.invocationCallOrder.at(-1)!;
+    const finalizeOrder = jobs.finalize.mock.invocationCallOrder[0];
+    const terminalEmit = sink.emit.mock.calls.findIndex(([frame]) => frame.type === 'error');
+    expect(persistOrder).toBeLessThan(finalizeOrder);
+    expect(finalizeOrder).toBeLessThan(sink.emit.mock.invocationCallOrder[terminalEmit]);
+  });
+
+  it('keeps a determined empty result failed when cancellation arrives concurrently', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    const emptyError = 'Chapter 1 failed: empty';
+    orch.writeChapter.mockResolvedValue({ status: 'empty', errorMessage: emptyError });
+    const isCancelled = vi.fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx({
+      lifecycle: { signal: { aborted: false }, isCancelled, cancel: vi.fn() } as never,
+    });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', emptyError);
+    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: emptyError });
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'paused' }));
+  });
+
+  it('does not bump progress and settles a lost lock as one durable failure', async () => {
     steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const { ctx, jobs, sink } = makeCtx();
@@ -157,12 +287,19 @@ describe('executeStartWriting — writing_jobs wiring', () => {
 
     expect(orch.writeChapter).not.toHaveBeenCalled();
     expect(jobs.bumpProgress).not.toHaveBeenCalled();
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
     expect(jobs.finalize).toHaveBeenCalledWith(
-      'paused',
+      'failed',
       'lock_failed',
-      'Writing stopped before any chapter was created because the writing lock was lost.',
+      'Writing lock lost (another session took over).',
     );
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit).toHaveBeenCalledWith({
+      type: 'error',
+      error: 'Writing lock lost (another session took over).',
+    });
+    const persistOrder = db.updateNovel.mock.invocationCallOrder.at(-1)!;
+    expect(persistOrder).toBeLessThan(jobs.finalize.mock.invocationCallOrder[0]);
   });
 
   it('keeps a chapter saved before lock loss in progress without claiming post-processing completed', async () => {
@@ -170,6 +307,7 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     orch.writeChapter.mockResolvedValue({
       ...writtenOutcome(1),
       status: 'lock_failed',
+      errorMessage: 'Writing lock lost after saving the chapter.',
     });
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const { ctx, jobs, sink } = makeCtx();
@@ -180,12 +318,59 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
     expect(db.updateNovel).not.toHaveBeenCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
     expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
-    expect(jobs.finalize).toHaveBeenCalledWith('paused', 'lock_failed', null);
+    expect(jobs.finalize).toHaveBeenCalledWith(
+      'failed',
+      'lock_failed',
+      'Writing lock lost after saving the chapter.',
+    );
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit).toHaveBeenCalledWith({
+      type: 'error',
+      error: 'Writing lock lost after saving the chapter.',
+    });
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
   });
 
-  it('resets the novel out of 5 percent drafting when blueprint generation is aborted', async () => {
+  it('counts a saved chapter before failing on its usage record', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockResolvedValue({
+      ...writtenOutcome(1),
+      status: 'saved_failed',
+      errorMessage: 'usage ledger unavailable',
+    });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
+    expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', 'usage ledger unavailable');
+    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: 'usage ledger unavailable' });
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
+  });
+
+  it('does not finalize a failed job when terminal novel persistence fails', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockRejectedValue(new Error('generation exploded'));
+    db.updateNovel
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('disk unavailable'));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.finalize).not.toHaveBeenCalled();
+    expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
+    expect(sink.emit).toHaveBeenCalledWith({
+      type: 'error',
+      error: 'Writing failed and its terminal state could not be saved. Please retry.',
+    });
+  });
+
+  it('preserves approval and a resumable 5 percent state when blueprint generation is aborted', async () => {
     steps.loadOrGenerateBlueprint.mockRejectedValue(new Error('aborted upstream'));
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const controller = new AbortController();
@@ -197,7 +382,7 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     await executeStartWriting(ctx, sink);
 
     expect(db.updateNovel).toHaveBeenNthCalledWith(1, 'n1', { stage: 'autonomous_writing', progress: 5 });
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 5 });
     expect(orch.writeChapter).not.toHaveBeenCalled();
     expect(jobs.finalize).toHaveBeenCalledWith(
       'paused',
@@ -243,6 +428,24 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', 'blueprint model failed');
   });
 
+  it('keeps autonomous_writing + latestProgress on a pre-first-chapter error for a fresh approved run', async () => {
+    steps.loadOrGenerateBlueprint.mockRejectedValue(new Error('blueprint boom'));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx({
+      novel: { stage: 'ready_for_greenlight', progress: 0, targetWords: 80_000, title: 'T', genre: 'F' } as unknown as StartWritingContext['novel'],
+      existingChapters: [],
+    });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(db.updateNovel).toHaveBeenNthCalledWith(1, 'n1', { stage: 'autonomous_writing', progress: 5 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 5 });
+    expect(db.updateNovel).not.toHaveBeenCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
+    expect(jobs.finalize).toHaveBeenCalledWith('failed', 'error', 'blueprint boom');
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'failed', progress: 5 }));
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', error: expect.any(String) }));
+  });
+
   it('records a disconnect (controller_closed) when the controller closes on the final send', async () => {
     steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
     orch.writeChapter.mockResolvedValue(writtenOutcome(1));
@@ -262,5 +465,25 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     await executeStartWriting(ctx, sink);
 
     expect(jobs.finalize).toHaveBeenCalledWith('paused', 'controller_closed', null);
+  });
+
+  it('keeps a cold disconnect paused when its latest pause-state write fails', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    db.updateNovel
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('disk unavailable'));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+    sink.isClosed = () => true;
+
+    await executeStartWriting(ctx, sink);
+
+    expect(orch.writeChapter).not.toHaveBeenCalled();
+    expect(jobs.finalize).toHaveBeenCalledWith(
+      'paused',
+      'controller_closed',
+      'Writing paused, but its latest paused state could not be saved.',
+    );
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'failed' }));
   });
 });

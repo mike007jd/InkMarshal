@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
+import type { ChatStatus } from 'ai';
 // useRouter is intentionally not imported. Mode switches update the current
 // history entry in place, while sidebar links own novel-to-novel navigation.
 import {
@@ -18,24 +19,26 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
-import { StopStreamingButton } from '@/components/ui/StopStreamingButton';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ChatArea } from '@/components/ChatArea';
 import { ConversationList } from '@/components/conversations/ConversationList';
 import { ConversationThread } from '@/components/conversations/ConversationThread';
 import { KnowledgePanel } from '@/components/knowledge/KnowledgePanel';
 import { ManuscriptShell } from '@/components/ManuscriptShell';
 import { NovelTopBar } from '@/components/NovelTopBar';
+import { StageBar } from '@/components/StageBar';
+import { ProposalReviewPanel } from '@/components/ProposalReviewPanel';
+import { useCapabilityBinding } from '@/components/WritingModelStatusBar';
 import {
   buildNovelViewHref,
+  isPostInterviewStage,
   parseViewParam,
-  shouldShowStageActionPill,
   type NovelView,
 } from '@/lib/novel-workspace-view';
 import {
   rememberNovelWorkspaceView,
   rememberNovelWorkspaceViewAfterHydration,
 } from '@/lib/novel-workspace-preferences';
-import { StageActionPill } from '@/components/StageActionPill';
 import { UnificationPanel } from '@/components/UnificationPanel';
 import type { Novel, UnificationReport } from '@/lib/db-types';
 import { useLanguage } from '@/components/LanguageProvider';
@@ -59,14 +62,10 @@ interface NovelWorkspaceProps {
   initialView?: NovelView;
 }
 
-const PRE_WRITING_STAGES = new Set<Novel['stage']>([
-  'discovery_interview',
-  'ready_for_greenlight',
-]);
+type RequiredDeckType = 'character' | 'world' | 'outline';
+type DeckCounts = Record<RequiredDeckType, number>;
 
-function hasUnlockedConversationThreads(stage: Novel['stage'] | null | undefined): boolean {
-  return Boolean(stage && !PRE_WRITING_STAGES.has(stage));
-}
+const EMPTY_DECK_COUNTS: DeckCounts = { character: 0, world: 0, outline: 0 };
 
 /**
  * NovelWorkspace — the per-novel main pane (W3-1).
@@ -119,6 +118,53 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
     return viewFromUrl ?? initialView;
   });
   const [storyDeckTab, setStoryDeckTab] = useState<KnowledgeFilterTab>('character');
+  const [assistantStatus, setAssistantStatus] = useState<ChatStatus>('ready');
+  const [deckRefreshToken, setDeckRefreshToken] = useState(0);
+  // Coverage (deckCounts → CTA) refreshes on its own token so a panel-local
+  // save/edit can re-resolve coverage without round-tripping the panel's
+  // list token — one mutation, one list fetch, one coverage fetch.
+  const [coverageRefreshToken, setCoverageRefreshToken] = useState(0);
+  const [deckCounts, setDeckCounts] = useState<DeckCounts>(EMPTY_DECK_COUNTS);
+  const [deckCountsNovelId, setDeckCountsNovelId] = useState(novelId);
+  const [deckLoading, setDeckLoading] = useState(true);
+  const [proposalAdjustRequest, setProposalAdjustRequest] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadDeckCounts() {
+      setDeckLoading(true);
+      try {
+        const response = await fetch(`/api/novels/${novelId}/knowledge`, {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Failed to load Story Deck (HTTP ${response.status})`);
+        const entries = await response.json() as Array<{ type?: string }>;
+        const next: DeckCounts = { ...EMPTY_DECK_COUNTS };
+        for (const entry of entries) {
+          if (entry.type === 'character' || entry.type === 'world' || entry.type === 'outline') {
+            next[entry.type] += 1;
+          }
+        }
+        setDeckCounts(next);
+        setDeckCountsNovelId(novelId);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          console.error('Failed to refresh Story Deck coverage:', error);
+          setDeckCounts(EMPTY_DECK_COUNTS);
+          setDeckCountsNovelId(novelId);
+        }
+      } finally {
+        if (!controller.signal.aborted) setDeckLoading(false);
+      }
+    }
+    void loadDeckCounts();
+    return () => controller.abort();
+  }, [coverageRefreshToken, novelId]);
+
+  const handleDeckEntriesMutated = useCallback(() => {
+    setCoverageRefreshToken(current => current + 1);
+  }, []);
 
   const selectView = useCallback((nextView: NovelView) => {
     setView(nextView);
@@ -210,18 +256,40 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
   const autostart = (searchParams?.get('autostart') ?? '') === '1';
   const manuscript = useManuscriptSession({ novelId, autostart });
   const fetchManuscriptNovel = manuscript.fetchNovel;
+  const fetchManuscriptChapters = manuscript.fetchChapters;
 
   const handleAgentTurnComplete = useCallback(() => {
+    setDeckRefreshToken(current => current + 1);
+    setCoverageRefreshToken(current => current + 1);
     void Promise.allSettled([
       refreshNovel(),
       fetchManuscriptNovel(),
     ]);
   }, [fetchManuscriptNovel, refreshNovel]);
 
+  useEffect(() => {
+    const refreshOnFocus = () => {
+      setDeckRefreshToken(current => current + 1);
+      setCoverageRefreshToken(current => current + 1);
+      void Promise.allSettled([
+        refreshNovel(),
+        fetchManuscriptNovel(),
+        fetchManuscriptChapters(),
+      ]);
+    };
+    window.addEventListener('focus', refreshOnFocus);
+    return () => window.removeEventListener('focus', refreshOnFocus);
+  }, [fetchManuscriptChapters, fetchManuscriptNovel, refreshNovel]);
+
   const handleStartWriting = useCallback(() => {
     selectView('read-edit');
     void manuscript.startWriting();
   }, [manuscript, selectView]);
+
+  const handleCompleteStoryDeck = useCallback(() => {
+    setProposalAdjustRequest(current => current + 1);
+    selectView('agent');
+  }, [selectView]);
 
   const handleDownloadBundle = useCallback(async () => {
     const requestNovelId = novelId;
@@ -306,10 +374,15 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
   // Source of truth for stage: prefer the manuscript copy when it is hydrated
   // (it absorbs streaming patches), otherwise fall back to the title-edit copy.
   const liveNovel = manuscript.novel ?? novel;
-  const conversationThreadsUnlocked = hasUnlockedConversationThreads(liveNovel?.stage);
+  const conversationThreadsUnlocked = isPostInterviewStage(liveNovel?.stage);
 
   // The W4-D unification banner on Read/Edit depends on stage.
   const showUnification = !!liveNovel && isInStages(liveNovel.stage, STAGES_THAT_SHOW_UNIFICATION_PANEL);
+  const activeDeckCounts = deckCountsNovelId === novelId ? deckCounts : EMPTY_DECK_COUNTS;
+  const deckComplete = activeDeckCounts.character > 0
+    && activeDeckCounts.world > 0
+    && activeDeckCounts.outline > 0;
+  const deckCoverageLoading = deckLoading || deckCountsNovelId !== novelId;
 
   return (
     <div className="flex h-full min-h-0 flex-col book-texture-parchment">
@@ -322,6 +395,26 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
         handleTitleSave={handleTitleSave}
         view={view}
         setView={selectView}
+        assistantActive={assistantStatus === 'submitted' || assistantStatus === 'streaming'}
+        manuscriptActive={manuscript.isStreaming}
+      />
+
+      <StageBar
+        stage={liveNovel?.stage}
+        progress={liveNovel?.progress ?? 0}
+        onApprove={handleStartWriting}
+        storyDeckComplete={deckComplete}
+        onCompleteDeck={handleCompleteStoryDeck}
+        onReviewDeck={() => selectView('story-deck')}
+        onDownloadBundle={handleDownloadBundle}
+        isStreaming={manuscript.isStreaming}
+        approveDisabled={deckCoverageLoading}
+        labels={{
+          stepStoryReady: t.stageStoryReady,
+          stepApproval: t.stageApproval,
+          reviewDeck: t.storyDeckReviewAction,
+        }}
+        className="z-[9] shrink-0 border-x-0 border-t-0 shadow-none"
       />
 
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -331,24 +424,37 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
             against and the continuous reader collapsed to zero height at narrow
             widths (blank prose area). */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-          {view === 'agent' && (
+          <div className={view === 'agent' ? 'flex min-h-0 flex-1' : 'hidden'} aria-hidden={view !== 'agent'}>
             <AgentMode
+              key={novelId}
               novelId={novelId}
+              novel={liveNovel}
+              deckCounts={activeDeckCounts}
+              deckLoading={deckLoading}
               conversationThreadsUnlocked={conversationThreadsUnlocked}
               activeConvId={activeConvId}
               setActiveConvId={setActiveConvId}
               onCreateConversation={handleCreateConversation}
               onUpdate={handleAgentTurnComplete}
+              onStatusChange={setAssistantStatus}
+              chatStatus={assistantStatus}
+              onStartWriting={handleStartWriting}
+              onReviewDeck={() => selectView('story-deck')}
+              onCompleteDeck={handleCompleteStoryDeck}
+              proposalAdjustRequest={proposalAdjustRequest}
               initialCreativity={liveNovel?.settings?.creativity ?? null}
             />
-          )}
+          </div>
 
           {view === 'story-deck' && (
             <StoryDeckMode
               novelId={novelId}
-              novel={liveNovel}
               tab={storyDeckTab}
               onTabChange={setStoryDeckTab}
+              refreshToken={deckRefreshToken}
+              coverageCounts={activeDeckCounts}
+              onReturnToAssistant={handleCompleteStoryDeck}
+              onEntriesMutated={handleDeckEntriesMutated}
             />
           )}
 
@@ -369,18 +475,6 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
           )}
         </div>
 
-        {/* Keep the floating action pill only where it owns a real next action.
-            Discovery chat already shows stage in the sidebar, so a duplicate
-            badge just competes with the model status strip. */}
-        {shouldShowStageActionPill(view, liveNovel?.stage) && (
-          <StageActionPill
-            novel={liveNovel}
-            onStartWriting={handleStartWriting}
-            onDownloadBundle={handleDownloadBundle}
-            isStreaming={manuscript.isStreaming}
-            onPauseWriting={manuscript.pauseWriting}
-          />
-        )}
       </div>
     </div>
   );
@@ -388,24 +482,55 @@ export function NovelWorkspace({ novelId, initialView = 'agent' }: NovelWorkspac
 
 function AgentMode({
   novelId,
+  novel,
+  deckCounts,
+  deckLoading,
   conversationThreadsUnlocked,
   activeConvId,
   setActiveConvId,
   onCreateConversation,
   onUpdate,
+  onStatusChange,
+  chatStatus,
+  onStartWriting,
+  onReviewDeck,
+  onCompleteDeck,
+  proposalAdjustRequest,
   initialCreativity,
 }: {
   novelId: string;
+  novel: Novel | null | undefined;
+  deckCounts: DeckCounts;
+  deckLoading: boolean;
   conversationThreadsUnlocked: boolean;
   activeConvId: string | null;
   setActiveConvId: (id: string | null) => void;
   onCreateConversation: (topic: string, title: string) => void | Promise<void>;
   onUpdate: () => void;
+  onStatusChange: (status: ChatStatus) => void;
+  chatStatus: ChatStatus;
+  onStartWriting: () => void;
+  onReviewDeck: () => void;
+  onCompleteDeck: () => void;
+  proposalAdjustRequest: number;
   initialCreativity?: CreativityLevel | null;
 }) {
   const { t } = useLanguage();
   const showConversationList = conversationThreadsUnlocked;
   const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
+  const [adjustingProposalLocally, setAdjustingProposalLocally] = useState(false);
+  const [acknowledgedAdjustRequest, setAcknowledgedAdjustRequest] = useState(proposalAdjustRequest);
+  const proposalReview = novel?.stage === 'ready_for_greenlight';
+  const adjustingProposal = adjustingProposalLocally
+    || proposalAdjustRequest !== acknowledgedAdjustRequest;
+
+  const handleChatStatusChange = useCallback((nextStatus: ChatStatus) => {
+    onStatusChange(nextStatus);
+    if (proposalReview && nextStatus === 'ready') {
+      setAdjustingProposalLocally(false);
+      setAcknowledgedAdjustRequest(proposalAdjustRequest);
+    }
+  }, [onStatusChange, proposalAdjustRequest, proposalReview]);
 
   useEffect(() => {
     const wide = window.matchMedia('(min-width: 1024px)');
@@ -418,7 +543,7 @@ function AgentMode({
   }, []);
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-book-bg-primary lg:flex-row">
+    <div className="flex h-full w-full min-h-0 flex-1 flex-col overflow-hidden bg-book-bg-primary lg:flex-row">
       {showConversationList && (
         <div className="hidden min-h-0 w-72 flex-col border-r border-book-border bg-book-bg-primary/80 lg:flex">
           <Button
@@ -477,13 +602,30 @@ function AgentMode({
           <div className="min-h-0 flex-1">
             <ConversationThread novelId={novelId} conversationId={activeConvId} />
           </div>
-        ) : (
+        ) : null}
+        <div className={showConversationList && activeConvId ? 'hidden' : 'flex min-h-0 flex-1'}>
           <ChatArea
             novelId={novelId}
             onUpdate={onUpdate}
+            onStatusChange={handleChatStatusChange}
             initialCreativity={initialCreativity ?? null}
+            composerCollapsed={proposalReview && !adjustingProposal}
+            autoSubmitRequest={proposalAdjustRequest}
+            autoSubmitText={t.storyDeckCompletePrompt}
+            completionContent={proposalReview && !adjustingProposal && novel ? (
+              <ProposalReviewPanel
+                novel={novel}
+                counts={deckCounts}
+                coverageLoading={deckLoading}
+                onApprove={onStartWriting}
+                onReviewDeck={onReviewDeck}
+                onAdjustProposal={() => setAdjustingProposalLocally(true)}
+                onCompleteDeck={onCompleteDeck}
+                busy={chatStatus === 'submitted' || chatStatus === 'streaming'}
+              />
+            ) : null}
           />
-        )}
+        </div>
       </div>
 
       {showConversationList && (
@@ -534,14 +676,20 @@ function AgentMode({
 
 function StoryDeckMode({
   novelId,
-  novel,
   tab,
   onTabChange,
+  refreshToken,
+  coverageCounts,
+  onReturnToAssistant,
+  onEntriesMutated,
 }: {
   novelId: string;
-  novel: Novel | null | undefined;
   tab: KnowledgeFilterTab;
   onTabChange: (tab: KnowledgeFilterTab) => void;
+  refreshToken: number;
+  coverageCounts: DeckCounts;
+  onReturnToAssistant: () => void;
+  onEntriesMutated: () => void;
 }) {
   const { t } = useLanguage();
   const tabs: ReadonlyArray<{
@@ -553,12 +701,6 @@ function StoryDeckMode({
     { key: 'world', label: t.storyDeckWorld, Icon: Globe },
     { key: 'outline', label: t.storyDeckOutline, Icon: FileText },
   ];
-  const signal = tab === 'character'
-    ? novel?.characterSummary
-    : tab === 'world'
-      ? novel?.storySummary
-      : novel?.arcSummary;
-
   return (
     <section className="flex h-full min-h-0 flex-col bg-book-bg-primary">
       <div className="border-b border-book-border px-5 py-4">
@@ -569,44 +711,34 @@ function StoryDeckMode({
           {t.storyDeckSubtitle}
         </p>
       </div>
-      <div className="grid grid-cols-3 gap-1 border-b border-book-border bg-book-bg-secondary/60 p-2 sm:max-w-xl">
-        {tabs.map(({ key, label, Icon }) => {
-          const active = tab === key;
-          return (
-            <Button
+      <Tabs
+        value={tab}
+        onValueChange={(value) => onTabChange(value as KnowledgeFilterTab)}
+        className="border-b border-book-border bg-book-bg-secondary/60 p-2 sm:max-w-xl"
+      >
+        <TabsList className="grid w-full grid-cols-3 gap-1 border-0">
+          {tabs.map(({ key, label, Icon }) => (
+            <TabsTrigger
               key={key}
-              type="button"
-              variant="unstyled"
-              size="unstyled"
-              onClick={() => onTabChange(key)}
-              className={[
-                'flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium transition-feedback',
-                active
-                  ? 'bg-book-bg-card text-book-ink-primary shadow-sm'
-                  : 'text-book-ink-muted hover:bg-book-bg-card/60 hover:text-book-ink-primary',
-              ].join(' ')}
+              value={key}
+              className="flex items-center justify-center gap-1.5 rounded-md border-0 px-2 py-1.5 text-xs font-medium data-[state=active]:border-b-transparent data-[state=active]:bg-book-bg-card data-[state=active]:text-book-ink-primary data-[state=active]:shadow-sm"
             >
               <Icon className="h-3.5 w-3.5" />
               <span className="truncate">{label}</span>
-            </Button>
-          );
-        })}
-      </div>
-      {signal?.trim() && (
-        <div className="border-b border-book-border bg-book-bg-card/50 px-4 py-3">
-          <div className="text-2xs font-semibold uppercase tracking-widest text-book-gold-dark">
-            {t.storyDeckBrainstormSignal}
-          </div>
-          <p className="mt-1 line-clamp-4 text-xs leading-5 text-book-ink-secondary">
-            {signal.trim()}
-          </p>
-        </div>
-      )}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
       <div className="min-h-0 flex-1">
         <KnowledgePanel
           novelId={novelId}
           controlledFilter={tab}
           variant="deck"
+          refreshToken={refreshToken}
+          coverageCounts={coverageCounts}
+          onReturnToAssistant={onReturnToAssistant}
+          returnToAssistantLabel={t.storyDeckReturnAssistant}
+          onEntriesMutated={onEntriesMutated}
         />
       </div>
     </section>
@@ -639,6 +771,8 @@ function ManuscriptPaneBody({
 }) {
   const { t } = useLanguage();
   const [retryingLoad, setRetryingLoad] = useState(false);
+  const planningBinding = useCapabilityBinding('outline');
+  const draftingBinding = useCapabilityBinding('chapter');
   const {
     novel,
     chapters,
@@ -725,12 +859,6 @@ function ManuscriptPaneBody({
         />
       )}
 
-      {isStreaming && (
-        <div className="mx-4 my-2 md:mx-6 flex justify-end">
-          <StopStreamingButton onStop={pauseWriting} label={t.writingPause} />
-        </div>
-      )}
-
       <ManuscriptShell
         novelId={novelId}
         title={novel.title || t.untitledNovel}
@@ -754,6 +882,23 @@ function ManuscriptPaneBody({
         startInEditing={startInEditing}
         requestedOffset={requestedOffset}
         canContinueWriting={novel.progress < 100 && isInStages(novel.stage, STAGES_THAT_CAN_START_WRITING)}
+        writingRunState={{
+          ...manuscript.writingRunState,
+          modelLabel: (() => {
+            const resolved = manuscript.writingRunState.phase === 'preparing'
+              || manuscript.writingRunState.phase === 'planning'
+              ? planningBinding.resolved
+              : draftingBinding.resolved;
+            return resolved.binding && resolved.conn
+              ? `${resolved.conn.label} · ${resolved.binding.modelId}`
+              : t.writingPreviewModelPending;
+          })(),
+        }}
+        writingRunControls={{
+          onPause: isStreaming ? pauseWriting : undefined,
+          onResume: () => { void startWriting({ chapters: 1 }); },
+          onRetry: () => { void startWriting({ chapters: 1 }); },
+        }}
       />
     </div>
   );
@@ -783,7 +928,7 @@ function ManuscriptNoticeRow({
   onPrimary: () => void;
 }) {
   return (
-    <div className="mx-4 my-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-full border border-book-border bg-book-bg-card/80 px-4 py-1.5 shadow-sm backdrop-blur md:mx-6">
+    <div className="mx-4 my-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-book-border bg-book-bg-card/80 px-4 py-1.5 shadow-sm backdrop-blur md:mx-6">
       <div className="flex min-w-0 flex-1 items-baseline gap-2 text-sm">
         <span className="shrink-0 font-medium text-book-ink-primary">{title}</span>
         <span className="truncate text-xs text-book-ink-secondary">{subtext}</span>
