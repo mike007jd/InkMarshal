@@ -1,6 +1,6 @@
 import type { StringKey, Translations } from '@/lib/i18n';
 
-export const AI_ERROR_CATEGORIES = [
+const AI_ERROR_CATEGORIES = [
   'invalid_credentials',
   'quota_or_balance',
   'network',
@@ -18,7 +18,7 @@ export const AI_ERROR_I18N_KEYS = {
   unknown: 'aiErrorUnknown',
 } as const satisfies Record<AIErrorCategory, StringKey>;
 
-export type AIErrorI18nKey = (typeof AI_ERROR_I18N_KEYS)[AIErrorCategory];
+type AIErrorI18nKey = (typeof AI_ERROR_I18N_KEYS)[AIErrorCategory];
 
 export interface AIErrorPayload {
   type: 'inkmarshal-ai-error';
