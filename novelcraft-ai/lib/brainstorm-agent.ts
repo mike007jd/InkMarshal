@@ -173,6 +173,7 @@ async function commitFinalizedBrainstorm(
   novelId: string,
   input: FinalizeBrainstormInput,
   receiptId?: string,
+  options: { preserveExistingStoryDeck?: boolean } = {},
 ) {
   const novel = await getNovel(novelId);
   if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
@@ -205,6 +206,7 @@ async function commitFinalizedBrainstorm(
       ...entry,
       summary: buildKnowledgeEntrySummary(entry.type, entry.data),
     })),
+    preserveExistingStoryDeck: options.preserveExistingStoryDeck,
   });
   if (!result.ok) return result;
 
@@ -283,7 +285,7 @@ export async function finalizeApprovedStoryDeck(
         details: { notes: storySummary, chapterNumber: '1' },
       },
     ],
-  }, receiptId);
+  }, receiptId, { preserveExistingStoryDeck: true });
 }
 
 export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): string {

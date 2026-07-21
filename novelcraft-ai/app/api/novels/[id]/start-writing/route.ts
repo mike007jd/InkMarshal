@@ -86,7 +86,13 @@ export async function POST(
     );
   }
 
-  const storyDeckEntries = await getKnowledgeEntries(id);
+  let storyDeckEntries: Awaited<ReturnType<typeof getKnowledgeEntries>>;
+  try {
+    storyDeckEntries = await getKnowledgeEntries(id);
+  } catch (error) {
+    await releaseWritingLock(id, lock.token).catch(() => undefined);
+    throw error;
+  }
   const storyDeckTypes = new Set(storyDeckEntries.map(entry => entry.type));
   const missingStoryDeckTypes = ['character', 'world', 'outline'].filter(
     type => !storyDeckTypes.has(type),
