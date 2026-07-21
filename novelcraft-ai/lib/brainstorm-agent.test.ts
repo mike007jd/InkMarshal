@@ -83,6 +83,77 @@ describe('brainstorm agent tools', () => {
     }
   });
 
+  it('repairs only missing Story Deck categories without changing existing cards', async () => {
+    const {
+      createKnowledgeEntry,
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      getNovel,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { finalizeApprovedStoryDeck } = await import('@/lib/brainstorm-agent');
+    const novel = await createNovel({ userId: 'local-user', title: 'Partial Deck Repair' });
+    await updateNovel(novel.id, {
+      genre: 'Mystery',
+      storySummary: 'A custom story seed.',
+      characterSummary: 'A custom cast.',
+      arcSummary: 'A custom arc.',
+    });
+    const updatedAt = '2026-01-02T03:04:05.000Z';
+    const existingCards = [
+      {
+        id: crypto.randomUUID(),
+        type: 'character',
+        title: 'Main Cast',
+        summary: 'Writer-authored character summary.',
+        data: JSON.stringify({ custom: 'character-data' }),
+        tags: JSON.stringify(['writer-authored']),
+      },
+      {
+        id: crypto.randomUUID(),
+        type: 'world',
+        title: 'Handmade World',
+        summary: 'Writer-authored world summary.',
+        data: JSON.stringify({ custom: 'world-data' }),
+        tags: JSON.stringify(['writer-authored']),
+      },
+    ];
+
+    try {
+      for (const card of existingCards) {
+        await createKnowledgeEntry({
+          ...card,
+          novelId: novel.id,
+          sortOrder: 7,
+          createdAt: updatedAt,
+          updatedAt,
+        });
+      }
+
+      expect(await finalizeApprovedStoryDeck(novel.id, 'en')).toMatchObject({ ok: true });
+
+      const entries = await getKnowledgeEntries(novel.id);
+      expect(entries.filter(entry => entry.type === 'character')).toHaveLength(1);
+      expect(entries.filter(entry => entry.type === 'world')).toHaveLength(1);
+      expect(entries.filter(entry => entry.type === 'outline')).toHaveLength(1);
+      for (const original of existingCards) {
+        expect(entries.find(entry => entry.id === original.id)).toMatchObject({
+          id: original.id,
+          type: original.type,
+          title: original.title,
+          summary: original.summary,
+          data: original.data,
+          tags: original.tags,
+          updated_at: updatedAt,
+        });
+      }
+      expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('upserts Story Deck entries as knowledge records', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries } = await import('@/lib/db');
     const { createBrainstormTools } = await import('@/lib/brainstorm-agent');

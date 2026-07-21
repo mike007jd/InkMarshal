@@ -593,9 +593,39 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
     await failSettledUsages(summarizeOutcome, validateOutcome);
     throw error;
   }
-  for (const deferredUsage of deferredPostChapterUsages) await deferredUsage.recordUsage();
-  if (summarizeOutcome.status === 'fulfilled') await summarizeOutcome.value.recordUsage();
-  if (validateOutcome.status === 'fulfilled') await validateOutcome.value.recordUsage();
+  const usagesToSettle = [
+    ...deferredPostChapterUsages,
+    ...(summarizeOutcome.status === 'fulfilled' ? [summarizeOutcome.value] : []),
+    ...(validateOutcome.status === 'fulfilled' ? [validateOutcome.value] : []),
+  ];
+  const usageSettlements = await Promise.allSettled(
+    usagesToSettle.map(usage => usage.recordUsage()),
+  );
+  const failedUsageIndexes = usageSettlements.flatMap((settlement, index) =>
+    settlement.status === 'rejected' ? [index] : [],
+  );
+  if (failedUsageIndexes.length > 0) {
+    await Promise.allSettled(
+      failedUsageIndexes.map(index => usagesToSettle[index].failUsage()),
+    );
+    const firstFailure = usageSettlements[failedUsageIndexes[0]];
+    return {
+      status: 'saved_failed',
+      errorMessage: sanitizeError(
+        firstFailure.status === 'rejected' ? firstFailure.reason : null,
+        'The chapter was saved, but post-generation usage settlement failed.',
+      ),
+      content: chapterContent,
+      actualWords,
+      attempts: chapterAttempts,
+      qualityIssues: chapterQualityIssues,
+      ralphRevisions: ralphRevisionCount,
+      summary: chapterSummary,
+      keyFacts: chapterKeyFacts,
+      generationMeta,
+      savedChapter,
+    };
+  }
 
   return {
     status: 'written',

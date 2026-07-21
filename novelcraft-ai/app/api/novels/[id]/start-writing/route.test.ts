@@ -16,7 +16,17 @@ const mocks = vi.hoisted(() => ({
   buildAIContext: vi.fn(),
   createAIUsageSession: vi.fn(),
   aiUsageErrorResponse: vi.fn(),
+  getKnowledgeEntries: vi.fn(),
 }));
+
+vi.mock('@/lib/db', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
+  mocks.getKnowledgeEntries.mockImplementation(actual.getKnowledgeEntries);
+  return {
+    ...actual,
+    getKnowledgeEntries: mocks.getKnowledgeEntries,
+  };
+});
 
 vi.mock('@/lib/ai-context-builder', () => ({
   buildAIContext: mocks.buildAIContext,
@@ -94,6 +104,7 @@ beforeEach(() => {
   mocks.createAIUsageSession.mockReset();
   mocks.aiUsageErrorResponse.mockReset();
   mocks.aiUsageErrorResponse.mockReturnValue(null);
+  mocks.getKnowledgeEntries.mockClear();
 });
 
 afterAll(async () => {
@@ -172,6 +183,24 @@ describe('start-writing batch resume helpers', () => {
 });
 
 describe('start-writing route lock and context preflight behaviour', () => {
+  it('releases the writing lock when loading the Story Deck throws', async () => {
+    const { POST } = await import('@/app/api/novels/[id]/start-writing/route');
+    const { deleteNovelCascade } = await import('@/lib/db');
+    const novel = await createReadyNovel('Deck Query Failure');
+    const queryError = new Error('deck query failed');
+    mocks.getKnowledgeEntries.mockRejectedValueOnce(queryError);
+
+    try {
+      await expect(POST(new Request(`http://localhost/api/novels/${novel.id}/start-writing`, {
+        method: 'POST',
+      }), { params: Promise.resolve({ id: novel.id }) })).rejects.toBe(queryError);
+      expect(mocks.createAIUsageSession).not.toHaveBeenCalled();
+      await expectWritingLockReleased(novel.id);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('rejects a ready novel with an incomplete Story Deck before model preflight', async () => {
     const { POST } = await import('@/app/api/novels/[id]/start-writing/route');
     const { createNovel, deleteNovelCascade, updateNovel } = await import('@/lib/db');

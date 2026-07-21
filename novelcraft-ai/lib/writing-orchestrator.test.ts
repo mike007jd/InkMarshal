@@ -141,6 +141,80 @@ describe('writeChapter', () => {
     expect(h.frames.some(frame => frame.type === 'error')).toBe(false);
   });
 
+  it.each(['summarize', 'validate'] as const)(
+    'returns saved_failed after a deferred %s usage settlement fails',
+    async failingPhase => {
+      const failedRecordUsage = vi.fn(async () => {
+        throw new Error(`${failingPhase} usage ledger unavailable`);
+      });
+      const failedFailUsage = vi.fn(async () => {});
+      const healthyRecordUsage = vi.fn(async () => {});
+      const failedUsage = {
+        ...deferred(),
+        recordUsage: failedRecordUsage,
+        failUsage: failedFailUsage,
+      };
+      const healthyUsage = {
+        ...deferred(),
+        recordUsage: healthyRecordUsage,
+      };
+      const h = harness({
+        summarize: async () => failingPhase === 'summarize' ? failedUsage : healthyUsage,
+        validate: async () => failingPhase === 'validate' ? failedUsage : healthyUsage,
+      });
+
+      const outcome = await writeChapter(h.deps, input());
+
+      expect(outcome.status).toBe('saved_failed');
+      expect(outcome.savedChapter).not.toBeNull();
+      expect(outcome.summary).toBe('s');
+      expect(outcome.errorMessage).toBe(`${failingPhase} usage ledger unavailable`);
+      expect(failedRecordUsage).toHaveBeenCalledTimes(1);
+      expect(failedFailUsage).toHaveBeenCalledTimes(1);
+      expect(healthyRecordUsage).toHaveBeenCalledTimes(1);
+      expect(h.frames.some(frame => frame.type === 'chapter_done')).toBe(false);
+      expect(h.frames.some(frame => frame.type === 'error')).toBe(false);
+    },
+  );
+
+  it('returns saved_failed when deferred Ralph usage settlement fails', async () => {
+    const ralphRecordUsage = vi.fn(async () => {
+      throw new Error('Ralph usage ledger unavailable');
+    });
+    const ralphFailUsage = vi.fn(async () => {});
+    const summarizeRecordUsage = vi.fn(async () => {});
+    const validateRecordUsage = vi.fn(async () => {});
+    const draft = 'one two three four five six seven eight nine ten';
+    const h = harness({
+      summarize: async () => ({ ...deferred(), recordUsage: summarizeRecordUsage }),
+    }, {
+      draftChunks: [draft],
+      validate: () => ({
+        ...deferred(),
+        issues: [{ type: 'pov', description: 'x', severity: 'major' }],
+        score: 50,
+        recordUsage: validateRecordUsage,
+      }),
+      revise: () => ({
+        content: 'too short',
+        recordUsage: ralphRecordUsage,
+        failUsage: ralphFailUsage,
+        cancelUsage: vi.fn(async () => {}),
+      }),
+    });
+
+    const outcome = await writeChapter(h.deps, input({ targetWordsPerChapter: 10 }));
+
+    expect(outcome.status).toBe('saved_failed');
+    expect(outcome.savedChapter).not.toBeNull();
+    expect(outcome.content).toBe(draft);
+    expect(outcome.errorMessage).toBe('Ralph usage ledger unavailable');
+    expect(ralphRecordUsage).toHaveBeenCalledTimes(1);
+    expect(ralphFailUsage).toHaveBeenCalledTimes(1);
+    expect(summarizeRecordUsage).toHaveBeenCalledTimes(1);
+    expect(validateRecordUsage).toHaveBeenCalledTimes(1);
+  });
+
   it('settles the chapter run as cancelled (not failed) when the user stops mid-generation', async () => {
     // AI-01: a Stop during generation must record `cancelled`, exactly once,
     // and must not be logged as a provider failure.

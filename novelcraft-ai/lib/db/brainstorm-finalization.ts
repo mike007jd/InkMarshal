@@ -52,15 +52,16 @@ export async function finalizeBrainstormAtomic(args: {
   novelId: string;
   profile: Partial<Novel>;
   entries: readonly BrainstormFinalizationEntry[];
+  preserveExistingStoryDeck?: boolean;
 }): Promise<FinalizeBrainstormResult> {
-  const coverage = args.entries.reduce<Record<BrainstormFinalizationEntry['type'], number>>(
+  const submittedCoverage = args.entries.reduce<Record<BrainstormFinalizationEntry['type'], number>>(
     (counts, entry) => {
       counts[entry.type] += 1;
       return counts;
     },
     { character: 0, world: 0, outline: 0 },
   );
-  if (Object.values(coverage).some(count => count < 1)) {
+  if (!args.preserveExistingStoryDeck && Object.values(submittedCoverage).some(count => count < 1)) {
     return { ok: false, reason: 'incomplete' };
   }
 
@@ -74,11 +75,35 @@ export async function finalizeBrainstormAtomic(args: {
       return { ok: false, reason: 'not_editable' };
     }
 
+    const existingCoverage = { character: 0, world: 0, outline: 0 };
+    if (args.preserveExistingStoryDeck) {
+      const rows = db.prepare(
+        `SELECT type, COUNT(*) AS count
+           FROM knowledge_entries
+          WHERE novel_id = ? AND type IN ('character', 'world', 'outline')
+          GROUP BY type`,
+      ).all(args.novelId) as { type: BrainstormFinalizationEntry['type']; count: number }[];
+      for (const row of rows) existingCoverage[row.type] = row.count;
+    }
+    const entriesToApply = args.preserveExistingStoryDeck
+      ? args.entries.filter(entry => existingCoverage[entry.type] === 0)
+      : args.entries;
+    const coverage = entriesToApply.reduce<Record<BrainstormFinalizationEntry['type'], number>>(
+      (counts, entry) => {
+        counts[entry.type] += 1;
+        return counts;
+      },
+      { ...existingCoverage },
+    );
+    if (Object.values(coverage).some(count => count < 1)) {
+      return { ok: false, reason: 'incomplete' };
+    }
+
     const beforeNovel = applyNovelUpdate(db, args.novelId, {});
     if (!beforeNovel) return { ok: false, reason: 'not_found' };
 
     const mutations: BrainstormEntryMutation[] = [];
-    for (const entry of args.entries) {
+    for (const entry of entriesToApply) {
       const before = db.prepare(
         `SELECT * FROM knowledge_entries
           WHERE novel_id = ? AND type = ? AND lower(trim(title)) = ?
