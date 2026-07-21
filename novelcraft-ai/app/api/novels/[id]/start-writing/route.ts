@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import {
   acquireWritingLock,
   getChapters,
+  getKnowledgeEntries,
   getMessages,
   getNovel,
   isInStages,
@@ -83,6 +84,20 @@ export async function POST(
       { error: 'Writing can only be started after the outline is ready.' },
       { status: 409 },
     );
+  }
+
+  const storyDeckEntries = await getKnowledgeEntries(id);
+  const storyDeckTypes = new Set(storyDeckEntries.map(entry => entry.type));
+  const missingStoryDeckTypes = ['character', 'world', 'outline'].filter(
+    type => !storyDeckTypes.has(type),
+  );
+  if (missingStoryDeckTypes.length > 0) {
+    await releaseWritingLock(id, lock.token).catch(() => undefined);
+    return Response.json({
+      code: 'STORY_DECK_INCOMPLETE',
+      error: 'Story Deck is incomplete. Complete the character, world, and outline cards before writing.',
+      missingTypes: missingStoryDeckTypes,
+    }, { status: 409 });
   }
 
   const novel = currentNovel;

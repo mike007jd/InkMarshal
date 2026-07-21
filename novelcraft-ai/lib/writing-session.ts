@@ -1,7 +1,7 @@
 'use client';
 
 import type { Chapter, Novel } from '@/lib/db-types';
-import type { WritingFrame } from '@/lib/writing-orchestrator';
+import type { WritingFrame, WritingPhase } from '@/lib/writing-orchestrator';
 import {
   buildAIRequestHeaders,
   consumeNdjsonStream,
@@ -23,6 +23,31 @@ export interface WritingSessionCopy {
   timeoutLabel: string;
 }
 
+export type { WritingPhase };
+
+export interface WritingRunState {
+  phase: 'idle' | WritingPhase;
+  statusLabel: string;
+  modelLabel?: string;
+  chapterNumber?: number;
+  chapterTitle?: string;
+  liveWordCount: number;
+  completedChapters: number;
+  totalChapters?: number;
+  progress: number;
+  startedAt?: string;
+  lastActivityAt?: string;
+  error?: string;
+}
+
+export const IDLE_WRITING_RUN_STATE: WritingRunState = {
+  phase: 'idle',
+  statusLabel: '',
+  liveWordCount: 0,
+  completedChapters: 0,
+  progress: 0,
+};
+
 export interface BatchDonePayload {
   /** Next un-written chapter, or null when the whole book is done. */
   nextChapter: number | null;
@@ -43,6 +68,7 @@ export interface WritingSessionHandlers {
   refreshChapters(): Promise<void>;
   onDone(): void;
   onError(message: string): void;
+  updateRunState?(patch: Partial<WritingRunState>): void;
   /** Optional: fires when the server completes a chapter batch (chaptersLimit /
    *  untilChapter reached) but the whole book is not yet done. */
   onBatchDone?(payload: BatchDonePayload): void;
@@ -107,7 +133,29 @@ export async function applyWritingSessionEvent(
 
   switch (type) {
     case 'heartbeat':
+      handlers.updateRunState?.({
+        lastActivityAt: text(event.at) ?? new Date().toISOString(),
+      });
       return true;
+
+    case 'phase': {
+      const phase = text(event.phase) as WritingPhase | null;
+      if (!phase) return false;
+      const statusLabel = text(event.message) ?? copy.writingLabel;
+      handlers.setStatusLabel(statusLabel);
+      handlers.updateRunState?.({
+        phase,
+        statusLabel,
+        ...(numberValue(event.progress) == null ? {} : { progress: numberValue(event.progress)! }),
+        ...(numberValue(event.chapterNumber) == null ? {} : { chapterNumber: numberValue(event.chapterNumber)! }),
+        ...(text(event.chapterTitle) == null ? {} : { chapterTitle: text(event.chapterTitle)! }),
+        ...(numberValue(event.completedChapters) == null ? {} : { completedChapters: numberValue(event.completedChapters)! }),
+        ...(numberValue(event.totalChapters) == null ? {} : { totalChapters: numberValue(event.totalChapters)! }),
+        lastActivityAt: new Date().toISOString(),
+        ...(phase === 'failed' ? { error: statusLabel } : { error: undefined }),
+      });
+      return true;
+    }
 
     case 'progress': {
       batcher.flush();
@@ -117,12 +165,21 @@ export async function applyWritingSessionEvent(
         ...(progress == null ? {} : { progress }),
         stage: 'autonomous_writing',
       });
+      handlers.updateRunState?.({
+        statusLabel: text(event.message) ?? copy.writingLabel,
+        ...(progress == null ? {} : { progress }),
+        lastActivityAt: new Date().toISOString(),
+      });
       return true;
     }
 
     case 'blueprint': {
       batcher.flush();
       handlers.patchNovel({ blueprint: event.blueprint as Novel['blueprint'] });
+      handlers.updateRunState?.({
+        totalChapters: numberValue(event.total) ?? undefined,
+        lastActivityAt: new Date().toISOString(),
+      });
       return true;
     }
 
@@ -134,6 +191,12 @@ export async function applyWritingSessionEvent(
         chapterNumber,
         title: text(event.title) ?? `Chapter ${String(chapterNumber).padStart(2, '0')}`,
         content: '',
+      });
+      handlers.updateRunState?.({
+        phase: 'drafting',
+        chapterNumber,
+        chapterTitle: text(event.title) ?? undefined,
+        lastActivityAt: new Date().toISOString(),
       });
       batcher.enqueue(text(event.chunk) ?? '');
       return true;
@@ -149,6 +212,14 @@ export async function applyWritingSessionEvent(
       handlers.setLiveChapter(null);
       const chapter = chapterFromWritingDoneEvent(event, novelId);
       if (chapter) handlers.upsertChapter(chapter);
+      handlers.updateRunState?.({
+        phase: 'chapter_complete',
+        ...(progress == null ? {} : { progress }),
+        ...(numberValue(event.completedChapters) == null ? {} : { completedChapters: numberValue(event.completedChapters)! }),
+        ...(numberValue(event.totalChapters) == null ? {} : { totalChapters: numberValue(event.totalChapters)! }),
+        liveWordCount: numberValue(event.wordCount) ?? 0,
+        lastActivityAt: new Date().toISOString(),
+      });
       return true;
     }
 
@@ -166,6 +237,13 @@ export async function applyWritingSessionEvent(
         completedChapters,
         totalChapters,
       });
+      handlers.updateRunState?.({
+        phase: 'paused',
+        statusLabel: copy.readingLabel,
+        completedChapters,
+        totalChapters,
+        lastActivityAt: new Date().toISOString(),
+      });
       await handlers.refreshChapters();
       return true;
     }
@@ -176,6 +254,12 @@ export async function applyWritingSessionEvent(
       if (event.novel) handlers.replaceNovel(event.novel as Novel);
       handlers.setStatusLabel(copy.readingLabel);
       handlers.onDone();
+      handlers.updateRunState?.({
+        phase: 'complete',
+        statusLabel: text(event.message) ?? copy.readingLabel,
+        progress: 100,
+        lastActivityAt: new Date().toISOString(),
+      });
       await handlers.refreshChapters();
       return true;
     }
@@ -186,7 +270,14 @@ export async function applyWritingSessionEvent(
       // The unified error frame key is `error` (lib/streaming-helpers). The old
       // `message` fallback was dead — client and server ship together in the same
       // desktop bundle, so there is no rolling-release skew to read across.
-      handlers.onError(text(event.error) ?? copy.errorLabel);
+      const error = text(event.error) ?? copy.errorLabel;
+      handlers.onError(error);
+      handlers.updateRunState?.({
+        phase: 'failed',
+        statusLabel: error,
+        error,
+        lastActivityAt: new Date().toISOString(),
+      });
       await Promise.allSettled([
         handlers.refreshNovel?.(),
         handlers.refreshChapters(),

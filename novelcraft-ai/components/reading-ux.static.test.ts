@@ -36,6 +36,9 @@ describe('reading heat-zone UX', () => {
     expect(novelWorkspace).toContain('setView={selectView}');
     expect(novelWorkspace).toContain('lg:hidden');
     expect(novelWorkspace).toContain('function StoryDeckMode');
+    expect(novelWorkspace).toContain("from '@/components/ui/tabs'");
+    expect(novelWorkspace).toContain('TabsList');
+    expect(novelWorkspace).toContain('TabsTrigger');
     expect(novelWorkspace).toContain('controlledFilter={tab}');
     expect(novelWorkspace).toContain('variant="deck"');
     expect(novelWorkspace).toContain("view === 'agent'");

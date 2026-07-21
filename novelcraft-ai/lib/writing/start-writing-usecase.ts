@@ -124,6 +124,7 @@ export async function executeStartWriting(
   let seq = 0;
   let abortedReason: StartWritingEndReason = 'unknown';
   let errorMessage: string | null = null;
+  let latestProgress = novel.progress;
 
   // Independent persisted fact: whether this novel already had chapters before
   // this run. `completedChapters` is only populated from `existingChapters`
@@ -135,7 +136,7 @@ export async function executeStartWriting(
   const originalStage = novel.stage;
   const originalProgress = novel.progress;
 
-  const resetColdAbort = async () => {
+  const persistPausedRun = async () => {
     if (completedChapters > 0) return;
     if (hadPersistedChapters) {
       // A resume aborted before the blueprint established the true completed
@@ -145,14 +146,33 @@ export async function executeStartWriting(
       errorMessage ??= coldAbortMessage(abortedReason);
       return;
     }
-    await updateNovel(id, { stage: 'ready_for_greenlight', progress: 0 });
+    // Approval is durable. Closing the app or pressing Pause cancels the HTTP
+    // generation stream, but it must not send the project back through the
+    // approval gate. Persist the last real phase so relaunch reconstructs a
+    // truthful paused WritingRunState with a Resume action.
+    await updateNovel(id, { stage: 'autonomous_writing', progress: latestProgress });
     errorMessage ??= coldAbortMessage(abortedReason);
   };
 
   try {
     log(START_WRITING_EVENTS.begin, { stage: novel.stage, messages: ctx.messageCount });
 
+    sink.emit({
+      type: 'phase',
+      phase: 'preparing',
+      progress: Math.max(0, novel.progress),
+      completedChapters: existingChapters.length,
+      message: isZhLocale(language) ? '正在准备写作上下文...' : 'Preparing writing context...',
+    });
     await updateNovel(id, { stage: 'autonomous_writing', progress: 5 });
+    latestProgress = 5;
+    sink.emit({
+      type: 'phase',
+      phase: 'planning',
+      progress: 5,
+      completedChapters: existingChapters.length,
+      message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...',
+    });
     sink.emit({ type: 'progress', progress: 5, message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...' });
 
     const blueprint = await loadOrGenerateBlueprint({
@@ -183,6 +203,7 @@ export async function executeStartWriting(
     completedChapters = blueprint.chapters.filter(c => existingByNumber.has(c.chapterNumber)).length;
     const progressForCompleted = (count: number) =>
       15 + Math.floor((count / blueprint.chapters.length) * 75);
+    latestProgress = progressForCompleted(completedChapters);
 
     // Hoist adaptive digest sizing — inputs (target words, chapter count)
     // don't change across the loop, no point recomputing per chapter.
@@ -264,6 +285,18 @@ export async function executeStartWriting(
       );
       const chapterStartedAt = Date.now();
       log(START_WRITING_EVENTS.chapterStart, { ch: plan.chapterNumber, title: plan.title });
+      sink.emit({
+        type: 'phase',
+        phase: 'drafting',
+        progress: progressForCompleted(completedChapters),
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `正在创作第 ${plan.chapterNumber} 章：${plan.title}`
+          : `Writing Chapter ${plan.chapterNumber}: ${plan.title}`,
+      });
       sink.emit({
         type: 'progress',
         progress: progressForCompleted(completedChapters),
@@ -421,6 +454,18 @@ export async function executeStartWriting(
       const chapterKeyFacts = outcome.keyFacts;
       const chapterQualityIssues = outcome.qualityIssues;
       const ralphRevisionCount = outcome.ralphRevisions;
+      sink.emit({
+        type: 'phase',
+        phase: 'saving',
+        progress: progressForCompleted(completedChapters),
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `正在保存第 ${plan.chapterNumber} 章...`
+          : `Saving Chapter ${plan.chapterNumber}...`,
+      });
       completedChapters++;
       writtenThisBatch++;
       existingByNumber.set(plan.chapterNumber, outcome.savedChapter!);
@@ -457,6 +502,7 @@ export async function executeStartWriting(
       }
 
       const newProgress = progressForCompleted(completedChapters);
+      latestProgress = newProgress;
       sink.emit({
         type: 'chapter_done',
         chapterNumber: plan.chapterNumber,
@@ -466,6 +512,20 @@ export async function executeStartWriting(
         qualityIssues: chapterQualityIssues,
         ralphRevisions: ralphRevisionCount,
         progress: newProgress,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+      });
+      sink.emit({
+        type: 'phase',
+        phase: 'chapter_complete',
+        progress: newProgress,
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `第 ${plan.chapterNumber} 章已完成`
+          : `Chapter ${plan.chapterNumber} complete`,
       });
 
       await updateNovel(id, { progress: newProgress });
@@ -503,6 +563,14 @@ export async function executeStartWriting(
         completedChapters,
         totalChapters: blueprint.chapters.length,
       });
+      sink.emit({
+        type: 'phase',
+        phase: 'paused',
+        progress: progressForCompleted(completedChapters),
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language) ? '写作已暂停，可随时继续' : 'Writing paused — ready to continue',
+      });
       log(START_WRITING_EVENTS.complete, {
         chapters: writtenThisBatch,
         batchComplete: true,
@@ -512,13 +580,13 @@ export async function executeStartWriting(
 
     if (lifecycle.isCancelled()) {
       abortedReason = 'aborted';
-      await resetColdAbort();
+      await persistPausedRun();
       return;
     }
 
     if (!shouldFinalizeStartWriting(abortedReason)) {
       if (abortedReason !== 'batch_complete') {
-        await resetColdAbort();
+        await persistPausedRun();
       }
       return;
     }
@@ -554,6 +622,14 @@ export async function executeStartWriting(
       throw new Error('Novel not found');
     }
     sink.emit({ type: 'done', novel: finalNovel, message: finalMsg });
+    sink.emit({
+      type: 'phase',
+      phase: 'complete',
+      progress: 100,
+      completedChapters: blueprint.chapters.length,
+      totalChapters: blueprint.chapters.length,
+      message: finalMsg,
+    });
     abortedReason = 'complete';
     log(START_WRITING_EVENTS.complete, {
       chapters: blueprint.chapters.length,
@@ -563,7 +639,7 @@ export async function executeStartWriting(
     if (lifecycle.isCancelled()) {
       abortedReason = 'aborted';
       log(START_WRITING_EVENTS.aborted, { message: err instanceof Error ? err.message : String(err) });
-      await resetColdAbort();
+      await persistPausedRun();
       return;
     }
     abortedReason = 'error';
@@ -578,7 +654,15 @@ export async function executeStartWriting(
       : hadPersistedChapters
         ? { stage: originalStage, progress: originalProgress }
         : { stage: 'ready_for_greenlight', progress: 0 });
-    sink.emit({ type: 'error', error: sanitizeError(err, 'Writing failed') });
+    const publicError = sanitizeError(err, 'Writing failed');
+    sink.emit({
+      type: 'phase',
+      phase: 'failed',
+      progress: latestProgress,
+      completedChapters,
+      message: publicError,
+    });
+    sink.emit({ type: 'error', error: publicError });
   } finally {
     log(START_WRITING_EVENTS.end, {
       reason: abortedReason,

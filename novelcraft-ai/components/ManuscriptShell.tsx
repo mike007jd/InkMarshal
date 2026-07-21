@@ -3,12 +3,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ListTree } from 'lucide-react';
 import { countWords } from '@/lib/utils';
+import type { WritingPhase, WritingRunState } from '@/lib/writing-session';
 import { useLanguage } from '@/components/LanguageProvider';
 import { ManuscriptSidebar } from './ManuscriptSidebar';
-import { ManuscriptReadingView, type ReadingLayout } from './ManuscriptReadingView';
+import { ManuscriptReadingView, type ChapterSelection, type ReadingLayout } from './ManuscriptReadingView';
 import { ManuscriptEditingView, type ManuscriptEditingViewHandle } from './ManuscriptEditingView';
 import { SaveStatusIndicator, type SaveState } from './SaveStatusIndicator';
 import { WritingModelDotBadge } from './WritingModelDotBadge';
+import { WritingRunStatus } from './WritingRunStatus';
+import type { WritingRunControls } from './WritingRunStatus';
 import { useRegisterSearchScope, type ManuscriptScope } from './search/GlobalSearchProvider';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
 import { MANUSCRIPT_FLUSH_EVENT, type ManuscriptFlushEventDetail } from '@/lib/desktop-shell-bus';
@@ -23,6 +26,15 @@ import {
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Spinner } from '@/components/ui/spinner';
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from '@/components/ui/empty';
+import { NibIcon } from '@/components/Icons';
 
 export interface ManuscriptChapter {
   id: string;
@@ -33,6 +45,37 @@ export interface ManuscriptChapter {
   /** When non-null, the chapter has an AI-generated first draft that the user
    *  can revert to via the RevertChapterButton. */
   originalContent?: string | null;
+}
+
+export type { WritingPhase, WritingRunState } from '@/lib/writing-session';
+export type { WritingRunControls } from './WritingRunStatus';
+export { formatRunElapsed } from './WritingRunStatus';
+
+/** True while the run is preparing/planning and nothing is on the page yet —
+ *  the shell shows a "planning the chapter blueprint" centre instead of the
+ *  generic empty draft. Once the first live chunk lands, the normal reading
+ *  view streams it. */
+export function isBlueprintPlanningState(
+  writingRunState: WritingRunState | null | undefined,
+  chapterCount: number,
+  hasLiveChapter: boolean,
+): boolean {
+  if (!writingRunState) return false;
+  if (writingRunState.phase !== 'preparing' && writingRunState.phase !== 'planning') return false;
+  return chapterCount === 0 && !hasLiveChapter;
+}
+
+/** Keep the legacy empty-manuscript prompt off screen for the entire active
+ * run, including the short gap between planning and the first draft chunk. */
+export function isAwaitingDraftContentState(
+  writingRunState: WritingRunState | null | undefined,
+  chapterCount: number,
+  hasLiveChapter: boolean,
+): boolean {
+  if (!writingRunState || chapterCount > 0 || hasLiveChapter) return false;
+  return writingRunState.phase !== 'idle'
+    && writingRunState.phase !== 'chapter_complete'
+    && writingRunState.phase !== 'complete';
 }
 
 interface ManuscriptShellProps {
@@ -67,6 +110,11 @@ interface ManuscriptShellProps {
    *  stealing height above the prose. Editing mode always shows it (polish needs
    *  a model regardless of stage). */
   canContinueWriting?: boolean;
+  /** Live writing-run narration. Optional so un-wired hosts compile; when
+   *  present (and not idle) the shell renders a compact status strip above the
+   *  prose and swaps the empty-draft centre for a blueprint-planning state. */
+  writingRunState?: WritingRunState | null;
+  writingRunControls?: WritingRunControls;
 }
 
 const LAYOUT_STORAGE_KEY = 'manuscript:readingLayout';
@@ -125,12 +173,28 @@ export function ManuscriptShell({
   requestedOffset = null,
   startInEditing = false,
   canContinueWriting = false,
+  writingRunState = null,
+  writingRunControls,
 }: ManuscriptShellProps) {
   const { t } = useLanguage();
   const [viewMode, setViewMode] = useState<'reading' | 'editing'>(
     startInEditing && !readOnly ? 'editing' : 'reading',
   );
-  const [activeChapter, setActiveChapter] = useState<number | null>(null);
+  // Passive mirror of "where the reader currently is" — flip/scroll syncs
+  // land here and never reposition the book.
+  const [activeChapter, setActiveChapterSync] = useState<number | null>(null);
+  // External chapter-selection token. Only explicit user picks (sidebar,
+  // jump input, deep link, search result) bump the seq, so the flipbook can
+  // tell "jump to this chapter's first page" apart from passive syncs.
+  const [chapterSelection, setChapterSelection] = useState<ChapterSelection | null>(null);
+  const chapterSelectionSeqRef = useRef(0);
+  // Explicit "go to chapter" action: sets the active chapter AND mints a
+  // fresh selection token so the reading view repositions + suspends follow.
+  const setActiveChapter = useCallback((chapterNumber: number) => {
+    setActiveChapterSync(chapterNumber);
+    chapterSelectionSeqRef.current += 1;
+    setChapterSelection({ chapterNumber, seq: chapterSelectionSeqRef.current });
+  }, []);
   const [mobileChaptersOpen, setMobileChaptersOpen] = useState(false);
   const [layout, setLayoutState] = useState<ReadingLayout>(() => readPersistedLayout());
   const editingViewRef = useRef<ManuscriptEditingViewHandle | null>(null);
@@ -195,6 +259,33 @@ export function ManuscriptShell({
   // Continue is still reachable; on a finished novel it would be dead chrome.
   const showWritingStatus = effectiveViewMode === 'editing' || isWritingLive || canContinueWriting;
 
+  // ── Writing-run narration ──────────────────────────────────────────────
+  const runActive = writingRunState != null && writingRunState.phase !== 'idle';
+  // 1s heartbeat drives elapsed / last-activity / long-planning copy. Only
+  // ticks while a run is on screen.
+  const [runNowMs, setRunNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!runActive) return;
+    const id = window.setInterval(() => setRunNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [runActive]);
+
+  const runStartedSec = writingRunState?.startedAt
+    ? Math.max(0, (runNowMs - Date.parse(writingRunState.startedAt)) / 1000)
+    : null;
+  const runPlanningWaitSec =
+    writingRunState && (writingRunState.phase === 'preparing' || writingRunState.phase === 'planning')
+      ? runStartedSec
+      : null;
+  const runPlanningLong = runPlanningWaitSec != null && runPlanningWaitSec >= 60;
+  const runPlanningMinutes = runPlanningWaitSec != null ? Math.floor(runPlanningWaitSec / 60) : 0;
+  const runBusyPhase = writingRunState != null && (
+    writingRunState.phase === 'preparing'
+    || writingRunState.phase === 'planning'
+    || writingRunState.phase === 'drafting'
+    || writingRunState.phase === 'saving'
+  );
+
   useEffect(() => {
     const saveNow = (event: Event) => {
       if (effectiveViewMode === 'editing' || draftContentByChapter.size === 0) return;
@@ -222,7 +313,7 @@ export function ManuscriptShell({
     draftContentRef.current = new Map();
     queueMicrotask(() => {
       if (cancelled) return;
-      setActiveChapter(null);
+      setActiveChapterSync(null);
       setSaveState('idle');
       setLastSavedAt(null);
       setDraftContentByChapter(new Map());
@@ -238,6 +329,16 @@ export function ManuscriptShell({
     return [...chapters.filter(ch => ch.chapterNumber !== liveChapter.chapterNumber), liveChapter]
       .sort((a, b) => a.chapterNumber - b.chapterNumber);
   }, [chapters, liveChapter]);
+  const blueprintPlanning = isBlueprintPlanningState(
+    writingRunState,
+    combinedChapters.length,
+    liveChapter != null,
+  );
+  const awaitingDraftContent = isAwaitingDraftContentState(
+    writingRunState,
+    combinedChapters.length,
+    liveChapter != null,
+  );
   const combinedChaptersRef = useRef(combinedChapters);
   useLayoutEffect(() => {
     combinedChaptersRef.current = combinedChapters;
@@ -356,7 +457,7 @@ export function ManuscriptShell({
     return () => {
       cancelled = true;
     };
-  }, [combinedChapters, novelId, requestedChapter]);
+  }, [combinedChapters, novelId, requestedChapter, setActiveChapter]);
 
   // Register a search scope for the lifetime of this shell. Scope re-registers
   // whenever the combined chapter list shifts (new draft, edit save, etc.).
@@ -391,7 +492,7 @@ export function ManuscriptShell({
     }
     // reading mode: scrollIntoView is handled by the reading view's
     // activeChapter effect — no extra work needed here.
-  }, [effectiveViewMode]);
+  }, [effectiveViewMode, setActiveChapter]);
 
   useEffect(() => {
     if (requestedChapter == null || requestedOffset == null) return;
@@ -445,7 +546,7 @@ export function ManuscriptShell({
           )}
         </div>
         {showWritingStatus && (
-          <div className="mt-2 overflow-hidden rounded-md border border-book-border bg-book-bg-card/70">
+          <div className="mt-2 overflow-hidden rounded-md border border-book-border bg-book-bg-card/70 empty:hidden">
             <WritingModelDotBadge
               operation={effectiveViewMode === 'editing' ? 'polish' : 'chapter'}
               unboundDensity={effectiveViewMode === 'reading' ? 'compact' : 'strip'}
@@ -464,14 +565,14 @@ export function ManuscriptShell({
           >
             <ToggleGroupItem
               value="reading"
-              className={`rounded px-2 py-1 text-2xs font-medium transition-colors ${effectiveViewMode === 'reading' ? 'bg-book-bg-card text-book-ink-primary shadow-sm' : 'text-book-ink-muted'}`}
+              className={`rounded px-2 py-1 text-2xs font-medium transition-feedback ${effectiveViewMode === 'reading' ? 'bg-book-bg-card text-book-ink-primary shadow-sm' : 'text-book-ink-muted'}`}
             >
               {t.readingMode}
             </ToggleGroupItem>
             <ToggleGroupItem
               value="editing"
               disabled={editingDisabled}
-              className={`rounded px-2 py-1 text-2xs font-medium transition-colors ${effectiveViewMode === 'editing' ? 'bg-book-bg-card text-book-ink-primary shadow-sm' : 'text-book-ink-muted'} disabled:opacity-40`}
+              className={`rounded px-2 py-1 text-2xs font-medium transition-feedback ${effectiveViewMode === 'editing' ? 'bg-book-bg-card text-book-ink-primary shadow-sm' : 'text-book-ink-muted'} disabled:opacity-40`}
             >
               {t.editingMode}
             </ToggleGroupItem>
@@ -512,17 +613,20 @@ export function ManuscriptShell({
                 setActiveChapter(chapterNumber);
                 setMobileChaptersOpen(false);
               }}
+              writingRunState={writingRunState}
+              writingRunControls={writingRunControls}
+              runNowMs={runNowMs}
             />
           </div>
         </SheetContent>
       </Sheet>
 
-      {/* lg 布局:模型状态独占一行 — 健康态收为右对齐圆点,未绑定时
-          回退的完整警告条有整行宽度,不再挤进 w-72 右栏换行(2026-06-10 审计)。
+      {/* lg 布局:仅异常模型状态独占一行；健康态不渲染 chrome。
+          未绑定时的完整警告条保留整行宽度,不挤进 w-72 右栏换行。
           阅读态且无法续写(已完成小说)时整行不渲染:阅读是消费,此处模型状态
           是偷正文高度的死 chrome(2026-06-25 屏幕高度审计)。 */}
       {showWritingStatus && (
-        <div className="mb-2 hidden shrink-0 items-center justify-end lg:flex">
+        <div className="mb-2 hidden shrink-0 items-center justify-end empty:hidden lg:flex">
           <WritingModelDotBadge
             operation={effectiveViewMode === 'editing' ? 'polish' : 'chapter'}
             unboundDensity={effectiveViewMode === 'reading' ? 'compact' : 'strip'}
@@ -532,14 +636,57 @@ export function ManuscriptShell({
 
       <div className="flex-1 flex gap-6 min-h-0">
         <div className="flex-1 min-w-0 flex flex-col min-h-0">
-          {effectiveViewMode === 'reading' ? (
+          {/* Compact writing-run bar (< lg): one ≤40px line — phase, chapter,
+              progress, primary action. lg+ shows the same run as a panel
+              replacing the sidebar Progress section instead. */}
+          {runActive && writingRunState && (
+            <WritingRunStatus
+              density="bar"
+              state={writingRunState}
+              controls={writingRunControls}
+              nowMs={runNowMs}
+              className="mb-2 shrink-0 lg:hidden"
+            />
+          )}
+
+          {awaitingDraftContent && writingRunState ? (
+            <div className="flex flex-1 items-center justify-center overflow-y-auto">
+              <Empty className="max-w-lg border border-book-border bg-book-bg-card p-10 text-left shadow-xl md:p-12">
+                <EmptyHeader className="max-w-none items-start text-left">
+                  <EmptyMedia className="mb-7 flex h-16 w-16 items-center justify-center rounded-md border border-book-border bg-book-bg-secondary">
+                    <NibIcon className="h-8 w-8 text-book-gold-dark" />
+                  </EmptyMedia>
+                  <EmptyTitle className="flex items-center gap-3 font-serif text-2xl font-semibold text-book-ink-primary">
+                    {runBusyPhase ? <Spinner size="md" /> : null}
+                    {blueprintPlanning ? t.writingPlanningBlueprint : writingRunState.statusLabel}
+                  </EmptyTitle>
+                  <EmptyDescription className="text-sm leading-6 text-book-ink-secondary">
+                    {blueprintPlanning
+                      ? t.writingPlanningDescription
+                      : writingRunState.phase === 'paused'
+                        ? t.writingPausedDescription
+                        : writingRunState.phase === 'failed'
+                          ? writingRunState.error || t.errorWritingFailed
+                          : t.writingAwaitingFirstChunk}
+                  </EmptyDescription>
+                  {runPlanningLong && (
+                    <EmptyDescription className="text-xs font-medium text-book-gold-dark">
+                      {t.writingPlanningSlow.replace('{minutes}', String(runPlanningMinutes))}
+                    </EmptyDescription>
+                  )}
+                </EmptyHeader>
+              </Empty>
+            </div>
+          ) : effectiveViewMode === 'reading' ? (
             <ManuscriptReadingView
               novelId={novelId}
               chapters={combinedChapters}
               liveChapter={liveChapter}
               mode={mode}
               activeChapter={effectiveActiveChapter}
-              onActiveChapterChange={setActiveChapter}
+              onActiveChapterChange={setActiveChapterSync}
+              onChapterJump={setActiveChapter}
+              chapterSelection={chapterSelection}
               layout={layout}
               onLayoutChange={setLayout}
             />
@@ -582,6 +729,9 @@ export function ManuscriptShell({
             liveChapterNumber={liveChapter?.chapterNumber}
             onModeChange={setViewMode}
             onChapterSelect={setActiveChapter}
+            writingRunState={writingRunState}
+            writingRunControls={writingRunControls}
+            runNowMs={runNowMs}
           />
         </div>
       </div>

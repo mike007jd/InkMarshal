@@ -14,7 +14,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **AiNovel** (7460 symbols, 20090 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **InkMarshal** (7560 symbols, 20393 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -37,10 +37,10 @@ This project is indexed by GitNexus as **AiNovel** (7460 symbols, 20090 relation
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/AiNovel/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/AiNovel/clusters` | All functional areas |
-| `gitnexus://repo/AiNovel/processes` | All execution flows |
-| `gitnexus://repo/AiNovel/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/InkMarshal/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/InkMarshal/clusters` | All functional areas |
+| `gitnexus://repo/InkMarshal/processes` | All execution flows |
+| `gitnexus://repo/InkMarshal/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

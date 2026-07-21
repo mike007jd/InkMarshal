@@ -32,6 +32,9 @@ const VISUAL_DEBT_BASELINE = {
   // 2026-07-03 dead-code(batchC): −5, removed the unmounted command-center
   // dashboard whose data-driven viz (trend-bar fills + progress ring/bar
   // widths) owned this entire bucket.
+  // 2026-07-21 stage-bar redesign: the single stage-surface dynamic width
+  // moved from StageActionPill (deleted popover) to StageBar's progress
+  // track — same justification, same count.
   inlineStyle: 6,
   rgba: 22,
 } as const;
@@ -148,18 +151,16 @@ const VISUAL_DEBT_PATTERNS: ReadonlyArray<[keyof typeof VISUAL_DEBT_BASELINE, Re
 //
 // The shape of a clickable control is decided by its semantic role, not by the
 // call site. Business <Button> tags therefore carry no radius utility at all —
-// they inherit the canonical Button radius. Three exceptions exist and all are
-// structural, not "this file is allowed to be messy":
+// they inherit the canonical Button radius. Primitive definitions are excluded
+// from the scan, and one business-level structural exception exists:
 //   1. components/ui/ — where semantic primitives (e.g. the round page-turn
 //      control) are *defined*. Already excluded from every scan below.
 //   2. The collapsed stage pill, whose product role IS a status pill/toggle.
-//   3. The healthy writing-model dot, whose entire interactive hit target is a
-//      circular status dot. Both business exceptions opt out explicitly.
+//      It lives in StageBar, the persistent stage strip that replaced the old
+//      floating popover entry point.
 const RADIUS_PATTERN = /\brounded-(?:none|xs|sm|md|lg|xl|2xl|3xl|full|\[[^\]]+\])/;
 const RADIUS_EXCEPTION_ATTR = 'data-shape="stage-pill"';
-const RADIUS_EXCEPTION_FILE = 'components/StageActionPill.tsx';
-const MODEL_DOT_EXCEPTION_ATTR = 'data-shape="model-health-dot"';
-const MODEL_DOT_EXCEPTION_FILE = 'components/WritingModelDotBadge.tsx';
+const RADIUS_EXCEPTION_FILE = 'components/StageBar.tsx';
 
 const PAGE_TURN_PRIMITIVE = '@/components/ui/page-turn-button';
 const PAGE_TURN_SURFACES = [
@@ -441,7 +442,6 @@ describe('business UI uses design-system primitives', () => {
   it('keeps business Button call sites on the canonical Button radius', () => {
     const violations: string[] = [];
     let stagePillExceptionCount = 0;
-    let modelDotExceptionCount = 0;
 
     for (const root of SOURCE_ROOTS) {
       for (const file of collectTsxFiles(join(process.cwd(), root))) {
@@ -459,16 +459,6 @@ describe('business UI uses design-system primitives', () => {
             }
             continue;
           }
-          if (tag.includes(MODEL_DOT_EXCEPTION_ATTR)) {
-            modelDotExceptionCount++;
-            if (rel !== MODEL_DOT_EXCEPTION_FILE) {
-              violations.push(`${rel}: model-health-dot radius exception used outside ${MODEL_DOT_EXCEPTION_FILE}`);
-            }
-            if (!RADIUS_PATTERN.test(classSources(tag, src))) {
-              violations.push(`${rel}: model-health-dot exception has no explicit circular radius`);
-            }
-            continue;
-          }
           const sources = classSources(tag, src);
           if (sources.includes('__unresolved_class_source:')) {
             violations.push(`${rel}: Button radius cannot be verified because a class source is unresolved`);
@@ -480,7 +470,6 @@ describe('business UI uses design-system primitives', () => {
     }
 
     expect(stagePillExceptionCount).toBe(1);
-    expect(modelDotExceptionCount).toBe(1);
     expect(violations).toEqual([]);
   });
 
@@ -531,6 +520,28 @@ describe('business UI uses design-system primitives', () => {
     }
 
     expect(violations).toEqual([]);
+  });
+
+  it('keeps manuscript notices and flipbook sizing on their canonical contracts', () => {
+    const reading = readFileSync(join(process.cwd(), 'components/ManuscriptReadingView.tsx'), 'utf8');
+    const pagination = readFileSync(join(process.cwd(), 'hooks/useDynamicPagination.ts'), 'utf8');
+    const geometry = readFileSync(join(process.cwd(), 'lib/flipbook-geometry.ts'), 'utf8');
+    const globals = readFileSync(join(process.cwd(), 'app/globals.css'), 'utf8');
+    const workspace = readFileSync(join(process.cwd(), 'components/NovelWorkspace.tsx'), 'utf8');
+    const noticeStart = workspace.indexOf('function ManuscriptNoticeRow');
+    const noticeEnd = workspace.indexOf('/**', noticeStart + 1);
+    const notice = workspace.slice(noticeStart, noticeEnd);
+
+    expect(reading).toContain('autoSize={false}');
+    expect(reading).toContain('width={FLIPBOOK_LAYOUT.pageWidth}');
+    expect(reading).toContain('height={FLIPBOOK_LAYOUT.pageHeight}');
+    expect(reading).not.toContain('maxHeight=');
+    expect(pagination).toContain('computeFlipbookGeometry(el.clientWidth, el.clientHeight)');
+    expect(geometry).toContain('pageWidth: 500');
+    expect(geometry).toContain('pageHeight: 850');
+    expect(globals).toMatch(/\.manuscript-flipbook\s*\{[^}]*height:\s*100%[^}]*width:\s*100%/);
+    expect(notice).toContain('rounded-lg');
+    expect(notice).not.toContain('rounded-full');
   });
 
   // INV-DD-03 — content-level empty states use the Empty family; loading and

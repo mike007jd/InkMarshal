@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useChat } from '@ai-sdk/react';
+import type { ChatStatus } from 'ai';
 import { AssistantChatTransport, useAISDKRuntime } from '@assistant-ui/react-ai-sdk';
 import type { AssistantRuntime } from '@assistant-ui/react';
 import type { Message } from '@/lib/db-types';
@@ -36,11 +37,13 @@ export interface NovelChatRuntimeArgs {
 
 export interface NovelChatRuntimeResult {
   runtime: AssistantRuntime;
+  status: ChatStatus;
   messages: Message[];
   loading: boolean;
   errorMessage: string | null;
   retry: () => Promise<void>;
   refresh: () => Promise<void>;
+  sendMessage: (text: string, body?: Record<string, unknown>) => Promise<void>;
 }
 
 function messagesEndpoint(novelId: string, conversationId?: string): string {
@@ -241,9 +244,24 @@ export function useNovelChatRuntime(args: NovelChatRuntimeArgs): NovelChatRuntim
     await chat.regenerate();
   }, [chat, fetchMessages]);
 
+  const sendMessage = useCallback(async (text: string, body?: Record<string, unknown>) => {
+    setErrorMessage(null);
+    chat.clearError();
+    await chat.sendMessage({ text }, body ? { body } : undefined);
+  }, [chat]);
+
   const runtime = useAISDKRuntime(chat, {
     unstable_capabilities: { copy: true },
   });
 
-  return { runtime, messages, loading, errorMessage, retry, refresh: fetchMessages };
+  return {
+    runtime,
+    status: chat.status,
+    messages,
+    loading,
+    errorMessage,
+    retry,
+    refresh: fetchMessages,
+    sendMessage,
+  };
 }

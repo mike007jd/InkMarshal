@@ -52,8 +52,28 @@ export const EMPTY_CHAPTER_WORD_FLOOR = 10;
 // ── Wire protocol ───────────────────────────────────────────────────────────
 /** The NDJSON frames the writing stream emits. Typed so the server `send` and
  *  the client reducer (lib/writing-session.ts) share one definition. */
+export type WritingPhase =
+  | 'preparing'
+  | 'planning'
+  | 'drafting'
+  | 'saving'
+  | 'chapter_complete'
+  | 'paused'
+  | 'failed'
+  | 'complete';
+
 export type WritingFrame =
-  | { type: 'heartbeat' }
+  | { type: 'heartbeat'; at?: string }
+  | {
+      type: 'phase';
+      phase: WritingPhase;
+      message: string;
+      progress?: number;
+      chapterNumber?: number;
+      chapterTitle?: string;
+      completedChapters?: number;
+      totalChapters?: number;
+    }
   | { type: 'progress'; progress: number; message: string }
   | { type: 'blueprint'; blueprint: NovelBlueprint; total: number }
   | { type: 'writing'; chapterNumber: number; chunk: string; title: string }
@@ -66,6 +86,8 @@ export type WritingFrame =
       qualityIssues: ChapterQualityIssue[] | null;
       ralphRevisions: number;
       progress: number;
+      completedChapters: number;
+      totalChapters: number;
     }
   | {
       type: 'batch_done';

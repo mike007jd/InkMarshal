@@ -5,7 +5,9 @@ import { ChevronDown, ChevronRight, Download, PenLine } from 'lucide-react';
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { exportFilenameBase } from '@/lib/exporters/filename';
+import type { WritingRunState } from '@/lib/writing-session';
 import { ChapterDownloadMenu } from '@/components/ChapterDownloadMenu';
+import { WritingRunStatus, type WritingRunControls } from '@/components/WritingRunStatus';
 import { Button } from '@/components/ui/button';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import {
@@ -38,6 +40,12 @@ interface ManuscriptSidebarProps {
   liveChapterNumber?: number;
   onModeChange: (mode: 'reading' | 'editing') => void;
   onChapterSelect: (chapterNumber: number) => void;
+  /** Active writing run — when present, the compact run panel REPLACES the
+   *  plain Progress section (no extra card is added). */
+  writingRunState?: WritingRunState | null;
+  writingRunControls?: WritingRunControls;
+  /** Caller-owned 1s heartbeat so elapsed/last-activity tick. */
+  runNowMs?: number;
 }
 
 export function ManuscriptSidebar({
@@ -54,11 +62,19 @@ export function ManuscriptSidebar({
   liveChapterNumber,
   onModeChange,
   onChapterSelect,
+  writingRunState = null,
+  writingRunControls,
+  runNowMs,
 }: ManuscriptSidebarProps) {
   const { t } = useLanguage();
   const { toast } = useToast();
   const [exporting, setExporting] = useState<string | null>(null);
   const chapterRefs = useRef(new Map<number, HTMLButtonElement>());
+  // Fallback clock for hosts that don't pass a run heartbeat — frozen at
+  // mount so render stays pure; the shell always passes its live runNowMs.
+  const [fallbackNowMs] = useState(() => Date.now());
+
+  const runActive = writingRunState != null && writingRunState.phase !== 'idle';
 
   const safeName = exportFilenameBase(title);
 
@@ -125,7 +141,7 @@ export function ManuscriptSidebar({
       >
         <ToggleGroupItem
           value="reading"
-          className="h-auto min-w-0 flex-1 rounded-md px-3 py-1.5 text-xs font-semibold text-book-ink-secondary transition hover:bg-book-bg-secondary hover:text-book-ink-secondary data-[state=on]:bg-book-gold data-[state=on]:text-book-on-gold data-[state=on]:shadow-sm"
+          className="h-auto min-w-0 flex-1 rounded-md px-3 py-1.5 text-xs font-semibold text-book-ink-secondary transition-feedback hover:bg-book-bg-secondary hover:text-book-ink-secondary data-[state=on]:bg-book-gold data-[state=on]:text-book-on-gold data-[state=on]:shadow-sm"
         >
           {t.readingMode}
         </ToggleGroupItem>
@@ -133,7 +149,7 @@ export function ManuscriptSidebar({
           value="editing"
           disabled={isWritingLive}
           title={isWritingLive ? t.editingDisabledWriting : undefined}
-          className="h-auto min-w-0 flex-1 rounded-md px-3 py-1.5 text-xs font-semibold text-book-ink-secondary transition hover:bg-book-bg-secondary hover:text-book-ink-secondary data-[state=on]:bg-book-gold data-[state=on]:text-book-on-gold data-[state=on]:shadow-sm disabled:cursor-not-allowed disabled:opacity-40"
+          className="h-auto min-w-0 flex-1 rounded-md px-3 py-1.5 text-xs font-semibold text-book-ink-secondary transition-feedback hover:bg-book-bg-secondary hover:text-book-ink-secondary data-[state=on]:bg-book-gold data-[state=on]:text-book-on-gold data-[state=on]:shadow-sm disabled:cursor-not-allowed disabled:opacity-40"
         >
           {t.editingMode}
         </ToggleGroupItem>
@@ -149,18 +165,30 @@ export function ManuscriptSidebar({
         </div>
       </div>
 
-      {/* Progress bar */}
+      {/* Progress — replaced in place by the compact run panel while a
+          writing run is active (no fourth card is added). */}
       <div className="shrink-0 border-b border-book-border px-4 py-3">
-        <div className="mb-1.5 flex items-center justify-between text-xs font-semibold text-book-ink-secondary">
-          <span>{t.manuscriptProgress}</span>
-          <span>{progress}%</span>
-        </div>
-        <div className="h-1.5 overflow-hidden rounded-full bg-book-border">
-          <div
-            className="motion-essential h-full rounded-full book-progress-bar transition-progress"
-            style={{ width: `${progress}%` }}
+        {runActive && writingRunState ? (
+          <WritingRunStatus
+            density="panel"
+            state={writingRunState}
+            controls={writingRunControls}
+            nowMs={runNowMs ?? fallbackNowMs}
           />
-        </div>
+        ) : (
+          <>
+            <div className="mb-1.5 flex items-center justify-between text-xs font-semibold text-book-ink-secondary">
+              <span>{t.manuscriptProgress}</span>
+              <span>{progress}%</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-book-border">
+              <div
+                className="motion-essential h-full rounded-full book-progress-bar transition-progress"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </>
+        )}
       </div>
 
       {/* Chapter list */}
@@ -183,7 +211,7 @@ export function ManuscriptSidebar({
                 <div
                   key={ch.id ?? `ch-${ch.chapterNumber}`}
                   className={[
-                    'group relative mb-1 flex items-stretch rounded-lg border text-xs transition',
+                    'group relative mb-1 flex items-stretch rounded-lg border text-xs transition-feedback',
                     isActive
                       ? 'border-book-gold bg-book-bg-secondary'
                       : 'border-transparent hover:border-book-border hover:bg-book-bg-secondary',
@@ -226,7 +254,7 @@ export function ManuscriptSidebar({
 
                   {/* Right rail: live pen / download menu / chevron */}
                   <div
-                    className={`absolute right-2 top-2 flex items-center gap-1 transition-opacity ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`}
+                    className={`absolute right-2 top-2 flex items-center gap-1 transition-feedback ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`}
                   >
                     {isLive ? (
                       <PenLine className="h-3 w-3 text-book-stage-writing" />
@@ -239,7 +267,7 @@ export function ManuscriptSidebar({
                     )}
                     <ChevronRight
                       className={[
-                        'h-3 w-3 transition-transform text-book-ink-muted',
+                        'h-3 w-3 transition-toggle text-book-ink-muted',
                         isActive ? 'translate-x-0.5 text-book-gold' : '',
                       ].join(' ')}
                     />

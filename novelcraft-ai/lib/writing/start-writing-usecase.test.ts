@@ -157,7 +157,7 @@ describe('executeStartWriting — writing_jobs wiring', () => {
 
     expect(orch.writeChapter).not.toHaveBeenCalled();
     expect(jobs.bumpProgress).not.toHaveBeenCalled();
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
     expect(jobs.finalize).toHaveBeenCalledWith(
       'paused',
       'lock_failed',
@@ -185,7 +185,7 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
   });
 
-  it('resets the novel out of 5 percent drafting when blueprint generation is aborted', async () => {
+  it('preserves approval and a resumable 5 percent state when blueprint generation is aborted', async () => {
     steps.loadOrGenerateBlueprint.mockRejectedValue(new Error('aborted upstream'));
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const controller = new AbortController();
@@ -197,7 +197,7 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     await executeStartWriting(ctx, sink);
 
     expect(db.updateNovel).toHaveBeenNthCalledWith(1, 'n1', { stage: 'autonomous_writing', progress: 5 });
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
+    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 5 });
     expect(orch.writeChapter).not.toHaveBeenCalled();
     expect(jobs.finalize).toHaveBeenCalledWith(
       'paused',

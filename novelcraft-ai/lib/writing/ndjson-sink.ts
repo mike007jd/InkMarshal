@@ -48,7 +48,7 @@ export function createNdjsonWritingStream(opts: NdjsonWritingStreamOptions): Rea
       const sink: WritingEventSink = { emit: send, isClosed: () => controllerClosed };
 
       // Heartbeat keeps proxies/clients from timing out during slow model calls.
-      const heartbeat = setInterval(() => send({ type: 'heartbeat' }), 5000);
+      const heartbeat = setInterval(() => send({ type: 'heartbeat', at: new Date().toISOString() }), 5000);
       // Renew on a timer too, not only at chapter boundaries: a single chapter
       // can exceed the lock TTL on slow local engines, which would let another
       // session steal the lock mid-generation. If renewal reports the lock is

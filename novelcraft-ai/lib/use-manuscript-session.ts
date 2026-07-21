@@ -4,10 +4,17 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
-import { startWritingSession, type LiveWritingChapter } from '@/lib/writing-session';
+import {
+  IDLE_WRITING_RUN_STATE,
+  startWritingSession,
+  type LiveWritingChapter,
+  type WritingRunState,
+} from '@/lib/writing-session';
 import { creativityFromSettings, readCachedNovelCreativity } from '@/hooks/useNovelCreativity';
 import type { Chapter, Novel } from '@/lib/db-types';
 import { isAIActionGateCancellation } from '@/lib/ai-action-gate';
+import { countWords } from '@/lib/utils';
+import type { WritingJob } from '@/lib/db/queries-writing-jobs';
 
 // Auto-resume only counts down when the caller explicitly opted in via the
 // `autostart` flag (the post-greenlight redirect). All other entries default
@@ -30,6 +37,7 @@ export interface ManuscriptSession {
   resumeCountdown: number | null;
   resumePromptVisible: boolean;
   batchDone: BatchDoneInfo | null;
+  writingRunState: WritingRunState;
 
   fetchNovel: () => Promise<Novel>;
   fetchChapters: () => Promise<Chapter[]>;
@@ -98,6 +106,8 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
   const [resumeCountdown, setResumeCountdown] = useState<number | null>(null);
   const [resumePromptVisible, setResumePromptVisible] = useState(false);
   const [batchDone, setBatchDone] = useState<BatchDoneInfo | null>(null);
+  const [writingRunState, setWritingRunState] = useState<WritingRunState>(IDLE_WRITING_RUN_STATE);
+  const [latestWritingJob, setLatestWritingJob] = useState<WritingJob | null>(null);
 
   const writingAbortRef = useRef<AbortController | null>(null);
   const writingStartRef = useRef(false);
@@ -126,9 +136,12 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     const requestNovelId = novelId;
     const response = await fetch(`/api/novels/${novelId}`);
     if (!response.ok) throw new Error(`Failed to fetch novel (HTTP ${response.status})`);
-    const data = await response.json();
-    if (activeNovelRef.current === requestNovelId) setNovel(data);
-    return data as Novel;
+    const data = await response.json() as Novel & { writingJob?: WritingJob | null };
+    if (activeNovelRef.current === requestNovelId) {
+      setNovel(data);
+      setLatestWritingJob(data.writingJob ?? null);
+    }
+    return data;
   }, [novelId]);
 
   const fetchChapters = useCallback(async () => {
@@ -163,6 +176,8 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
       setResumeCountdown(null);
       setResumePromptVisible(false);
       setBatchDone(null);
+      setWritingRunState(IDLE_WRITING_RUN_STATE);
+      setLatestWritingJob(null);
     });
     return () => {
       cancelled = true;
@@ -205,6 +220,17 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     setBatchDone(null);
     setResumePromptVisible(false);
     setStatusLabel(t.manuscriptWriting || 'Writing Live');
+    const startedAt = new Date().toISOString();
+    setWritingRunState({
+      ...IDLE_WRITING_RUN_STATE,
+      phase: 'preparing',
+      statusLabel: t.manuscriptWriting || 'Writing Live',
+      progress: novel?.progress ?? 0,
+      completedChapters: chapters.length,
+      totalChapters: novel?.blueprint?.chapters?.length,
+      startedAt,
+      lastActivityAt: startedAt,
+    });
     setResumeCountdown(null);
     setLiveChapter(null);
     partialChapterByRunRef.current.delete(runId);
@@ -240,7 +266,17 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
           },
           appendLiveChapter: chunk => {
             if (!isActiveRun() && !canApplyPausedFlush()) return;
-            setLiveChapter(current => current ? { ...current, content: current.content + chunk } : current);
+            setLiveChapter(current => {
+              if (!current) return current;
+              const next = { ...current, content: current.content + chunk };
+              setWritingRunState(run => ({
+                ...run,
+                phase: 'drafting',
+                liveWordCount: countWords(next.content),
+                lastActivityAt: new Date().toISOString(),
+              }));
+              return next;
+            });
           },
           setLiveChapter: chapter => {
             if (!isActiveRun() && !canApplyPausedFlush()) return;
@@ -265,11 +301,24 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
                 remaining: info.remaining,
               });
             }
+            setWritingRunState(current => ({
+              ...current,
+              phase: 'paused',
+              completedChapters: info.completedChapters,
+              totalChapters: info.totalChapters,
+              lastActivityAt: new Date().toISOString(),
+            }));
           },
           onDone: () => {
             if (!isActiveRun()) return;
             setIsStreaming(false);
             setDidRequestAutostart(false);
+            setWritingRunState(current => ({
+              ...current,
+              phase: 'complete',
+              progress: 100,
+              lastActivityAt: new Date().toISOString(),
+            }));
           },
           onError: message => {
             if (!isActiveRun()) return;
@@ -279,6 +328,13 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
             const partial = partialChapterByRunRef.current.get(runId) ?? null;
             partialChapterByRunRef.current.delete(runId);
             if (partial) setLiveChapter(partial);
+            setWritingRunState(current => ({
+              ...current,
+              phase: 'failed',
+              statusLabel: message,
+              error: message,
+              lastActivityAt: new Date().toISOString(),
+            }));
             toast(message, 'error', {
               action: { label: t.toastRetry, onClick: () => { void startWritingRef.current?.(opts); } },
             });
@@ -288,6 +344,10 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
               partialChapterByRunRef.current.set(runId, chapter);
             }
           },
+          updateRunState: patch => {
+            if (!isActiveRun() && !canApplyPausedFlush()) return;
+            setWritingRunState(current => ({ ...current, ...patch }));
+          },
         },
       });
     } catch (error) {
@@ -296,6 +356,11 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
       if (pausedRun) {
         const partial = partialChapterByRunRef.current.get(runId);
         if (canApplyPausedFlush() && partial) setLiveChapter(partial);
+        setWritingRunState(current => ({
+          ...current,
+          phase: 'paused',
+          lastActivityAt: new Date().toISOString(),
+        }));
         return;
       }
       setIsStreaming(false);
@@ -311,6 +376,7 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
       if (isAIActionGateCancellation(error)) {
         setLiveChapter(null);
         setStatusLabel('');
+        setWritingRunState(IDLE_WRITING_RUN_STATE);
         return;
       }
       setLiveChapter(liveChapterAfterFailure);
@@ -320,6 +386,14 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
         action: { label: t.toastRetry, onClick: () => { void startWritingRef.current?.(opts); } },
       });
       setStatusLabel('');
+      const message = error instanceof Error ? error.message : t.errorWritingFailed;
+      setWritingRunState(current => ({
+        ...current,
+        phase: 'failed',
+        statusLabel: message,
+        error: message,
+        lastActivityAt: new Date().toISOString(),
+      }));
     } finally {
       pausedWritingRunsRef.current.delete(runId);
       partialChapterByRunRef.current.delete(runId);
@@ -328,7 +402,7 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
         releaseWritingStart(writingStartRef);
       }
     }
-  }, [fetchChapters, fetchNovel, locale, novel, novelId, t.manuscriptWriting, t.manuscriptReading, t.errorWritingFailed, t.toastRetry, toast]);
+  }, [chapters.length, fetchChapters, fetchNovel, locale, novel, novelId, t.manuscriptWriting, t.manuscriptReading, t.errorWritingFailed, t.toastRetry, toast]);
   useEffect(() => { startWritingRef.current = startWriting; }, [startWriting]);
 
   const pauseWriting = useCallback(() => {
@@ -340,9 +414,15 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     writingStartRef.current = false;
     setIsStreaming(false);
     setDidRequestAutostart(false);
-    setStatusLabel(t.manuscriptReading || 'Reading Copy');
+    setStatusLabel(t.writingPausedLabel || 'Writing paused');
+    setWritingRunState(current => ({
+      ...current,
+      phase: 'paused',
+      statusLabel: t.writingPausedLabel || 'Writing paused',
+      lastActivityAt: new Date().toISOString(),
+    }));
     toast(t.writingStopped, 'info');
-  }, [t.manuscriptReading, t.writingStopped, toast]);
+  }, [t.writingPausedLabel, t.writingStopped, toast]);
 
   // Autostart from explicit autostart flag (post-greenlight redirect).
   useEffect(() => {
@@ -437,6 +517,58 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     };
   }, [autostart, novel, t.manuscriptReading, t.manuscriptWriting]);
 
+  // Reconstruct a truthful resumable state from durable novel/chapter data
+  // after relaunch or refocus. A running HTTP stream will immediately replace
+  // this with its more specific preparing/planning/drafting phase events.
+  useEffect(() => {
+    if (!novel || isStreaming) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      if (latestWritingJob?.status === 'failed') {
+        setWritingRunState({
+          ...IDLE_WRITING_RUN_STATE,
+          phase: 'failed',
+          statusLabel: latestWritingJob.errorMessage || t.errorWritingFailed,
+          error: latestWritingJob.errorMessage || t.errorWritingFailed,
+          chapterNumber: latestWritingJob.currentChapter ?? undefined,
+          completedChapters: chapters.length,
+          totalChapters: novel.blueprint?.chapters?.length,
+          progress: novel.progress,
+          startedAt: latestWritingJob.startedAt,
+          lastActivityAt: latestWritingJob.updatedAt,
+        });
+        return;
+      }
+      if (novel.stage === 'autonomous_writing') {
+        setWritingRunState(current => current.phase === 'failed' ? current : ({
+          ...current,
+          phase: 'paused',
+          statusLabel: t.writingPausedLabel || 'Writing paused',
+          progress: novel.progress,
+          completedChapters: chapters.length,
+          totalChapters: novel.blueprint?.chapters?.length,
+          startedAt: current.startedAt ?? latestWritingJob?.startedAt,
+          lastActivityAt: latestWritingJob?.updatedAt ?? current.lastActivityAt ?? new Date().toISOString(),
+        }));
+        return;
+      }
+      if (novel.stage === 'completed' || novel.stage === 'whole_book_unification') {
+        setWritingRunState(current => ({
+          ...current,
+          phase: 'complete',
+          statusLabel: t.manuscriptReading || 'Reading Copy',
+          progress: 100,
+          completedChapters: chapters.length,
+          totalChapters: novel.blueprint?.chapters?.length ?? chapters.length,
+        }));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [chapters.length, isStreaming, latestWritingJob, novel, t.errorWritingFailed, t.manuscriptReading, t.writingPausedLabel]);
+
   // Abort writing + clear timers on unmount.
   useEffect(() => {
     return () => {
@@ -469,6 +601,7 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     resumeCountdown,
     resumePromptVisible,
     batchDone,
+    writingRunState,
     fetchNovel,
     fetchChapters,
     startWriting,

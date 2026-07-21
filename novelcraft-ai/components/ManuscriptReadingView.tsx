@@ -2,10 +2,15 @@
 
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
-import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect } from 'react';
 import { BookOpen, ArrowRight, Scroll } from 'lucide-react';
 
-import { paginateManuscript, type ManuscriptPage } from '@/lib/pagination';
+import {
+  findPageIndexForSourceOffset,
+  paginateManuscript,
+  type ManuscriptPage,
+} from '@/lib/pagination';
+import { FLIPBOOK_LAYOUT } from '@/lib/flipbook-geometry';
 import { useLanguage } from '@/components/LanguageProvider';
 import { parsePositiveIntegerParam } from '@/lib/route-params';
 import { useToast } from '@/components/Toast';
@@ -30,6 +35,15 @@ const HTMLFlipBook = dynamic(() => import('react-pageflip'), { ssr: false });
 
 export type ReadingLayout = 'continuous' | 'flipbook';
 
+/** External chapter-selection token. `seq` increments on every explicit
+ *  user-driven chapter pick (sidebar, jump input, deep link, search result)
+ *  so the flipbook can tell "jump to this chapter's first page" apart from
+ *  the passive activeChapter sync produced by page flips. */
+export interface ChapterSelection {
+  chapterNumber: number;
+  seq: number;
+}
+
 interface ManuscriptReadingViewProps {
   novelId: string;
   chapters: ManuscriptChapter[]; // already combined with live chapter by parent
@@ -37,6 +51,11 @@ interface ManuscriptReadingViewProps {
   mode: 'writing-live' | 'reading-review';
   activeChapter: number | null;
   onActiveChapterChange?: (chapterNumber: number) => void;
+  /** Explicit user chapter navigation (jump input). Distinct from the passive
+   *  flip/scroll sync above so the parent can route it as an external
+   *  selection that repositions the book and suspends live-follow. */
+  onChapterJump?: (chapterNumber: number) => void;
+  chapterSelection?: ChapterSelection | null;
   layout: ReadingLayout;
   onLayoutChange: (layout: ReadingLayout) => void;
 }
@@ -168,7 +187,7 @@ function EmptyManuscript({ novelId }: { novelId: string }) {
   );
 }
 
-/* ---------- Layout toolbar (segmented toggle + jump-to-chapter) ---------- */
+/* ---------- Layout toolbar (segmented toggle + page nav + jump-to-chapter) ---------- */
 
 interface LayoutToolbarProps {
   layout: ReadingLayout;
@@ -176,9 +195,16 @@ interface LayoutToolbarProps {
   jumpInputRef: React.RefObject<HTMLInputElement | null>;
   onJump: (chapterNumber: number) => void;
   totalChapters: number;
+  /** Flipbook page controls (prev / page info / next). Rendered by the
+   *  flipbook only; the buttons are hidden at xl+ where the fixed side
+   *  rails take over, the single page indicator stays. */
+  pageNav?: React.ReactNode;
+  /** Live-writing follow status for the aria-live announcement. Null when
+   *  not in writing-live flipbook mode. */
+  follow?: { suspended: boolean; remainingSec: number } | null;
 }
 
-function LayoutToolbar({ layout, onLayoutChange, jumpInputRef, onJump, totalChapters }: LayoutToolbarProps) {
+function LayoutToolbar({ layout, onLayoutChange, jumpInputRef, onJump, totalChapters, pageNav, follow }: LayoutToolbarProps) {
   const { t } = useLanguage();
   const { toast } = useToast();
   const [jumpValue, setJumpValue] = useState('');
@@ -211,7 +237,7 @@ function LayoutToolbar({ layout, onLayoutChange, jumpInputRef, onJump, totalChap
         <ToggleGroupItem
           value="continuous"
           className={[
-            'inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-medium uppercase tracking-label transition-colors',
+            'inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-medium uppercase tracking-label transition-feedback',
             layout === 'continuous'
               ? 'bg-book-bg-card text-book-ink-primary shadow-sm'
               : 'text-book-ink-muted hover:text-book-ink-primary',
@@ -224,7 +250,7 @@ function LayoutToolbar({ layout, onLayoutChange, jumpInputRef, onJump, totalChap
         <ToggleGroupItem
           value="flipbook"
           className={[
-            'inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-medium uppercase tracking-label transition-colors',
+            'inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-medium uppercase tracking-label transition-feedback',
             layout === 'flipbook'
               ? 'bg-book-bg-card text-book-ink-primary shadow-sm'
               : 'text-book-ink-muted hover:text-book-ink-primary',
@@ -236,7 +262,24 @@ function LayoutToolbar({ layout, onLayoutChange, jumpInputRef, onJump, totalChap
         </ToggleGroupItem>
       </ToggleGroup>
 
-      <div className="ml-auto flex items-center gap-1">
+      {follow && (
+        <span
+          role="status"
+          aria-live="polite"
+          className="inline-flex items-center gap-1.5 text-2xs font-medium text-book-ink-muted"
+        >
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${follow.suspended ? 'bg-book-ink-muted' : 'bg-book-stage-writing'}`}
+            aria-hidden
+          />
+          {follow.suspended
+            ? t.readingFollowPaused.replace('{seconds}', String(follow.remainingSec))
+            : t.readingFollowActive}
+        </span>
+      )}
+
+      <div className="ml-auto flex items-center gap-2">
+        {pageNav}
         <Input
           ref={jumpInputRef}
           type="number"
@@ -405,11 +448,22 @@ interface FlipbookReadingViewProps {
   mode: 'writing-live' | 'reading-review';
   activeChapter: number | null;
   onActiveChapterChange?: (n: number) => void;
+  chapterSelection?: ChapterSelection | null;
+  toolbar: {
+    layout: ReadingLayout;
+    onLayoutChange: (layout: ReadingLayout) => void;
+    jumpInputRef: React.RefObject<HTMLInputElement | null>;
+    onJump: (chapterNumber: number) => void;
+    totalChapters: number;
+  };
 }
 
 const FLIP_TIME_MS = 400;
+/** How long a user page-turn gesture suspends live-writing auto-follow. */
+const FOLLOW_SUSPEND_MS = 5000;
 
 interface PageFlipController {
+  update(): void;
   flipNext(): void;
   flipPrev(): void;
   turnToNextPage(): void;
@@ -425,21 +479,34 @@ function FlipbookReadingView({
   mode,
   activeChapter,
   onActiveChapterChange,
+  chapterSelection,
+  toolbar,
 }: FlipbookReadingViewProps) {
-  // --- Dynamic pagination ---
-  const { containerRef, charsPerPage, titleReserve } = useDynamicPagination({
+  const bookRef = useRef<{ pageFlip(): PageFlipController | null } | null>(null);
+  const updateBookLayout = useCallback(() => {
+    bookRef.current?.pageFlip()?.update();
+  }, []);
+
+  // --- Dynamic pagination: measures ONLY the real book viewport below (the
+  // centre column between the side rails). The toolbar and rails live outside
+  // the measured element, so no fixed "reserve" guess is needed; the
+  // ResizeObserver inside the hook re-paginates on window/zoom changes.
+  const { containerRef, charsPerPage, titleReserve, geometry } = useDynamicPagination({
     lineHeight: 30,
     charsPerLine: 42,
     titleReserveLines: 5,
     paddingY: 56,
-    heightReserve: 96,
-    pageAspectRatio: 620 / 460,
-    pagesPerSpread: 2,
     paddingX: 72,
     averageCharWidth: 9,
-    minPageWidth: 260,
-    maxPageWidth: 680,
+    onContainerResize: updateBookLayout,
   });
+
+  const bookOverlayStyle = useMemo<React.CSSProperties>(() => ({
+    left: geometry.left,
+    top: geometry.top,
+    width: geometry.spreadWidth,
+    height: geometry.pageHeight,
+  }), [geometry]);
 
   const pages = useMemo(
     () => paginateManuscript(chapters, { charsPerPage, chapterTitleReserve: titleReserve }),
@@ -451,16 +518,37 @@ function FlipbookReadingView({
   const displayPages = useMemo(() => {
     const result: (ManuscriptPage | null)[] = [...pages];
     if (result.length === 0) {
-      result.push(null, null);
-    } else if (result.length % 2 !== 0) {
+      result.push(null);
+      if (geometry.spreadPages === 2) result.push(null);
+    } else if (geometry.spreadPages === 2 && result.length % 2 !== 0) {
       result.push(null);
     }
     return result;
-  }, [pages]);
+  }, [pages, geometry.spreadPages]);
 
-  const bookRef = useRef<{ pageFlip(): PageFlipController | null } | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
+  const previousPagesRef = useRef(pages);
+  const pendingReadingAnchorRef = useRef<{ chapterNumber: number; sourceOffset: number } | null>(null);
+
+  // Capture the centre of the currently visible source range before new page
+  // boundaries replace it. A numeric page index is not a stable reading
+  // position: enlarging the book can reduce the page count and page-flip then
+  // falls back to page zero when the old index no longer exists.
+  useLayoutEffect(() => {
+    const previousPages = previousPagesRef.current;
+    if (previousPages !== pages && previousPages.length > 0) {
+      const previousPage = previousPages[Math.min(currentPage, previousPages.length - 1)];
+      if (previousPage) {
+        pendingReadingAnchorRef.current = {
+          chapterNumber: previousPage.chapterNumber,
+          sourceOffset: previousPage.sourceStart
+            + Math.max(0, Math.floor((previousPage.sourceEnd - previousPage.sourceStart) / 2)),
+        };
+      }
+    }
+    previousPagesRef.current = pages;
+  }, [pages, currentPage]);
 
   useEffect(() => {
     if (typeof window.matchMedia !== 'function') return;
@@ -471,37 +559,116 @@ function FlipbookReadingView({
     return () => media.removeEventListener('change', syncPreference);
   }, []);
 
-  // User-interaction tracking (suppresses live-write auto-flip).
-  const userInteractedRef = useRef(false);
-  const interactTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // --- Live-follow state -------------------------------------------------
+  // `suspendResumeAt != null` means the user explicitly took over (buttons,
+  // arrow keys, book swipe, chapter jump, sidebar chapter pick) and
+  // auto-follow is paused until that timestamp. Every further gesture
+  // re-arms the full window. When the timer fires we snap straight to the
+  // latest real content page — even if no new chunk arrived meanwhile.
+  const [suspendResumeAt, setSuspendResumeAt] = useState<number | null>(null);
+  const suspendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [followNowMs, setFollowNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     return () => {
-      if (interactTimerRef.current) clearTimeout(interactTimerRef.current);
+      if (suspendTimerRef.current) clearTimeout(suspendTimerRef.current);
     };
   }, []);
 
-  const markUserInteracted = useCallback(() => {
-    userInteractedRef.current = true;
-    if (interactTimerRef.current) clearTimeout(interactTimerRef.current);
-    interactTimerRef.current = setTimeout(() => {
-      userInteractedRef.current = false;
-      interactTimerRef.current = null;
-    }, 5000);
+  // Last REAL content page of the chapter currently being generated — never
+  // the blank filler page appended to complete a spread.
+  const lastContentPageIndex = useMemo(() => {
+    if (pages.length === 0) return -1;
+    if (liveChapter) {
+      for (let i = pages.length - 1; i >= 0; i -= 1) {
+        if (pages[i].chapterNumber === liveChapter.chapterNumber) return i;
+      }
+    }
+    return pages.length - 1;
+  }, [pages, liveChapter]);
+
+  const jumpToLatestContentPage = useCallback(() => {
+    if (lastContentPageIndex < 0) return;
+    const pf = bookRef.current?.pageFlip();
+    if (!pf || pf.getCurrentPageIndex() === lastContentPageIndex) return;
+    pf.turnToPage(lastContentPageIndex);
+  }, [lastContentPageIndex]);
+  const jumpToLatestRef = useRef(jumpToLatestContentPage);
+  useEffect(() => {
+    jumpToLatestRef.current = jumpToLatestContentPage;
+  });
+
+  const suspendFollow = useCallback(() => {
+    const now = Date.now();
+    setFollowNowMs(now);
+    setSuspendResumeAt(now + FOLLOW_SUSPEND_MS);
+    if (suspendTimerRef.current) clearTimeout(suspendTimerRef.current);
+    suspendTimerRef.current = setTimeout(() => {
+      suspendTimerRef.current = null;
+      setSuspendResumeAt(null);
+      jumpToLatestRef.current();
+    }, FOLLOW_SUSPEND_MS);
   }, []);
+
+  // 1s-ish heartbeat while suspended so the toolbar countdown reads live.
+  useEffect(() => {
+    if (suspendResumeAt == null) return;
+    const id = setInterval(() => setFollowNowMs(Date.now()), 250);
+    return () => clearInterval(id);
+  }, [suspendResumeAt]);
+
+  const followSuspended = suspendResumeAt != null;
+  const followRemainingSec = suspendResumeAt == null
+    ? 0
+    : Math.max(0, Math.ceil((suspendResumeAt - followNowMs) / 1000));
+
+  // Auto-follow the live draft. Writing-live only; review mode is fully
+  // manual. Fires whenever pagination grows (one page or several) and right
+  // after a suspension ends.
+  useEffect(() => {
+    if (mode !== 'writing-live' || !liveChapter || followSuspended) return;
+    jumpToLatestContentPage();
+  }, [mode, liveChapter, followSuspended, jumpToLatestContentPage]);
+
+  // React-pageflip refreshes its internal HTML collection in a passive effect.
+  // Restore after that refresh: active live-follow owns the latest page;
+  // review mode and suspended follow retain the same source passage.
+  useEffect(() => {
+    const shouldFollowLatest = mode === 'writing-live' && liveChapter && !followSuspended;
+    if (!shouldFollowLatest && !pendingReadingAnchorRef.current) return;
+
+    const timer = setTimeout(() => {
+      if (shouldFollowLatest) {
+        pendingReadingAnchorRef.current = null;
+        jumpToLatestContentPage();
+        return;
+      }
+
+      const anchor = pendingReadingAnchorRef.current;
+      const pf = bookRef.current?.pageFlip();
+      if (!anchor || !pf) return;
+      const target = findPageIndexForSourceOffset(pages, anchor.chapterNumber, anchor.sourceOffset);
+      if (target >= 0 && pf.getCurrentPageIndex() !== target) pf.turnToPage(target);
+      pendingReadingAnchorRef.current = null;
+    }, 0);
+
+    return () => clearTimeout(timer);
+  }, [pages, mode, liveChapter, followSuspended, jumpToLatestContentPage]);
 
   const [hasFlipped, setHasFlipped] = useState(false);
 
+  // onFlip is a passive sync: it records the current page and mirrors the
+  // chapter into the sidebar. It must NOT infer user intent — programmatic
+  // turns fire it too, so suspending follow here would break auto-follow.
   const handleFlip = useCallback((e: { data: number }) => {
     setCurrentPage(e.data);
     setHasFlipped(true);
-    markUserInteracted();
     // Map page → chapterNumber for sidebar sync
     const page = pages[e.data];
     if (page && page.chapterNumber !== activeChapter) {
       onActiveChapterChange?.(page.chapterNumber);
     }
-  }, [markUserInteracted, pages, activeChapter, onActiveChapterChange]);
+  }, [pages, activeChapter, onActiveChapterChange]);
 
   const flipNext = useCallback(() => {
     if (!hasContent) return;
@@ -509,9 +676,10 @@ function FlipbookReadingView({
     if (!pf) return;
     const cur = pf.getCurrentPageIndex();
     if (cur >= displayPages.length - 1) return;
+    suspendFollow();
     if (prefersReducedMotion) pf.turnToNextPage();
     else pf.flipNext();
-  }, [hasContent, displayPages.length, prefersReducedMotion]);
+  }, [hasContent, displayPages.length, prefersReducedMotion, suspendFollow]);
 
   const flipPrev = useCallback(() => {
     if (!hasContent) return;
@@ -519,9 +687,10 @@ function FlipbookReadingView({
     if (!pf) return;
     const cur = pf.getCurrentPageIndex();
     if (cur <= 0) return;
+    suspendFollow();
     if (prefersReducedMotion) pf.turnToPrevPage();
     else pf.flipPrev();
-  }, [hasContent, prefersReducedMotion]);
+  }, [hasContent, prefersReducedMotion, suspendFollow]);
 
   // Arrow keys flip pages. We delegate the input-focus skip to
   // useGlobalHotkey so it walks `isContentEditable` ancestors too —
@@ -530,31 +699,44 @@ function FlipbookReadingView({
   useGlobalHotkey('arrowright', flipNext, { enabled: hasContent });
   useGlobalHotkey('arrowleft', flipPrev, { enabled: hasContent });
 
-  // Sync only when the externally selected chapter or pagination changes.
-  // Page turns within the same chapter must not snap back to its first page.
-  const turnToActiveChapter = useCallback(() => {
-    if (activeChapter == null) return;
-    const target = pages.findIndex(p => p.chapterNumber === activeChapter && p.isFirstOfChapter);
-    if (target < 0) return;
+  // --- Chapter-start positioning ------------------------------------------
+  // Only an EXTERNAL chapter selection (sidebar pick, jump input, deep link,
+  // search result — signalled by a fresh selection seq) repositions the book
+  // to a chapter's first page. Flip-driven activeChapter syncs, stream
+  // chunks, re-pagination and programmatic turns never do.
+  const turnToChapterStart = useCallback((chapterNumber: number): boolean => {
+    const target = pages.findIndex(p => p.chapterNumber === chapterNumber && p.isFirstOfChapter);
+    if (target < 0) return false;
     const pf = bookRef.current?.pageFlip();
-    if (!pf || target === pf.getCurrentPageIndex()) return;
-    pf.turnToPage(target);
-  }, [activeChapter, pages]);
+    if (!pf) return false;
+    if (pf.getCurrentPageIndex() !== target) pf.turnToPage(target);
+    return true;
+  }, [pages]);
+
+  const selectionStateRef = useRef<{ seq: number; chapterNumber: number; done: boolean } | null>(null);
 
   useEffect(() => {
-    turnToActiveChapter();
-  }, [turnToActiveChapter]);
+    if (!chapterSelection) return;
+    let pending = selectionStateRef.current;
+    if (!pending || pending.seq !== chapterSelection.seq) {
+      pending = { ...chapterSelection, done: false };
+      selectionStateRef.current = pending;
+      suspendFollow();
+    }
+    if (pending.done) return;
+    // If the chapter is not paginated yet (fresh draft), stay pending — the
+    // effect re-runs when `pages` changes and retries without re-suspending.
+    if (turnToChapterStart(pending.chapterNumber)) pending.done = true;
+  }, [chapterSelection, suspendFollow, turnToChapterStart]);
 
-  // Auto-flip to last page during live writing (unchanged behavior, gated on
-  // (a) writing-live mode, (b) no recent user interaction, AND (c) the live
-  // chapter being the active one — so a writer who deliberately jumped back
-  // to read Ch.3 while Ch.7 streams doesn't get yanked forward).
-  useEffect(() => {
-    if (mode !== 'writing-live' || !liveChapter || userInteractedRef.current) return;
-    if (activeChapter != null && activeChapter !== liveChapter.chapterNumber) return;
-    const lastPage = Math.max(0, displayPages.length - 1);
-    bookRef.current?.pageFlip()?.turnToPage(lastPage);
-  }, [mode, liveChapter, displayPages.length, activeChapter]);
+  const handleBookInit = useCallback(() => {
+    const pending = selectionStateRef.current;
+    if (pending && !pending.done) {
+      if (turnToChapterStart(pending.chapterNumber)) pending.done = true;
+      return;
+    }
+    if (activeChapter != null) turnToChapterStart(activeChapter);
+  }, [turnToChapterStart, activeChapter]);
 
   const { t } = useLanguage();
   const totalPages = pages.length;
@@ -569,78 +751,128 @@ function FlipbookReadingView({
   const isAtStart = !hasContent || boundedCurrentPage <= 0;
   const isAtEnd = !hasContent || boundedCurrentPage >= displayPages.length - 1;
 
-  const nav = (
+  // Single page indicator: it lives in the toolbar at every width. The prev/
+  // next buttons render twice — in the toolbar below xl and inside the fixed
+  // side rails at xl+ (CSS-gated, so exactly one pair is ever visible).
+  const pageNav = (
     <div className="flex items-center gap-1.5">
-      <PageTurnButton
-        direction="prev"
-        onClick={flipPrev}
-        disabled={isAtStart}
-        label={t.unificationPagerPrev}
-      />
-      <PageTurnButton
-        direction="next"
-        onClick={flipNext}
-        disabled={isAtEnd}
-        label={t.unificationPagerNext}
-      />
+      <span className="xl:hidden">
+        <PageTurnButton
+          direction="prev"
+          onClick={flipPrev}
+          disabled={isAtStart}
+          label={t.unificationPagerPrev}
+        />
+      </span>
+      <span className="whitespace-nowrap text-xs-tight font-semibold uppercase tracking-label text-book-gold">
+        {pageInfo}
+      </span>
+      <span className="xl:hidden">
+        <PageTurnButton
+          direction="next"
+          onClick={flipNext}
+          disabled={isAtEnd}
+          label={t.unificationPagerNext}
+        />
+      </span>
     </div>
   );
 
+  const followStatus = mode === 'writing-live'
+    ? { suspended: followSuspended, remainingSec: followRemainingSec }
+    : null;
+
   return (
-    <div className="flex flex-col flex-1 min-h-0 relative" ref={containerRef}>
-      <div className="mb-2 shrink-0 flex items-center justify-between px-1 text-xs-tight font-semibold uppercase tracking-label text-book-gold lg:hidden">
-        <span>{pageInfo}</span>
-        {nav}
-      </div>
+    <div className="flex flex-col flex-1 min-h-0 relative">
+      <LayoutToolbar
+        layout={toolbar.layout}
+        onLayoutChange={toolbar.onLayoutChange}
+        jumpInputRef={toolbar.jumpInputRef}
+        onJump={toolbar.onJump}
+        totalChapters={toolbar.totalChapters}
+        pageNav={pageNav}
+        follow={followStatus}
+      />
 
-      <div className="flex-1 min-h-0 relative">
-        {hasContent ? (
-          <>
-            {/* @ts-expect-error — dynamic import typing */}
-            <HTMLFlipBook
-              ref={bookRef}
-              width={460}
-              height={620}
-              size="stretch"
-              minWidth={260}
-              maxWidth={680}
-              minHeight={340}
-              maxHeight={1000}
-              drawShadow={true}
-              maxShadowOpacity={0.45}
-              flippingTime={FLIP_TIME_MS}
-              usePortrait={true}
-              showCover={false}
-              showPageCorners={false}
-              mobileScrollSupport={false}
-              swipeDistance={30}
-              onInit={turnToActiveChapter}
-              onFlip={handleFlip}
-              className="manuscript-flipbook"
-            >
-              {displayPages.map((page, i) => (
-                <FlipBookPage key={i} page={page} />
-              ))}
-            </HTMLFlipBook>
+      <div className="flex-1 min-h-0 flex items-stretch">
+        {/* Fixed side rail (xl+): reserves its own column, button vertically
+            centred, never overlays the page. */}
+        <div className="hidden xl:flex w-14 shrink-0 flex-col items-center justify-center">
+          <PageTurnButton
+            direction="prev"
+            onClick={flipPrev}
+            disabled={isAtStart}
+            label={t.unificationPagerPrev}
+            iconSize="md"
+          />
+        </div>
 
-            <div className="hidden md:block pointer-events-none absolute left-1/2 top-2 z-10 h-[calc(100%-1rem)] w-6 -translate-x-1/2 rounded-full bg-[radial-gradient(circle,_rgba(78,51,23,0.18),_rgba(78,51,23,0.04)_68%,_transparent_100%)]" />
+        {/* Real book viewport — the only element pagination measures. */}
+        <div
+          ref={containerRef}
+          className="flex-1 min-w-0 relative"
+          onPointerDown={hasContent ? suspendFollow : undefined}
+          onTouchStart={hasContent ? suspendFollow : undefined}
+        >
+          {hasContent ? (
+            <>
+              {/* @ts-expect-error — dynamic import typing */}
+              <HTMLFlipBook
+                ref={bookRef}
+                width={FLIPBOOK_LAYOUT.pageWidth}
+                height={FLIPBOOK_LAYOUT.pageHeight}
+                size="stretch"
+                minWidth={FLIPBOOK_LAYOUT.minPageWidth}
+                maxWidth={FLIPBOOK_LAYOUT.maxPageWidth}
+                minHeight={FLIPBOOK_LAYOUT.minPageHeight}
+                autoSize={false}
+                drawShadow={true}
+                maxShadowOpacity={0.45}
+                flippingTime={FLIP_TIME_MS}
+                usePortrait={true}
+                showCover={false}
+                showPageCorners={false}
+                mobileScrollSupport={false}
+                swipeDistance={30}
+                onInit={handleBookInit}
+                onFlip={handleFlip}
+                className="manuscript-flipbook"
+              >
+                {displayPages.map((page, i) => (
+                  <FlipBookPage key={i} page={page} />
+                ))}
+              </HTMLFlipBook>
 
-            {hasContent && !hasFlipped && (
-              <div className="flip-hint-swipe pointer-events-none absolute right-12 bottom-14 z-20">
-                <svg width="44" height="44" viewBox="0 0 24 24" fill="currentColor" className="text-book-gold-dark dark:text-book-gold">
-                  <path d="M9,11.24V7.5C9,6.12,10.12,5,11.5,5S14,6.12,14,7.5v3.74c1.21-0.81,2-2.18,2-3.74C16,5.01,13.99,3,11.5,3S7,5.01,7,7.5C7,9.06,7.79,10.43,9,11.24z M18.84,15.87l-4.54-2.26c-0.17-0.07-0.35-0.11-0.54-0.11H13v-6C13,6.67,12.33,6,11.5,6S10,6.67,10,7.5v10.74c-3.6-0.76-3.54-0.75-3.67-0.75c-0.31,0-0.59,0.13-0.79,0.33l-0.79,0.8l4.94,4.94C9.96,23.83,10.34,24,10.75,24h6.79c0.75,0,1.33-0.55,1.44-1.28l0.75-5.27c0.01-0.07,0.02-0.14,0.02-0.2C19.75,16.63,19.37,16.09,18.84,15.87z" />
-                </svg>
-              </div>
-            )}
-          </>
-        ) : (
-          <EmptyManuscript novelId={novelId} />
-        )}
-      </div>
+              {geometry.pageHeight > 0 && (
+                <div className="pointer-events-none absolute z-10" style={bookOverlayStyle} aria-hidden>
+                  {geometry.spreadPages === 2 && (
+                    <div data-testid="flipbook-spine" className="hidden md:block absolute left-1/2 top-2 h-[calc(100%-1rem)] w-6 -translate-x-1/2 rounded-full bg-[radial-gradient(circle,_rgba(78,51,23,0.18),_rgba(78,51,23,0.04)_68%,_transparent_100%)]" />
+                  )}
 
-      <div className="mt-2 shrink-0 hidden lg:flex items-center justify-between px-1 text-xs-tight font-semibold uppercase tracking-label text-book-gold">
-        <span>{pageInfo}</span>
-        {nav}
+                  {!hasFlipped && (
+                    <div className="flip-hint-swipe absolute right-12 bottom-14 z-20">
+                      <svg width="44" height="44" viewBox="0 0 24 24" fill="currentColor" className="text-book-gold-dark dark:text-book-gold">
+                        <path d="M9,11.24V7.5C9,6.12,10.12,5,11.5,5S14,6.12,14,7.5v3.74c1.21-0.81,2-2.18,2-3.74C16,5.01,13.99,3,11.5,3S7,5.01,7,7.5C7,9.06,7.79,10.43,9,11.24z M18.84,15.87l-4.54-2.26c-0.17-0.07-0.35-0.11-0.54-0.11H13v-6C13,6.67,12.33,6,11.5,6S10,6.67,10,7.5v10.74c-3.6-0.76-3.54-0.75-3.67-0.75c-0.31,0-0.59,0.13-0.79,0.33l-0.79,0.8l4.94,4.94C9.96,23.83,10.34,24,10.75,24h6.79c0.75,0,1.33-0.55,1.44-1.28l0.75-5.27c0.01-0.07,0.02-0.14,0.02-0.2C19.75,16.63,19.37,16.09,18.84,15.87z" />
+                      </svg>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <EmptyManuscript novelId={novelId} />
+          )}
+        </div>
+
+        <div className="hidden xl:flex w-14 shrink-0 flex-col items-center justify-center">
+          <PageTurnButton
+            direction="next"
+            onClick={flipNext}
+            disabled={isAtEnd}
+            label={t.unificationPagerNext}
+            iconSize="md"
+          />
+        </div>
       </div>
     </div>
   );
@@ -655,6 +887,8 @@ export function ManuscriptReadingView({
   mode,
   activeChapter,
   onActiveChapterChange,
+  onChapterJump,
+  chapterSelection,
   layout,
   onLayoutChange,
 }: ManuscriptReadingViewProps) {
@@ -662,8 +896,9 @@ export function ManuscriptReadingView({
   const totalChapters = chapters.length;
 
   const handleJump = useCallback((n: number) => {
-    onActiveChapterChange?.(n);
-  }, [onActiveChapterChange]);
+    if (onChapterJump) onChapterJump(n);
+    else onActiveChapterChange?.(n);
+  }, [onChapterJump, onActiveChapterChange]);
 
   // Cmd/Ctrl+G → focus the jump-to-chapter input
   useGlobalHotkey('mod+g', () => {
@@ -673,27 +908,7 @@ export function ManuscriptReadingView({
 
   return (
     <div className="flex-1 min-w-0 flex flex-col min-h-0 relative">
-      <LayoutToolbar
-        layout={layout}
-        onLayoutChange={onLayoutChange}
-        jumpInputRef={jumpInputRef}
-        onJump={handleJump}
-        totalChapters={totalChapters}
-      />
-
-      {chapters.length === 0 ? (
-        <div className="flex-1 min-h-0 relative">
-          <EmptyManuscript novelId={novelId} />
-        </div>
-      ) : layout === 'continuous' ? (
-        <div className="flex-1 min-h-0 relative">
-          <ContinuousReadingView
-            chapters={chapters}
-            activeChapter={activeChapter}
-            onActiveChapterChange={onActiveChapterChange}
-          />
-        </div>
-      ) : (
+      {layout === 'flipbook' && chapters.length > 0 ? (
         <FlipbookReadingView
           key={novelId}
           novelId={novelId}
@@ -702,7 +917,39 @@ export function ManuscriptReadingView({
           mode={mode}
           activeChapter={activeChapter}
           onActiveChapterChange={onActiveChapterChange}
+          chapterSelection={chapterSelection}
+          toolbar={{
+            layout,
+            onLayoutChange,
+            jumpInputRef,
+            onJump: handleJump,
+            totalChapters,
+          }}
         />
+      ) : (
+        <>
+          <LayoutToolbar
+            layout={layout}
+            onLayoutChange={onLayoutChange}
+            jumpInputRef={jumpInputRef}
+            onJump={handleJump}
+            totalChapters={totalChapters}
+          />
+
+          {chapters.length === 0 ? (
+            <div className="flex-1 min-h-0 relative">
+              <EmptyManuscript novelId={novelId} />
+            </div>
+          ) : (
+            <div className="flex-1 min-h-0 relative">
+              <ContinuousReadingView
+                chapters={chapters}
+                activeChapter={activeChapter}
+                onActiveChapterChange={onActiveChapterChange}
+              />
+            </div>
+          )}
+        </>
       )}
     </div>
   );

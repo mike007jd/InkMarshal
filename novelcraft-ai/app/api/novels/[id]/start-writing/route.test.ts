@@ -47,7 +47,7 @@ function mockUsageSession(contextWindow = 8192) {
 }
 
 async function createReadyNovel(title: string) {
-  const { createNovel, updateNovel } = await import('@/lib/db');
+  const { createKnowledgeEntry, createNovel, updateNovel } = await import('@/lib/db');
   const novel = await createNovel({
     userId: 'local-user',
     title,
@@ -59,6 +59,21 @@ async function createReadyNovel(title: string) {
     characterSummary: 'character seed',
     arcSummary: 'arc seed',
   });
+  const now = new Date().toISOString();
+  for (const type of ['character', 'world', 'outline']) {
+    await createKnowledgeEntry({
+      id: crypto.randomUUID(),
+      novelId: novel.id,
+      type,
+      title: `${type} seed`,
+      summary: `${type} summary`,
+      data: '{}',
+      sortOrder: 0,
+      tags: '[]',
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
   return novel;
 }
 
@@ -157,6 +172,29 @@ describe('start-writing batch resume helpers', () => {
 });
 
 describe('start-writing route lock and context preflight behaviour', () => {
+  it('rejects a ready novel with an incomplete Story Deck before model preflight', async () => {
+    const { POST } = await import('@/app/api/novels/[id]/start-writing/route');
+    const { createNovel, deleteNovelCascade, updateNovel } = await import('@/lib/db');
+    const novel = await createNovel({ userId: 'local-user', title: 'Missing Deck' });
+    await updateNovel(novel.id, { stage: 'ready_for_greenlight' });
+
+    try {
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/start-writing`, {
+        method: 'POST',
+      }), { params: Promise.resolve({ id: novel.id }) });
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        code: 'STORY_DECK_INCOMPLETE',
+        missingTypes: ['character', 'world', 'outline'],
+      });
+      expect(mocks.createAIUsageSession).not.toHaveBeenCalled();
+      await expectWritingLockReleased(novel.id);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('rejects a concurrent start-writing request before model preflight', async () => {
     const { POST } = await import('@/app/api/novels/[id]/start-writing/route');
     const { acquireWritingLock, deleteNovelCascade, releaseWritingLock } = await import('@/lib/db');

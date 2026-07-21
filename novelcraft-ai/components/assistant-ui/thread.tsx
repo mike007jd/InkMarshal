@@ -33,6 +33,8 @@ export interface NovelThreadProps {
   composerFooter?: ReactNode;
   errorMessage?: string | null;
   onRetry?: () => void;
+  hideComposer?: boolean;
+  completionContent?: ReactNode;
   /**
    * Extra controls injected into every assistant message's action bar. The node
    * renders inside each message's context, so children may read the active
@@ -52,6 +54,8 @@ export const NovelThread: FC<NovelThreadProps> = ({
   composerFooter,
   errorMessage,
   onRetry,
+  hideComposer = false,
+  completionContent,
   assistantActions,
 }) => {
   const { t } = useLocale();
@@ -67,13 +71,15 @@ export const NovelThread: FC<NovelThreadProps> = ({
             {() => <ThreadMessage assistantActions={assistantActions} />}
           </ThreadPrimitive.Messages>
 
+          {completionContent}
+
           <ThreadPrimitive.ViewportFooter className="sticky bottom-0 mt-auto flex flex-col items-center gap-2">
             <ScrollToBottom />
           </ThreadPrimitive.ViewportFooter>
         </div>
       </ThreadPrimitive.Viewport>
 
-      <div className="border-t border-book-border bg-book-bg-primary px-4 py-4 md:px-6">
+      <div className={cn('border-t border-book-border bg-book-bg-primary px-4 py-4 md:px-6', hideComposer && 'hidden')}>
         {errorMessage ? (
           <div className="mx-auto mb-3 flex max-w-3xl items-center gap-3 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-sm text-book-danger">
             <AlertCircle className="size-4 shrink-0" />

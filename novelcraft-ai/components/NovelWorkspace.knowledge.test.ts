@@ -87,6 +87,30 @@ describe('NovelWorkspace knowledge outline wiring', () => {
     expect(workspace).toContain('onUpdate={handleAgentTurnComplete}');
   });
 
+  it('keeps the main Assistant runtime mounted while switching workspace views', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const chatArea = source('components/ChatArea.tsx');
+    const runtime = source('components/assistant-ui/useNovelChatRuntime.ts');
+
+    expect(workspace).toContain("className={view === 'agent' ? 'flex min-h-0 flex-1' : 'hidden'}");
+    expect(workspace).not.toContain("{view === 'agent' && (");
+    expect(workspace).toContain('onStatusChange={setAssistantStatus}');
+    expect(chatArea).toContain('onStatusChange?.(status)');
+    expect(runtime).toContain('status: chat.status');
+  });
+
+  it('keeps the Story Deck repair action enabled after coverage finishes loading', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const chatArea = source('components/ChatArea.tsx');
+
+    expect(workspace).toContain('storyDeckComplete={deckComplete}');
+    expect(workspace).toContain('approveDisabled={deckLoading}');
+    expect(workspace).not.toContain('approveDisabled={deckLoading || !deckComplete}');
+    expect(workspace).toContain('autoSubmitRequest={proposalAdjustRequest}');
+    expect(workspace).toContain('autoSubmitText={t.storyDeckCompletePrompt}');
+    expect(chatArea).toContain("void sendMessage(autoSubmitText, { repairStoryDeck: true })");
+  });
+
   it('preserves outline chapter deep-links into the manuscript shell', () => {
     const workspace = source('components/NovelWorkspace.tsx');
     const shell = source('components/ManuscriptShell.tsx');

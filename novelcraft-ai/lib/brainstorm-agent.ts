@@ -11,6 +11,14 @@ import type { Novel } from '@/lib/db-types';
 import type { Locale } from '@/lib/i18n';
 import { toJsonb, type InterviewState } from '@/lib/interview-state';
 import { upsertKnowledgeEntryByTitle } from '@/lib/knowledge/upsert-entry';
+import { buildKnowledgeEntrySummary } from '@/lib/knowledge';
+import { syncIndexFromEntry } from '@/lib/knowledge/index-sync';
+import {
+  clearStaleEmbedding,
+  scheduleEmbeddingRefresh,
+  trySyncKnowledgeEntryToVault,
+} from '@/lib/knowledge/apply-write';
+import { finalizeBrainstormAtomic } from '@/lib/db/brainstorm-finalization';
 import { isInStages, type NovelStage } from '@/lib/novel-stages';
 import type { KnowledgeType } from '@/lib/types/knowledge';
 import {
@@ -32,7 +40,6 @@ const updateBrainstormProfileSchema = z.object({
   storySummary: z.string().max(2_000).optional(),
   characterSummary: z.string().max(2_000).optional(),
   arcSummary: z.string().max(2_000).optional(),
-  readyForGreenlight: z.boolean().optional(),
 });
 
 const storyDeckEntrySchema = z.object({
@@ -40,6 +47,21 @@ const storyDeckEntrySchema = z.object({
   title: z.string().min(1).max(200),
   summary: z.string().min(1).max(1_000),
   details: z.record(z.string().max(64), z.string().max(500)).default({}),
+});
+
+const finalizeBrainstormSchema = z.object({
+  profile: updateBrainstormProfileSchema,
+  entries: z.array(storyDeckEntrySchema).min(3).max(24),
+}).superRefine((value, ctx) => {
+  for (const type of STORY_DECK_TYPES) {
+    if (!value.entries.some(entry => entry.type === type)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['entries'],
+        message: `Story Deck requires at least one ${type} entry`,
+      });
+    }
+  }
 });
 
 function trimOptional(value: string | undefined): string | undefined {
@@ -145,11 +167,135 @@ async function upsertStoryDeckEntry(
   return result;
 }
 
-export function brainstormAgentSystemAddon(locale: Locale): string {
+type FinalizeBrainstormInput = z.infer<typeof finalizeBrainstormSchema>;
+
+async function commitFinalizedBrainstorm(
+  novelId: string,
+  input: FinalizeBrainstormInput,
+  receiptId?: string,
+) {
+  const novel = await getNovel(novelId);
+  if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
+    return { ok: false as const, reason: 'not_editable' as const };
+  }
+  const uniqueEntries = Array.from(new Map(input.entries.map(entry => [
+    `${entry.type}:${entry.title.trim().toLowerCase()}`,
+    {
+      type: entry.type,
+      title: entry.title.trim(),
+      summary: entry.summary.trim(),
+      data: storyDeckData(entry.type, entry.summary.trim(), entry.details),
+      tags: ['brainstorm'],
+    },
+  ])).values());
+  const profileUpdate = Object.fromEntries(Object.entries({
+    genre: trimOptional(input.profile.genre),
+    targetWords: input.profile.targetWords,
+    storySummary: trimOptional(input.profile.storySummary),
+    characterSummary: trimOptional(input.profile.characterSummary),
+    arcSummary: trimOptional(input.profile.arcSummary),
+  }).filter(([, value]) => value !== undefined));
+  const result = await finalizeBrainstormAtomic({
+    novelId,
+    profile: {
+      ...profileUpdate,
+      interviewState: toJsonb(greenlightProposalState(novel, input.profile)),
+    },
+    entries: uniqueEntries.map(entry => ({
+      ...entry,
+      summary: buildKnowledgeEntrySummary(entry.type, entry.data),
+    })),
+  });
+  if (!result.ok) return result;
+
+  if (receiptId) {
+    recordBrainstormProfileMutation(receiptId, result.beforeNovel, result.novel);
+    for (const mutation of result.mutations) {
+      if (mutation.action !== 'unchanged') {
+        recordBrainstormEntryMutation(
+          receiptId,
+          mutation.before,
+          mutation.after,
+          mutation.action,
+        );
+      }
+    }
+  }
+
+  await Promise.allSettled(result.mutations.map(async mutation => {
+    const entry = mutation.after;
+    await syncIndexFromEntry({
+      id: entry.id,
+      novelId,
+      type: entry.type as KnowledgeType,
+      title: entry.title,
+      summary: entry.summary,
+      data: JSON.parse(entry.data) as Record<string, unknown>,
+      tags: JSON.parse(entry.tags) as string[],
+      updatedAt: entry.updated_at,
+    });
+    await trySyncKnowledgeEntryToVault(novelId, entry.id, 'brainstormAgent.finalizeBrainstorm');
+    await clearStaleEmbedding(entry.id, novelId);
+    scheduleEmbeddingRefresh(entry.id);
+  }));
+
+  return { ok: true as const, coverage: result.coverage };
+}
+
+export async function finalizeApprovedStoryDeck(
+  novelId: string,
+  locale: Locale,
+  receiptId?: string,
+) {
+  const novel = await getNovel(novelId);
+  if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
+    return { ok: false as const, reason: 'not_editable' as const };
+  }
+  const storySummary = novel.storySummary.trim() || novel.arcSummary.trim() || novel.title;
+  const characterSummary = novel.characterSummary.trim() || storySummary;
+  const arcSummary = novel.arcSummary.trim() || storySummary;
   const zh = locale !== 'en';
+  return commitFinalizedBrainstorm(novelId, {
+    profile: {
+      genre: novel.genre,
+      targetWords: novel.targetWords,
+      storySummary,
+      characterSummary,
+      arcSummary,
+    },
+    entries: [
+      {
+        type: 'character',
+        title: zh ? '主要角色' : 'Main Cast',
+        summary: characterSummary,
+        details: { motivation: arcSummary, arc: arcSummary },
+      },
+      {
+        type: 'world',
+        title: zh ? '故事世界' : 'Story World',
+        summary: storySummary,
+        details: { genre: novel.genre, premise: storySummary },
+      },
+      {
+        type: 'outline',
+        title: zh ? '故事大纲' : 'Story Outline',
+        summary: arcSummary,
+        details: { notes: storySummary, chapterNumber: '1' },
+      },
+    ],
+  }, receiptId);
+}
+
+export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): string {
+  const zh = locale !== 'en';
+  if (stage === 'ready_for_greenlight') {
+    return zh
+      ? `当前处于方案审阅阶段。禁止生成小说正文、章节试写或继续冒险情节。只回答方案调整问题；如果 Story Deck 不完整，或用户批准了调整，必须调用 finalizeBrainstorm 一次性保存完整 profile、character、world、outline。调用 finalizeBrainstorm 后立即结束本轮，不再输出正文。`
+      : `This is proposal review. Do not generate manuscript prose, sample chapters, or continue the plot. Only discuss plan adjustments. If the Story Deck is incomplete or the user approves a change, call finalizeBrainstorm with the complete profile plus character, world, and outline entries. End the turn immediately after finalizeBrainstorm and do not output prose.`;
+  }
   return zh
-    ? `你正在主持一本小说的 Brainstorm。不要用固定问卷，不要在开场罗列问题清单，也不要要求用户按顺序填写。自然地覆盖篇幅、题材、参考作品、叙事视角、世界观、角色、核心冲突、结局倾向和读后感；每次最多追问一个最关键的问题。\n\n只有用户明确说出的事实才可以调用工具写入 Brainstorm profile 和 Story Deck；合理推断、补全和创意建议只能在回复中标为建议，等待用户明确同意后再写入，绝不能静默覆盖已有设定。Story Deck 只沉淀 characters、world、outline。每次工具写入后，用一句自然语言说明刚保存了什么。信息足够形成创作方案时可调用 ready 标记，但最终回复只展示用户可读的确认稿和下一步，不展示原始思维链。`
-    : `You are running a novel Brainstorm. Do not use a fixed questionnaire, open with a checklist, or force the user through slots in order. Cover length, genre, references, point of view, world, characters, central conflict, ending direction, and target reader feeling naturally, asking at most one high-value follow-up at a time.\n\nOnly facts explicitly stated by the user may be written to the Brainstorm profile or Story Deck with tools. Inferences, gap-filling, and creative ideas must be labeled as suggestions in the reply and require explicit user agreement before writing; never silently overwrite an existing fact. Story Deck only contains characters, world, and outline. After a tool write, state in one natural sentence what was saved. When enough information exists for a writing brief, mark it ready, but only show a user-readable brief and next step, never raw chain-of-thought.`;
+    ? `你正在主持一本小说的 Brainstorm。不要用固定问卷，不要在开场罗列问题清单，也不要要求用户按顺序填写。自然地覆盖篇幅、题材、参考作品、叙事视角、世界观、角色、核心冲突、结局倾向和读后感；每次最多追问一个最关键的问题。\n\n只有用户明确说出的事实才可以调用工具写入 Brainstorm profile 和 Story Deck；合理推断、补全和创意建议只能在回复中标为建议，等待用户明确同意后再写入，绝不能静默覆盖已有设定。信息足够形成完整创作方案时，必须调用 finalizeBrainstorm，一次性保存 profile 以及至少一张 character、world、outline 卡片。调用后立即结束本轮，只给出简短完成提示，禁止继续写小说正文。`
+    : `You are running a novel Brainstorm. Do not use a fixed questionnaire, open with a checklist, or force the user through slots in order. Cover length, genre, references, point of view, world, characters, central conflict, ending direction, and target reader feeling naturally, asking at most one high-value follow-up at a time.\n\nOnly facts explicitly stated by the user may be written to the Brainstorm profile or Story Deck with tools. Inferences, gap-filling, and creative ideas must be labeled as suggestions and require explicit approval. When the complete writing brief is ready, call finalizeBrainstorm once with the profile and at least one character, world, and outline entry. End the turn immediately after that tool and never continue into manuscript prose.`;
 }
 
 export function createBrainstormTools(novelId: string, receiptId?: string) {
@@ -172,21 +318,9 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
         const novelUpdate = Object.fromEntries(
           Object.entries(update).filter(([, value]) => value !== undefined),
         );
-        if (input.readyForGreenlight && novel.stage === 'discovery_interview') {
-          const updatedNovel = await updateNovel(novelId, {
-            ...novelUpdate,
-            interviewState: toJsonb(greenlightProposalState(novel, input)),
-            stage: 'ready_for_greenlight',
-            progress: 0,
-          });
-          if (receiptId && updatedNovel) {
-            recordBrainstormProfileMutation(receiptId, novel, updatedNovel);
-          }
-        } else {
-          const updatedNovel = await updateNovel(novelId, novelUpdate);
-          if (receiptId && updatedNovel) {
-            recordBrainstormProfileMutation(receiptId, novel, updatedNovel);
-          }
+        const updatedNovel = await updateNovel(novelId, novelUpdate);
+        if (receiptId && updatedNovel) {
+          recordBrainstormProfileMutation(receiptId, novel, updatedNovel);
         }
         return { ok: true };
       },
@@ -242,6 +376,11 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
           unchanged: results.filter(result => result === 'unchanged').length,
         };
       },
+    }),
+    finalizeBrainstorm: tool({
+      description: 'Atomically save the approved brainstorm profile and complete Story Deck, then mark the story ready for approval. This must be the final tool call of the turn.',
+      inputSchema: finalizeBrainstormSchema,
+      execute: async input => commitFinalizedBrainstorm(novelId, input, receiptId),
     }),
   };
 }
