@@ -346,6 +346,10 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
           },
           upsertChapter: chapter => {
             if (!isActiveRun()) return;
+            // A focus/manual refresh may have started before this authoritative
+            // stream event. Invalidate that older durable read before applying
+            // the persisted chapter so its stale list cannot erase this commit.
+            durableFetchGenRef.current += 1;
             setChapters(prev => {
               const filtered = prev.filter(c => c.chapterNumber !== chapter.chapterNumber);
               return [...filtered, chapter].sort((a, b) => a.chapterNumber - b.chapterNumber);
@@ -453,6 +457,19 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
       const message = error instanceof Error ? error.message : t.errorWritingFailed;
       enterFailedTerminal(message, liveChapterAfterWritingFailure(error, partial));
     } finally {
+      const shouldReconcilePausedRun =
+        pausedWritingRunsRef.current.has(runId)
+        && activeNovelRef.current === requestNovelId
+        && activeWritingRunRef.current === null
+        // Pause advances the sequence exactly once. Any later sequence means
+        // another run has already owned this session, even if it is now paused.
+        && writingRunSeqRef.current === runId + 1;
+      if (shouldReconcilePausedRun) {
+        // The server gives a determined failure precedence over a concurrent
+        // cancel. The aborted stream cannot deliver that terminal frame, so
+        // reconcile after it settles and let durable novel/job truth decide.
+        await Promise.allSettled([fetchNovel()]);
+      }
       pausedWritingRunsRef.current.delete(runId);
       partialChapterByRunRef.current.delete(runId);
       if (isActiveRun()) {
@@ -465,9 +482,11 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
 
   const pauseWriting = useCallback(() => {
     const pausedRun = activeWritingRunRef.current;
-    if (pausedRun !== null) pausedWritingRunsRef.current.add(pausedRun);
+    if (pausedRun !== null) {
+      pausedWritingRunsRef.current.add(pausedRun);
+      writingRunSeqRef.current += 1;
+    }
     activeWritingRunRef.current = null;
-    writingRunSeqRef.current += 1;
     // A terminal refresh may already be in flight when Pause is clicked. Its
     // response belongs to the stopped run and must not rewrite durable slices.
     durableFetchGenRef.current += 1;
@@ -619,6 +638,9 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
         && novel.stage === 'autonomous_writing';
 
       if (jobIsCurrentFailed) {
+        setResumePromptVisible(false);
+        setResumeCountdown(null);
+        clearResumeTimer();
         setWritingRunState(current => {
           // A newer local terminal (done / successful complete) must not be
           // overwritten by an older or just-invalidated failed job row.
@@ -626,11 +648,20 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
           const localActivity = current.lastActivityAt
             ? Date.parse(current.lastActivityAt)
             : Number.NaN;
+          const localStartedAt = current.startedAt
+            ? Date.parse(current.startedAt)
+            : Number.NaN;
+          const jobStartedAt = Date.parse(job.startedAt);
+          const jobCanBelongToCurrentRun =
+            Number.isFinite(localStartedAt)
+            && Number.isFinite(jobStartedAt)
+            && jobStartedAt >= localStartedAt;
           if (
             current.phase === 'paused'
             && Number.isFinite(localActivity)
             && Number.isFinite(jobActivity)
             && localActivity > jobActivity
+            && !jobCanBelongToCurrentRun
           ) {
             return current;
           }
@@ -671,7 +702,7 @@ export function useManuscriptSession(opts: { novelId: string; autostart: boolean
     return () => {
       cancelled = true;
     };
-  }, [chapters.length, isStreaming, latestWritingJob, novel, t.errorWritingFailed, t.manuscriptReading, t.writingPausedLabel]);
+  }, [chapters.length, clearResumeTimer, isStreaming, latestWritingJob, novel, t.errorWritingFailed, t.manuscriptReading, t.writingPausedLabel]);
 
   // Abort writing + clear timers on unmount.
   useEffect(() => {

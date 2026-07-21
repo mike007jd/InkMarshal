@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LanguageProvider } from '@/components/LanguageProvider';
 import { useManuscriptSession } from '@/lib/use-manuscript-session';
 import type { WritingSessionHandlers } from '@/lib/writing-session';
+import type { Chapter } from '@/lib/db-types';
 import type { WritingJob } from '@/lib/db/queries-writing-jobs';
 
 type SessionArgs = {
@@ -216,6 +217,116 @@ describe('useManuscriptSession run ownership', () => {
     expect(result.current.isStreaming).toBe(false);
   });
 
+  it('reconciles a same-run durable failure that wins concurrently with Pause', async () => {
+    vi.setSystemTime(new Date('2026-07-21T00:00:00.000Z'));
+    let durableNovel = midWritingNovel();
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/chapters')) {
+        return response([{ id: 'chapter-1', chapterNumber: 1 }]);
+      }
+      return response(durableNovel);
+    });
+
+    writingSessionMock.startWritingSession.mockImplementationOnce(async ({ signal }: SessionArgs) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          durableNovel = midWritingNovel({
+            writingJob: failedJob({
+              id: 'same-run-failed',
+              errorMessage: 'server failure won the race',
+              startedAt: '2026-07-21T00:00:00.100Z',
+              updatedAt: '2026-07-21T00:00:00.900Z',
+            }),
+          });
+          reject(new DOMException('paused after server failure', 'AbortError'));
+        }, { once: true });
+      });
+    });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let start!: Promise<void>;
+    act(() => { start = result.current.startWriting(); });
+    await act(async () => { await Promise.resolve(); });
+
+    vi.setSystemTime(new Date('2026-07-21T00:00:01.000Z'));
+    act(() => result.current.pauseWriting());
+    await act(async () => { await start; });
+    await flushSessionEffects();
+
+    expect(result.current.writingRunState.phase).toBe('failed');
+    expect(result.current.writingRunState.error).toBe('server failure won the race');
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.resumePromptVisible).toBe(false);
+  });
+
+  it('an older paused run cannot reconcile after a newer run has settled', async () => {
+    let durableNovel = midWritingNovel();
+    stubManuscriptFetch(fetchMock, durableNovel);
+    const firstAbort = deferred();
+    const secondSession = deferred();
+    let secondHandlers!: WritingSessionHandlers;
+    writingSessionMock.startWritingSession
+      .mockImplementationOnce(async ({ signal }: SessionArgs) => {
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            void firstAbort.promise.then(() => reject(new DOMException('first paused', 'AbortError')));
+          }, { once: true });
+        });
+      })
+      .mockImplementationOnce(async ({ handlers }: SessionArgs) => {
+        secondHandlers = handlers;
+        await secondSession.promise;
+      });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let firstStart!: Promise<void>;
+    act(() => { firstStart = result.current.startWriting(); });
+    await act(async () => { await Promise.resolve(); });
+    act(() => result.current.pauseWriting());
+
+    let secondStart!: Promise<void>;
+    act(() => { secondStart = result.current.startWriting(); });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => {
+      secondHandlers.onError('newer run failure');
+      secondSession.resolve();
+      await secondStart;
+    });
+    expect(result.current.writingRunState.phase).toBe('failed');
+    expect(result.current.writingRunState.error).toBe('newer run failure');
+
+    durableNovel = midWritingNovel({
+      title: 'STALE-FIRST-RUN-RECONCILE',
+      writingJob: failedJob({ id: 'stale-first-run-failed' }),
+    });
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/chapters')) {
+        return response([{ id: 'chapter-1', chapterNumber: 1 }]);
+      }
+      return response(durableNovel);
+    });
+
+    await act(async () => {
+      firstAbort.resolve();
+      await firstStart;
+    });
+    await flushSessionEffects();
+
+    expect(result.current.novel?.title).not.toBe('STALE-FIRST-RUN-RECONCILE');
+    expect(result.current.writingRunState.phase).toBe('failed');
+    expect(result.current.writingRunState.error).toBe('newer run failure');
+  });
+
   it('pause invalidates an in-flight run refresh so it cannot rewrite novel or chapters', async () => {
     const novelLoads = deferred<ReturnType<typeof midWritingNovel>>();
     const chapterLoads = deferred<unknown[]>();
@@ -229,7 +340,8 @@ describe('useManuscriptSession run ownership', () => {
       }
       novelServe += 1;
       if (novelServe === 1) return response(midWritingNovel());
-      return response(await novelLoads.promise);
+      if (novelServe === 2) return response(await novelLoads.promise);
+      return response(midWritingNovel());
     });
 
     const session = deferred();
@@ -265,6 +377,71 @@ describe('useManuscriptSession run ownership', () => {
     expect(result.current.writingRunState.phase).toBe('paused');
     expect(result.current.novel?.title).not.toBe('STALE-PAUSED-NOVEL');
     expect(result.current.chapters.some(c => c.chapterNumber === 99)).toBe(false);
+  });
+
+  it('authoritative stream chapter invalidates an older same-run chapter refresh', async () => {
+    const chapterLoads = deferred<unknown[]>();
+    let chapterServe = 0;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/chapters')) {
+        chapterServe += 1;
+        if (chapterServe === 1) return response([{ id: 'chapter-1', chapterNumber: 1 }]);
+        return response(await chapterLoads.promise);
+      }
+      return response(midWritingNovel());
+    });
+
+    const session = deferred();
+    let handlers!: WritingSessionHandlers;
+    writingSessionMock.startWritingSession.mockImplementationOnce(async ({ handlers: h }: SessionArgs) => {
+      handlers = h;
+      await session.promise;
+    });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let start!: Promise<void>;
+    act(() => { start = result.current.startWriting(); });
+    await act(async () => { await Promise.resolve(); });
+
+    const committedChapter: Chapter = {
+      id: 'chapter-2',
+      novelId: 'novel-1',
+      chapterNumber: 2,
+      title: 'Committed Two',
+      content: 'persisted prose',
+      originalContent: null,
+      wordCount: 2,
+      version: 1,
+      summary: '',
+      keyFacts: null,
+      qualityIssues: null,
+      generationMeta: null,
+      createdAt: Date.now(),
+    };
+
+    let staleRefresh!: Promise<Chapter[]>;
+    act(() => {
+      staleRefresh = result.current.fetchChapters();
+      handlers.upsertChapter(committedChapter);
+    });
+    expect(result.current.chapters.some(c => c.id === committedChapter.id)).toBe(true);
+
+    await act(async () => {
+      chapterLoads.resolve([{ id: 'chapter-1', chapterNumber: 1 }]);
+      await staleRefresh;
+    });
+    expect(result.current.chapters.some(c => c.id === committedChapter.id)).toBe(true);
+
+    await act(async () => {
+      handlers.onDone();
+      session.resolve();
+      await start;
+    });
   });
 
   it('pause → retry → old flush/callback is completely ignored', async () => {
