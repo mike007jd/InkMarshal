@@ -47,7 +47,6 @@ jobs:
           pnpm lint
           pnpm typecheck
           pnpm test
-          pnpm verify:third-party-notices
           pnpm verify:security
           pnpm build
 

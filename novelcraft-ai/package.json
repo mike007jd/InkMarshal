@@ -40,7 +40,7 @@
     "verify:desktop": "cd src-tauri && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked",
     "verify:all": "pnpm verify && pnpm verify:security && pnpm verify:desktop",
     "verify:third-party-notices": "node scripts/generate-third-party-notices.mjs --check",
-    "verify:release-desktop": "node scripts/validate-desktop-release.mjs",
+    "verify:release-desktop": "pnpm verify:third-party-notices && node scripts/validate-desktop-release.mjs",
     "verify:mac-library-validation": "node scripts/verify-mac-library-validation.mjs"
   },
   "dependencies": {

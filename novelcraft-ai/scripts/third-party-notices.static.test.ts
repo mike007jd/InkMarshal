@@ -17,6 +17,9 @@ describe('third-party notices distribution contract', () => {
     expect(packageJson.scripts['verify:third-party-notices']).toBe(
       'node scripts/generate-third-party-notices.mjs --check',
     );
+    expect(packageJson.scripts['verify:release-desktop']).toContain(
+      'pnpm verify:third-party-notices',
+    );
     expect(tauri.bundle.resources['../../NOTICE']).toBe('NOTICE');
     expect(tauri.bundle.resources['../../THIRD_PARTY_NOTICES.md']).toBe(
       'THIRD_PARTY_NOTICES.md',
