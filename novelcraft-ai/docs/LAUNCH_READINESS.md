@@ -1,8 +1,8 @@
 # Launch Readiness - InkMarshal
 
-Last checked: 2026-07-16
+Last checked: 2026-07-23
 
-This is the release operating document for the current product. It describes the launch path that exists now.
+This is the release operating document for the current prelaunch product after the maintainability audit. It describes the launch path that exists now. This documentation pass does **not** claim that signing, notarization, real-model, BYOK, offline, or manual GUI smoke passed.
 
 ## Launch Scope
 
@@ -18,6 +18,15 @@ Explicitly not in scope:
 - Hosted web Studio.
 - Login, account, cloud database, platform credits, or Stripe credit checkout.
 - Server-owned provider API keys.
+
+## Product Contracts (prelaunch)
+
+- `pnpm verify` is lint, typecheck, Knip dead-code analysis, the full Vitest suite, an isolated 80-chapter full-novel QA gate, and production build.
+- Local SQLite supports exactly the current schema v1 baseline. Empty/new databases are created at that shape only; incompatible nonempty databases fail closed without modification. Destructive cleanup is only through `pnpm local-state:reset -- --confirm-delete-inkmarshal-local-state`.
+- DB + `knowledge_index` are canonical. Vault markdown is a durable outbox/tombstone projection of that truth.
+- Desktop updater order: download → durable manuscript flush/snapshot → official Tauri install → relaunch.
+- Security gate: Next 16.2.11, narrow `sharp` 0.35.3 override, OSV, and Cargo audit with an explicit advisory-ID allowlist.
+- Outer unattended `scripts/ralph` loop is removed. The in-app Ralph writing workflow remains.
 
 ## Release Assets
 
@@ -86,6 +95,8 @@ pnpm verify:release-desktop
 pnpm release:mac
 ```
 
+   `release:mac` performs clean packaging, full engine manifest verification, mounts the exact final DMG, launches exactly one process from that mount, and checks desktop runtime health before retaining release assets. That automatic exact-DMG oracle complements — and does not replace — the deeper real-machine checklist.
+
    The release builder re-signs every bundled Mach-O (Node, llama/MLX,
    dylibs, and native Node modules) with the configured Developer ID Team ID
    before signing the app. The app and inference engines have no Hardened
@@ -127,9 +138,9 @@ in this desktop repository.
 
 ## Manual Smoke
 
-The release is not launch-ready until a real macOS machine passes `docs/RELEASE_SMOKE_CHECKLIST.md`.
+The release is not launch-ready until a real macOS machine passes `docs/RELEASE_SMOKE_CHECKLIST.md`. Automated exact-DMG health smoke from `pnpm release:mac` is a packaging oracle only.
 
-Critical paths:
+Critical paths still requiring human confirmation:
 
 - DMG install and first launch.
 - Model download, Use, engine start, and full chapter generation.

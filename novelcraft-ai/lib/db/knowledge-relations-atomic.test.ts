@@ -72,9 +72,16 @@ async function relationsOfSource(): Promise<{ target_id: string; relation_type: 
     .all(S) as { target_id: string; relation_type: string }[];
 }
 
+async function sourceOutboxIntent(): Promise<{ operation: string; rel_path: string } | undefined> {
+  const { getDb } = await import('@/lib/db/connection');
+  return getDb()
+    .prepare('SELECT operation, rel_path FROM knowledge_vault_outbox WHERE entry_id = ?')
+    .get(S) as { operation: string; rel_path: string } | undefined;
+}
+
 beforeEach(async () => {
   const { getDb } = await import('@/lib/db/connection');
-  getDb().exec('DELETE FROM knowledge_relations; DELETE FROM knowledge_entries; DELETE FROM novels;');
+  getDb().exec('DELETE FROM knowledge_vault_outbox; DELETE FROM knowledge_relations; DELETE FROM knowledge_entries; DELETE FROM novels;');
   await seed();
 });
 
@@ -92,6 +99,10 @@ describe('syncKnowledgeRelationsForSource — atomic batch', () => {
       { target_id: T1, relation_type: 'friend' }, // kept
       { target_id: T3, relation_type: 'ally' },   // created
     ]); // R2 (T2/mentor) deleted
+    expect(await sourceOutboxIntent()).toEqual({
+      operation: 'upsert',
+      rel_path: indexFor(S).path,
+    });
   });
 
   it('rolls back the whole batch — including deletes — when a create violates a constraint', async () => {
@@ -115,5 +126,35 @@ describe('syncKnowledgeRelationsForSource — atomic batch', () => {
       { target_id: T1, relation_type: 'friend' },
       { target_id: T2, relation_type: 'mentor' },
     ]);
+    expect(await sourceOutboxIntent()).toBeUndefined();
+  });
+
+  it('commits mirror intent inside create and delete relation transactions', async () => {
+    const {
+      createKnowledgeRelationWithSourceIndex,
+      deleteKnowledgeRelationWithSourceIndex,
+    } = await import('@/lib/db');
+    const relationId = 'cccccccc-0000-0000-0000-000000000004';
+
+    await createKnowledgeRelationWithSourceIndex({
+      id: relationId,
+      sourceId: S,
+      targetId: T3,
+      relationType: 'ally',
+      label: '',
+      createdAt: NOW,
+    }, indexFor(S));
+    expect(await sourceOutboxIntent()).toEqual({
+      operation: 'upsert',
+      rel_path: indexFor(S).path,
+    });
+
+    const { getDb } = await import('@/lib/db/connection');
+    getDb().prepare('DELETE FROM knowledge_vault_outbox WHERE entry_id = ?').run(S);
+    await deleteKnowledgeRelationWithSourceIndex(relationId, indexFor(S));
+    expect(await sourceOutboxIntent()).toEqual({
+      operation: 'upsert',
+      rel_path: indexFor(S).path,
+    });
   });
 });

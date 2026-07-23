@@ -14,6 +14,7 @@ describe('createNdjsonWritingStream', () => {
       lease: {
         renew: vi.fn(async () => true),
         renewQuietly: vi.fn(),
+        hasLost: vi.fn(() => false),
         release: vi.fn(async () => {}),
       },
       log: vi.fn(),

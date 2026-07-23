@@ -84,26 +84,6 @@ async function invokeTauri<T>(command: string, args?: Record<string, unknown>): 
   return invoke<T>(command, args);
 }
 
-async function resolveDesktopStatusPaths(): Promise<Pick<
-  DesktopStatus,
-  'app_data_dir' | 'model_dir'
-> | null> {
-  try {
-    const { homeDir, join } = await import('@tauri-apps/api/path');
-    const home = await homeDir();
-    if (!home) return null;
-    const appDataDirPath = await join(home, '.inkmarshal', 'app');
-    const modelDir = await join(appDataDirPath, 'models');
-    if (!modelDir) return null;
-    return {
-      app_data_dir: appDataDirPath,
-      model_dir: modelDir,
-    };
-  } catch {
-    return null;
-  }
-}
-
 async function invokeTauriWithProgress<TProgress>(
   command: string,
   args: Record<string, unknown>,
@@ -131,26 +111,16 @@ export async function getDesktopStatus(): Promise<DesktopStatus> {
   }
   try {
     const status = await invokeTauri<DesktopStatus>(DESKTOP_COMMANDS.desktopStatus);
-    if (status.model_dir_error) return status;
-    if (status.app_data_dir && status.model_dir) return status;
-    const fallbackPaths = await resolveDesktopStatusPaths();
-    if (!fallbackPaths) return status;
-    return {
-      ...status,
-      app_data_dir: status.app_data_dir ?? fallbackPaths.app_data_dir,
-      model_dir: status.model_dir ?? fallbackPaths.model_dir,
-    };
+    return status;
   } catch (err) {
-    const fallbackPaths = await resolveDesktopStatusPaths();
-    if (!fallbackPaths) throw err;
     return {
       desktop: true,
       platform: typeof navigator === 'undefined' ? 'desktop' : navigator.platform,
       arch: null,
       total_memory_bytes: null,
-      app_data_dir: fallbackPaths.app_data_dir,
-      model_dir: fallbackPaths.model_dir,
-      model_dir_error: null,
+      app_data_dir: null,
+      model_dir: null,
+      model_dir_error: err instanceof Error ? err.message : 'desktop_status failed',
     };
   }
 }

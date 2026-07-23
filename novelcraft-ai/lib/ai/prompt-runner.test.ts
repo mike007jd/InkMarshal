@@ -37,10 +37,9 @@ describe('variantForStage', () => {
   });
 });
 
-// DB-backed: prove the resolver actually returns a CUSTOM variant's text once a
-// variant row exists, and falls back to the seeded default text otherwise. This
-// is the "接通" check — without it, custom templates would silently resolve to
-// default.
+// DB-backed: prove the resolver returns a custom row when present, and only
+// falls back to the default coordinate when that variant has no row anywhere
+// in the locale chain.
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;
 let tmpDir: string;
 
@@ -62,13 +61,10 @@ describe('resolveTemplate with a custom variant', () => {
     const { resolveTemplate } = await import('@/lib/ai/prompt-runner');
     const { importVariantPack } = await import('@/lib/prompt-pack-io');
 
-    const defaultText = resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK');
-    expect(defaultText).not.toBe('FALLBACK'); // seeded default exists
+    const defaultText = resolveTemplate('chapter_write', 'user', 'en');
+    expect(defaultText.length).toBeGreaterThan(0);
 
-    // No such variant yet → resolveTemplate catches TemplateNotFoundError and
-    // returns the fallback (NOT the default), so a stale variant id never breaks
-    // the chain.
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK', 'nope_variant')).toBe('FALLBACK');
+    expect(resolveTemplate('chapter_write', 'user', 'en', 'nope_variant')).toBe(defaultText);
 
     importVariantPack({
       formatVersion: 1,
@@ -76,8 +72,36 @@ describe('resolveTemplate with a custom variant', () => {
       rows: [{ stage: 'chapter_write', role: 'user', locale: 'en', templateText: 'CUSTOM {{title}}' }],
     });
 
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK', 'runner_custom')).toBe('CUSTOM {{title}}');
+    expect(resolveTemplate('chapter_write', 'user', 'en', 'runner_custom')).toBe('CUSTOM {{title}}');
     // Default coordinate is unaffected.
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK')).toBe(defaultText);
+    expect(resolveTemplate('chapter_write', 'user', 'en')).toBe(defaultText);
+  });
+
+  it('falls back to the default stage after applying a sparse genre pack to a novel', async () => {
+    const { resolveTemplate, variantForStage: pickVariant } = await import('@/lib/ai/prompt-runner');
+    const { applyGenrePack } = await import('@/lib/prompt-genre-packs');
+    const { createNovel, deleteNovelCascade, getNovel } = await import('@/lib/db');
+    const novel = await createNovel({ userId: 'local-user', title: 'Sparse pack fallback' });
+
+    try {
+      const applied = await applyGenrePack(novel.id, 'mystery');
+      const updated = await getNovel(novel.id);
+      const selected = pickVariant(updated?.settings, 'unification');
+
+      expect(applied.variant).toBe('genre_mystery');
+      expect(selected).toBe('genre_mystery');
+      expect(resolveTemplate('unification', 'user', 'en', selected))
+        .toBe(resolveTemplate('unification', 'user', 'en'));
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('still throws TemplateNotFoundError when the default coordinate is missing too', async () => {
+    const { resolveTemplate } = await import('@/lib/ai/prompt-runner');
+    const { TemplateNotFoundError } = await import('@/lib/prompt-template');
+
+    expect(() => resolveTemplate('missing_stage', 'user', 'zh-TW', 'genre_mystery'))
+      .toThrow(TemplateNotFoundError);
   });
 });

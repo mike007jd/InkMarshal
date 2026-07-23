@@ -65,19 +65,6 @@ export function buildUnificationBatches(
 }
 
 
-const UNIFICATION_FALLBACK = `You are unifying a complete novel "{{novelTitle}}" ({{genre}}). Identify and propose verbatim find/replace edits for cross-chapter inconsistencies only — character name spelling drift, contradictory facts, broken timeline, POV slips. Do NOT rewrite for style.
-
-{{knowledgeSection}}
-
-Manuscript:
----
-{{chapterDump}}
----
-
-{{langNote}}
-
-For each issue: pick the chapter where the wrong text lives, set "original" to a verbatim substring (so it can be located by exact match), give the corrected "replacement", a short "rationale" (why this fixes a cross-chapter inconsistency), and severity 'major' (breaks reader trust) or 'minor' (small drift). Surface the most impactful first.`;
-
 function buildUnificationPrompt(args: {
   novelContext: { title?: string; genre?: string };
   chapters: UnificationChapterInput[];
@@ -94,7 +81,7 @@ function buildUnificationPrompt(args: {
     .map(ch => `=== Chapter ${ch.chapterNumber}: ${ch.title} ===\n${ch.content}`)
     .join('\n\n');
 
-  const template = resolveTemplate('unification', 'user', language, UNIFICATION_FALLBACK, variant);
+  const template = resolveTemplate('unification', 'user', language, variant);
   return renderTemplate(template, {
     novelTitle: novelContext.title ?? '',
     genre: novelContext.genre ?? '',

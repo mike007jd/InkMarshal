@@ -3,8 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { runMigrations } from '@/lib/db/migrations';
-import { migrations } from '@/lib/db/schema';
+import { initializeCurrentSchema } from '@/lib/db/migrations';
 
 // The local SQLite store resolves its DB file from INKMARSHAL_DATA_DIR (set
 // before the module is imported so the lazy singleton opens inside our tmp
@@ -1287,7 +1286,7 @@ describe('db-local: migrations', () => {
     const db = new Database(':memory:');
     try {
       db.pragma('foreign_keys = ON');
-      runMigrations(db, migrations);
+      initializeCurrentSchema(db);
       const now = new Date().toISOString();
       db
         .prepare(

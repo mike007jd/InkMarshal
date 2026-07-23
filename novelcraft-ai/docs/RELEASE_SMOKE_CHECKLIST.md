@@ -1,7 +1,10 @@
 # Release Smoke Checklist（macOS 真机人工冒烟）
 
-E2E/桌面 UI 自动化落地之前（审计 P1-3），每次发布候选 DMG 必须在真机过完这份清单并留存记录。
-自动化门禁（CI + `pnpm verify:all` + `CHECK_LOCAL_MAC_BUNDLE=1 pnpm verify:release-desktop`）通过是执行本清单的前置条件，不能替代本清单。
+每次发布候选 DMG 必须在真机过完这份清单并留存记录。
+
+已有自动化包装层：`pnpm release:mac` 会挂载**最终** DMG、从该挂载点只启动一个进程、并检查桌面 runtime health，通过后才保留 release 资产。另有桌面 boot smoke（`e2e/desktop-smoke`）覆盖无 GUI 的启动不变量。这些自动化是包装/启动 oracle，**不能替代**本清单中的真机人工路径（真实模型下载/Use、BYOK、物理断网、GUI 操作、导出与强杀恢复等）。
+
+自动化门禁前置：`pnpm verify`（含 lint、typecheck、Knip、全量 Vitest、隔离 80 章 full-novel QA、production build）+ `pnpm verify:security` + `pnpm verify:desktop`，以及需要时的 `CHECK_LOCAL_MAC_BUNDLE=1 pnpm verify:release-desktop`。
 
 ## 记录头
 

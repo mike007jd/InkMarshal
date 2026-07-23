@@ -85,9 +85,7 @@ export async function dryRender(input: {
 
   const vars = input.sampleVars ?? {};
 
-  // Variant text (fall back through resolveTemplate's catch to default if the
-  // variant has no row, so a half-cloned variant still previews).
-  const variantTemplate = resolveTemplate(stage, role as Role, locale, '', variant);
+  const variantTemplate = resolveTemplate(stage, role as Role, locale, variant);
   const { rendered: variantText, missing } = renderForgiving(variantTemplate, vars);
 
   // Default text for the diff (may be absent if the seed was wiped).
@@ -158,7 +156,7 @@ export async function runTrial(input: {
   const locale = (input.locale ?? 'en') as Locale;
   if (!(PROMPT_LOCALES as readonly string[]).includes(locale)) throw new Error('Invalid locale');
 
-  const template = resolveTemplate(stage, role as Role, locale, '', variant);
+  const template = resolveTemplate(stage, role as Role, locale, variant);
   const { rendered: prompt } = renderForgiving(template, input.sampleVars ?? {});
   if (!prompt.trim()) {
     return { ok: false, error: 'The rendered prompt is empty — fill the variables first.' };

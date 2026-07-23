@@ -3,6 +3,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   buildPersistPayload,
+  clearManuscriptRecovery,
+  CorruptManuscriptRecoveryError,
   loadPersistedDrafts,
   persistDrafts,
   reconcilePersistedDrafts,
@@ -46,6 +48,24 @@ describe('durable manuscript recovery store', () => {
 
     expect(loadPersistedDrafts('novel-1')).toEqual({});
     expect(loadPersistedDrafts('novel-2')['4']?.content).toBe('second draft');
+  });
+
+  it('fails closed without overwriting malformed persisted recovery data', () => {
+    const raw = '{"novel-1":{"1":{"content":42}}}';
+    localStorage.setItem('inkmarshal_manuscript_recovery_v1', raw);
+
+    expect(() => loadPersistedDrafts('novel-1')).toThrow(CorruptManuscriptRecoveryError);
+    expect(() => persistDrafts('novel-1', {
+      '1': { content: 'replacement', version: 1, savedAt: 1 },
+    })).toThrow(CorruptManuscriptRecoveryError);
+    expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).toBe(raw);
+  });
+
+  it('explicitly clears corrupt recovery data without parsing or rewriting it', async () => {
+    localStorage.setItem('inkmarshal_manuscript_recovery_v1', '{"broken":');
+
+    await expect(clearManuscriptRecovery()).resolves.toBe(true);
+    expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).toBeNull();
   });
 });
 

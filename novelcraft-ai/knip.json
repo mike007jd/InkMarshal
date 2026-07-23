@@ -68,5 +68,6 @@
     "components/CapabilityBindingPanel.tsx",
     "components/Toast.tsx"
   ],
-  "ignoreDependencies": ["tailwindcss"]
+  "ignoreDependencies": ["tailwindcss"],
+  "ignoreBinaries": ["pgrep"]
 }

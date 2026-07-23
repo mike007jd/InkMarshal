@@ -38,24 +38,6 @@ export function buildNovelLanguageSignals(
 
 // ── streamEdit ─────────────────────────────────────────────────────────────
 
-const EDIT_SYSTEM_FALLBACK = `You are a professional novel editor. The user will give you an editing instruction for a chapter.
-
-Rules:
-- Each "original" must be an exact verbatim substring from the chapter text — copy it character-for-character so it can be located by string match.
-- Make minimal targeted edits — only change what is necessary.
-- If the user selected specific text (marked with <<<SELECTED>>>...<<<END_SELECTED>>>), focus edits on that region.
-- "summary" should be 1-2 sentences describing what was changed and why.
-{{langNote}}`;
-
-const EDIT_USER_FALLBACK = `Novel: {{novelTitle}} ({{genre}})
-
-Chapter text:
----
-{{markedText}}
----
-
-Editing instruction: {{instruction}}`;
-
 export interface StreamEditArgs {
   model: LanguageModel;
   novelContext: { title?: string; genre?: string; settings?: NovelSettings | null };
@@ -115,13 +97,13 @@ export function streamEdit(args: StreamEditArgs) {
       ? `${chapterText.slice(0, firstIdx)}<<<SELECTED>>>${selectedText}<<<END_SELECTED>>>${chapterText.slice(firstIdx + selectedText.length)}`
       : chapterText;
 
-  const sysTemplate = tryResolveTemplate('chapter_edit', 'system', language, EDIT_SYSTEM_FALLBACK, variant);
+  const sysTemplate = tryResolveTemplate('chapter_edit', 'system', language, variant);
   const editorSystem = renderTemplate(sysTemplate, { langNote });
   const system = novelSystemPrompt
     ? `${novelSystemPrompt}\n\n--- Editor rules ---\n${editorSystem}`
     : editorSystem;
 
-  const userTemplate = tryResolveTemplate('chapter_edit', 'user', language, EDIT_USER_FALLBACK, variant);
+  const userTemplate = tryResolveTemplate('chapter_edit', 'user', language, variant);
   const userMessage = renderTemplate(userTemplate, {
     novelTitle: novelContext.title ?? '',
     genre: novelContext.genre ?? '',

@@ -47,8 +47,8 @@ pub struct EngineStartArgs {
     pub format: EngineFormat,
     /// Optional disambiguator so the same `model_path` can be launched twice
     /// (e.g. one tuned-style instance bound to `polish`, one default-style
-    /// instance bound to `draft`). When `None` the engine_id collapses to the
-    /// legacy `"{fmt}:{path}"` form so existing TS callers keep working.
+    /// instance bound to `draft`). The registry id always uses the v2 escaped
+    /// shape, with or without this optional suffix.
     #[serde(default)]
     pub engine_label: Option<String>,
 }
@@ -246,17 +246,15 @@ mod tests {
 
     #[test]
     fn make_engine_id_with_and_without_label() {
-        // No label collapses to the legacy "{fmt}:{path}" form so existing TS
-        // callers keep working without a migration.
         assert_eq!(
             make_engine_id(EngineFormat::Gguf, "/m/llama.gguf", &None),
-            "gguf:/m/llama.gguf"
+            "gguf:v2:/m/llama.gguf"
         );
         // Empty label is treated the same as None — we don't want "#" suffixes
         // creeping in from accidentally-empty UI inputs.
         assert_eq!(
             make_engine_id(EngineFormat::Gguf, "/m/llama.gguf", &Some(String::new())),
-            "gguf:/m/llama.gguf"
+            "gguf:v2:/m/llama.gguf"
         );
         // Same path, different labels → distinct engine_ids so the registry
         // HashMap can hold both simultaneously. Labeled ids use the v2
@@ -268,8 +266,8 @@ mod tests {
         // Format is part of the key — a gguf+path collision with an mlx+path
         // would otherwise look identical to the registry.
         let mlx = make_engine_id(EngineFormat::Mlx, "/m/llama.gguf", &None);
-        assert_eq!(mlx, "mlx:/m/llama.gguf");
-        assert_ne!(mlx, "gguf:/m/llama.gguf");
+        assert_eq!(mlx, "mlx:v2:/m/llama.gguf");
+        assert_ne!(mlx, "gguf:v2:/m/llama.gguf");
     }
 
     #[test]

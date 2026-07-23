@@ -1,9 +1,8 @@
 //! SQLite-backed metadata store for installed + imported local models.
 //!
-//! Replaces the legacy `.inkmarshal-models.json` + `.inkmarshal-imported-models.json`
-//! pair. Read/write paths in `model_manager.rs` route through this module via
-//! [`MetaDb`]. The legacy JSON files are migrated once on first open and kept
-//! alongside as `.bak` so a downgrade can read them.
+//! Read/write paths in `model_manager.rs` route through this module via
+//! [`MetaDb`]. Prelaunch builds support only this SQLite product shape; startup
+//! never imports, renames, or removes unrelated JSON files.
 //!
 //! Connections are opened per call (SQLite open is cheap). The DB file lives
 //! at `{models_dir}/inkmarshal-meta.db`.
@@ -25,10 +24,6 @@ CREATE TABLE IF NOT EXISTS installed_models (
   managed      INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE TABLE IF NOT EXISTS migration_state (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
 "#;
 
 #[derive(Debug, Clone)]
@@ -74,106 +69,6 @@ impl MetaDb {
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("meta_db schema: {e}"))?;
         Ok(MetaDb { conn })
-    }
-
-    fn migration_done(&self, key: &str) -> bool {
-        self.conn
-            .query_row(
-                "SELECT value FROM migration_state WHERE key = ?1",
-                params![key],
-                |_| Ok(()),
-            )
-            .is_ok()
-    }
-
-    fn mark_migration_done(&self, key: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO migration_state(key, value) VALUES (?1, ?2)",
-                params![key, "1"],
-            )
-            .map_err(|e| format!("meta_db migration_state: {e}"))?;
-        Ok(())
-    }
-
-    /// One-shot migration: read any legacy JSON metadata files and copy their
-    /// contents into the SQLite tables. Idempotent — the migration_state row
-    /// guards against re-running. Both legacy files are renamed to `*.bak` on
-    /// success so a downgrade can still read them.
-    pub fn migrate_legacy_json(&self, root: &Path) -> Result<(), String> {
-        if self.migration_done("legacy_json_v1") {
-            return Ok(());
-        }
-
-        let installed_path = root.join(".inkmarshal-models.json");
-        if let Some(map) = read_legacy_json_map(&installed_path)? {
-            for (path, value) in map {
-                let label = value
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let source_repo = value
-                    .get("sourceRepo")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let format = value
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("gguf")
-                    .to_string();
-                let installed_at = value
-                    .get("installedAtUnix")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                self.upsert_installed(
-                    &path,
-                    &InstalledRecord {
-                        label,
-                        source_repo,
-                        format,
-                        installed_at_unix: installed_at,
-                    },
-                )?;
-            }
-            archive_legacy_json(&installed_path, &root.join(".inkmarshal-models.json.bak"))?;
-        }
-
-        let imported_path = root.join(".inkmarshal-imported-models.json");
-        if let Some(map) = read_legacy_json_map(&imported_path)? {
-            for (path, value) in map {
-                let label = value
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let format = value
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("gguf")
-                    .to_string();
-                let imported_at = value
-                    .get("importedAtUnix")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                self.upsert_imported(
-                    &path,
-                    &ImportedRecord {
-                        label,
-                        format,
-                        imported_at_unix: imported_at,
-                    },
-                )?;
-            }
-            archive_legacy_json(
-                &imported_path,
-                &root.join(".inkmarshal-imported-models.json.bak"),
-            )?;
-        }
-
-        self.mark_migration_done("legacy_json_v1")?;
-        Ok(())
     }
 
     pub fn list_installed(&self) -> Result<HashMap<String, InstalledRecord>, String> {
@@ -327,52 +222,10 @@ fn prepare_meta_db_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn read_legacy_json_map(path: &Path) -> Result<Option<HashMap<String, serde_json::Value>>, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) => {
-            if md.file_type().is_symlink() {
-                return Err(format!(
-                    "legacy model metadata cannot be a symlink: {}",
-                    path.display()
-                ));
-            }
-            if !md.is_file() {
-                return Err(format!(
-                    "legacy model metadata is not a regular file: {}",
-                    path.display()
-                ));
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("legacy model metadata inspect: {err}")),
-    }
-
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(_) => return Ok(None),
-    };
-    Ok(serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw).ok())
-}
-
-fn archive_legacy_json(path: &Path, bak_path: &Path) -> Result<(), String> {
-    if let Ok(md) = std::fs::symlink_metadata(path) {
-        if md.file_type().is_symlink() {
-            return Err(format!(
-                "legacy model metadata cannot be a symlink: {}",
-                path.display()
-            ));
-        }
-    }
-    std::fs::rename(path, bak_path).map_err(|e| format!("legacy model metadata archive: {e}"))
-}
-
-/// Open the meta DB for `models_dir`, run the one-shot legacy migration if
-/// needed, and return the handle. Caller is responsible for using the result
+/// Open the current metadata DB. Caller is responsible for using the result
 /// for at least one DB operation; opening it is cheap.
 pub fn open_for(models_dir: &Path) -> Result<MetaDb, String> {
-    let db = MetaDb::open(models_dir)?;
-    db.migrate_legacy_json(models_dir)?;
-    Ok(db)
+    MetaDb::open(models_dir)
 }
 
 /// Helper for tests + diagnostics: confirm the meta DB exists.
@@ -448,34 +301,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn legacy_json_migration_rejects_symlink_metadata() {
-        use std::os::unix::fs::symlink;
+    fn open_for_leaves_unrelated_json_metadata_untouched() {
+        let dir = unique_tmp("ignore-json");
+        let json = dir.join(".inkmarshal-models.json");
+        fs::write(&json, b"do-not-import-or-rename").expect("json fixture");
 
-        let dir = unique_tmp("legacy-symlink");
-        let outside = dir.with_file_name(format!(
-            "inkmarshal-legacy-json-outside-{}",
-            std::process::id()
-        ));
-        fs::write(&outside, r#"{}"#).expect("outside");
-        symlink(&outside, dir.join(".inkmarshal-models.json")).expect("legacy symlink");
+        open_for(&dir).expect("open current metadata db");
 
-        let db = MetaDb::open(&dir).expect("open db");
-        let err = db
-            .migrate_legacy_json(&dir)
-            .expect_err("reject symlink legacy json");
-        assert!(err.contains("symlink"));
-        assert!(fs::symlink_metadata(dir.join(".inkmarshal-models.json"))
-            .expect("legacy link still exists")
-            .file_type()
-            .is_symlink());
         assert_eq!(
-            fs::read_to_string(&outside).expect("outside unchanged"),
-            "{}"
+            fs::read(&json).expect("json preserved"),
+            b"do-not-import-or-rename"
         );
-
-        let _ = fs::remove_file(&outside);
+        assert!(!dir.join(".inkmarshal-models.json.bak").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

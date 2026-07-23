@@ -51,3 +51,4 @@ for (const relativePath of [
 
 emptyGeneratedResourceDir(path.join(root, 'src-tauri', 'resources', 'next-server'));
 emptyGeneratedResourceDir(path.join(root, 'src-tauri', 'resources', 'node'));
+emptyGeneratedResourceDir(path.join(root, 'src-tauri', 'resources', 'engines'));

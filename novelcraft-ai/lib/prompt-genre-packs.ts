@@ -8,8 +8,8 @@
 // run resolves against it.
 //
 // Mirrors lib/prompt-seed.ts's data-table shape. The pack only overrides the
-// stages where genre voice matters most — chapter_write (system + user) and
-// book_blueprint — across all three locales; every other stage falls back to
+// stage where genre voice matters most — chapter_write (system + user) —
+// across all three locales; every other stage falls back to
 // the default template via the resolver's variant fallback, so a pack is a thin
 // stylistic overlay rather than a full fork.
 

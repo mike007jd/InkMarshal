@@ -10,6 +10,13 @@ vi.mock('ai', () => ({
   Output: aiMocks.Output,
 }));
 
+vi.mock('@/lib/ai/prompt-runner', () => ({
+  resolveTemplate: (_stage: string, role: string) => role === 'system'
+    ? 'You are an editor. {{langNote}}'
+    : '{{novelTitle}} {{genre}} {{markedText}} {{instruction}}',
+  variantForStage: () => undefined,
+}));
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;

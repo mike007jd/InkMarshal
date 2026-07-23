@@ -43,11 +43,14 @@ export type {
   VaultIndexRow,
 } from '@/lib/vault/types';
 
-/** Suggest a default vault path for a novel: `~/.inkmarshal/app/vaults/{slug}`. */
+/** Suggest a default vault path beneath the native runtime's canonical app root. */
 export async function defaultVaultPathForNovel(slug: string): Promise<string | null> {
   if (typeof window === 'undefined' || !window.__TAURI_INTERNALS__) return null;
-  const { homeDir, join } = await import('@tauri-apps/api/path');
-  const home = await homeDir();
-  if (!home) return null;
-  return join(home, '.inkmarshal', 'app', 'vaults', slug);
+  const [{ join }, { getDesktopStatus }] = await Promise.all([
+    import('@tauri-apps/api/path'),
+    import('@/lib/desktop-runtime'),
+  ]);
+  const status = await getDesktopStatus();
+  if (!status.app_data_dir) return null;
+  return join(status.app_data_dir, 'vaults', slug);
 }

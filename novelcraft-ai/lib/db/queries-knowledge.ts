@@ -3,6 +3,10 @@ import { touchNovelUpdatedAt } from '@/lib/db/transactions';
 import { nowIso } from '@/lib/utils';
 import { upsertKnowledgeIndex, type KnowledgeIndexInsert } from '@/lib/db/queries-vault';
 import { SAFE_DATA_JSON } from '@/lib/db/json-columns';
+import {
+  enqueueKnowledgeVaultDelete,
+  enqueueKnowledgeVaultUpsert,
+} from '@/lib/db/queries-knowledge-vault-outbox';
 
 // `ke.`-aliased variant of SAFE_DATA_JSON (see json-columns.ts) for JOINs where
 // the knowledge table is aliased `ke`.
@@ -11,9 +15,8 @@ const SAFE_KE_DATA_JSON = "CASE WHEN json_valid(ke.data) THEN ke.data ELSE '{}' 
 export interface KnowledgeEntryRow {
   id: string;
   novel_id: string;
-  /** W3-3: non-null when this entry is shared across a series (the series id);
-   *  NULL for a private/standalone entry. Present on `SELECT *` reads after the
-   *  0017 migration adds the column; older callers ignore it. */
+  /** Non-null when this entry is shared across a series; null for a private or
+   *  standalone entry. Stored by the current baseline and optional to callers. */
   series_id?: string | null;
   type: string;
   title: string;
@@ -141,6 +144,12 @@ export async function createKnowledgeEntryWithIndex(
       data.updatedAt,
     );
     upsertKnowledgeIndex(db, index);
+    enqueueKnowledgeVaultUpsert(db, {
+      entryId: index.id,
+      novelId: index.novelId,
+      relPath: index.path,
+      updatedAt: data.updatedAt,
+    });
     touchNovelUpdatedAt(db, data.novelId);
   });
   tx();
@@ -208,6 +217,12 @@ export async function updateKnowledgeEntryWithIndex(
     const info = updateEntry.run(...values, id);
     if (info.changes > 0 && row) {
       upsertKnowledgeIndex(db, index);
+      enqueueKnowledgeVaultUpsert(db, {
+        entryId: index.id,
+        novelId: index.novelId,
+        relPath: index.path,
+        updatedAt: fields.updatedAt,
+      });
       touchNovelUpdatedAt(db, row.novel_id);
     }
   });
@@ -221,8 +236,13 @@ export async function deleteKnowledgeEntry(
 ): Promise<void> {
   const db = getDb();
   const row = db
-    .prepare('SELECT novel_id FROM knowledge_entries WHERE id = ?')
-    .get(id) as { novel_id: string } | undefined;
+    .prepare(
+      `SELECT ke.novel_id, ki.path
+         FROM knowledge_entries ke
+         LEFT JOIN knowledge_index ki ON ki.id = ke.id
+        WHERE ke.id = ?`,
+    )
+    .get(id) as { novel_id: string; path: string | null } | undefined;
   const updateCleanup = db.prepare(
     'UPDATE knowledge_entries SET data = ?, updated_at = ? WHERE id = ?',
   );
@@ -235,6 +255,20 @@ export async function deleteKnowledgeEntry(
     }
     for (const index of sourceIndexUpdates) {
       upsertKnowledgeIndex(db, index);
+      enqueueKnowledgeVaultUpsert(db, {
+        entryId: index.id,
+        novelId: index.novelId,
+        relPath: index.path,
+        updatedAt: index.updatedAt,
+      });
+    }
+    if (row) {
+      enqueueKnowledgeVaultDelete(db, {
+        entryId: id,
+        novelId: row.novel_id,
+        relPath: row.path,
+        updatedAt: nowIso(),
+      });
     }
     deleteIndex.run(id);
     const info = deleteEntry.run(id);
@@ -329,6 +363,12 @@ export async function createKnowledgeRelationWithSourceIndex(
   const tx = db.transaction(() => {
     insertRelation.run(data.id, data.sourceId, data.targetId, data.relationType, data.label, data.createdAt);
     upsertKnowledgeIndex(db, sourceIndex);
+    enqueueKnowledgeVaultUpsert(db, {
+      entryId: sourceIndex.id,
+      novelId: sourceIndex.novelId,
+      relPath: sourceIndex.path,
+      updatedAt: sourceIndex.updatedAt,
+    });
     if (source) touchNovelUpdatedAt(db, source.novel_id);
   });
   tx();
@@ -370,6 +410,12 @@ export async function syncKnowledgeRelationsForSource(
       insertRelation.run(c.id, c.sourceId, c.targetId, c.relationType, c.label, c.createdAt);
     }
     upsertKnowledgeIndex(db, sourceIndex);
+    enqueueKnowledgeVaultUpsert(db, {
+      entryId: sourceIndex.id,
+      novelId: sourceIndex.novelId,
+      relPath: sourceIndex.path,
+      updatedAt: sourceIndex.updatedAt,
+    });
     touchNovelUpdatedAt(db, sourceNovelId);
   });
   tx();
@@ -407,6 +453,12 @@ export async function deleteKnowledgeRelationWithSourceIndex(
     const info = deleteRelation.run(id);
     if (info.changes > 0 && rel) {
       upsertKnowledgeIndex(db, sourceIndex);
+      enqueueKnowledgeVaultUpsert(db, {
+        entryId: sourceIndex.id,
+        novelId: sourceIndex.novelId,
+        relPath: sourceIndex.path,
+        updatedAt: sourceIndex.updatedAt,
+      });
       touchNovelUpdatedAt(db, rel.novel_id);
     }
   });

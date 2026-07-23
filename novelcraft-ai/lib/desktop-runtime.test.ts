@@ -229,7 +229,7 @@ describe('desktop runtime command contract', () => {
     expect(mocks.invoke).toHaveBeenCalledWith(DESKTOP_COMMANDS.desktopStatus, undefined);
   });
 
-  it('fills missing desktop model paths from the Tauri path API', async () => {
+  it('does not guess model paths when the native status omits them', async () => {
     vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });
     mocks.invoke.mockResolvedValueOnce({
       desktop: true,
@@ -237,42 +237,25 @@ describe('desktop runtime command contract', () => {
       app_data_dir: null,
       model_dir: null,
     });
-    mocks.homeDir.mockResolvedValue('/Users/me');
-    mocks.join
-      .mockResolvedValueOnce('/Users/me/.inkmarshal/app')
-      .mockResolvedValueOnce('/Users/me/.inkmarshal/app/models');
-
     await expect(getDesktopStatus()).resolves.toMatchObject({
       desktop: true,
       platform: 'darwin',
-      app_data_dir: '/Users/me/.inkmarshal/app',
-      model_dir: '/Users/me/.inkmarshal/app/models',
+      app_data_dir: null,
+      model_dir: null,
     });
-    expect(mocks.join).toHaveBeenCalledWith(
-      '/Users/me',
-      '.inkmarshal',
-      'app',
-    );
-    expect(mocks.join).toHaveBeenCalledWith(
-      '/Users/me/.inkmarshal/app',
-      'models',
-    );
+    expect(mocks.join).not.toHaveBeenCalled();
   });
 
-  it('falls back to Tauri paths when desktop_status rejects', async () => {
+  it('fails closed without a guessed path when desktop_status rejects', async () => {
     vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });
     vi.stubGlobal('navigator', { platform: 'MacIntel' });
     mocks.invoke.mockRejectedValueOnce(new Error('command failed'));
-    mocks.homeDir.mockResolvedValue('/Users/me');
-    mocks.join
-      .mockResolvedValueOnce('/Users/me/.inkmarshal/app')
-      .mockResolvedValueOnce('/Users/me/.inkmarshal/app/models');
-
     await expect(getDesktopStatus()).resolves.toMatchObject({
       desktop: true,
       platform: 'MacIntel',
-      app_data_dir: '/Users/me/.inkmarshal/app',
-      model_dir: '/Users/me/.inkmarshal/app/models',
+      app_data_dir: null,
+      model_dir: null,
+      model_dir_error: 'command failed',
     });
   });
 });

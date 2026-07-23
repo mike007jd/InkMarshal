@@ -1,4 +1,4 @@
-// Phase 3 — writing_jobs run-history queries. Real SQLite (schema 0012) via the
+// Writing-job run-history queries against the current baseline SQLite schema via the
 // temp-DATA_DIR + getDb pattern; server-only is stubbed under vitest.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -53,6 +53,27 @@ describe('queries-writing-jobs', () => {
     expect(jobs.getLatestWritingJob(novelId)?.status).toBe('running');
   });
 
+  it('rolls back the reclaim when inserting the successor fails', async () => {
+    const { jobs } = await mods();
+    const { getDb } = await import('@/lib/db/connection');
+    const novelId = await freshNovel();
+    const crashed = jobs.createWritingJob(novelId);
+    getDb().exec(`
+      CREATE TRIGGER fail_writing_job_successor
+      BEFORE INSERT ON writing_jobs
+      BEGIN
+        SELECT RAISE(ABORT, 'injected successor failure');
+      END;
+    `);
+
+    expect(() => jobs.createWritingJob(novelId)).toThrow('injected successor failure');
+    expect(jobs.getLatestWritingJob(novelId)).toMatchObject({
+      id: crashed.id,
+      status: 'running',
+    });
+    getDb().exec('DROP TRIGGER fail_writing_job_successor');
+  });
+
   it('bumpProgress advances without changing status', async () => {
     const { jobs } = await mods();
     const novelId = await freshNovel();
@@ -70,7 +91,7 @@ describe('queries-writing-jobs', () => {
     const { jobs } = await mods();
     const novelId = await freshNovel();
     const job = jobs.createWritingJob(novelId);
-    jobs.finalizeWritingJob(job.id, 'completed', 'full_done');
+    jobs.finalizeWritingJob(job.id, novelId, 'completed', 'full_done');
     expect(jobs.getLatestWritingJob(novelId)?.status).toBe('completed');
     expect(jobs.getLatestWritingJob(novelId)?.endReason).toBe('full_done');
     // Only 'running' rows are reclaimed; a completed job stays completed.
@@ -82,9 +103,40 @@ describe('queries-writing-jobs', () => {
     const { jobs } = await mods();
     const novelId = await freshNovel();
     const job = jobs.createWritingJob(novelId);
-    jobs.finalizeWritingJob(job.id, 'failed', null, 'boom');
+    jobs.finalizeWritingJob(job.id, novelId, 'failed', null, 'boom');
     const latest = jobs.getLatestWritingJob(novelId);
     expect(latest?.status).toBe('failed');
     expect(latest?.errorMessage).toBe('boom');
+  });
+
+  it('rolls back the novel terminal patch when job finalization fails', async () => {
+    const { jobs, db } = await mods();
+    const { getDb } = await import('@/lib/db/connection');
+    const novelId = await freshNovel();
+    const job = jobs.createWritingJob(novelId);
+    const before = await db.getNovel(novelId);
+    getDb().exec(`
+      CREATE TRIGGER fail_writing_job_terminal
+      BEFORE UPDATE ON writing_jobs
+      WHEN NEW.status != 'running'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected terminal failure');
+      END;
+    `);
+
+    expect(() => jobs.finalizeWritingJob(
+      job.id,
+      novelId,
+      'failed',
+      'error',
+      'boom',
+      { stage: 'autonomous_writing', progress: 42 },
+    )).toThrow('injected terminal failure');
+    expect(await db.getNovel(novelId)).toMatchObject({
+      stage: before?.stage,
+      progress: before?.progress,
+    });
+    expect(jobs.getLatestWritingJob(novelId)?.status).toBe('running');
+    getDb().exec('DROP TRIGGER fail_writing_job_terminal');
   });
 });

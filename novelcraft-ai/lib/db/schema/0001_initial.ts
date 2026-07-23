@@ -173,6 +173,17 @@ CREATE TABLE IF NOT EXISTS knowledge_embeddings (
   updated_at    TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_vault_outbox (
+  entry_id      TEXT PRIMARY KEY,
+  novel_id      TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  operation     TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  rel_path      TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -247,6 +258,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_novel_id ON conversations(novel_id)
 CREATE INDEX IF NOT EXISTS idx_kemb_novel ON knowledge_embeddings(novel_id);
 CREATE INDEX IF NOT EXISTS idx_kidx_novel_type ON knowledge_index(novel_id, type);
 CREATE INDEX IF NOT EXISTS idx_kidx_title ON knowledge_index(novel_id, title);
+CREATE INDEX IF NOT EXISTS idx_knowledge_vault_outbox_novel
+  ON knowledge_vault_outbox(novel_id, operation);
 CREATE INDEX IF NOT EXISTS idx_knowledge_entries_novel ON knowledge_entries(novel_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_entries_series ON knowledge_entries(series_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_relations_source ON knowledge_relations(source_id);

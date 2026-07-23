@@ -22,12 +22,15 @@ export interface WritingLease {
   renew(): Promise<boolean>;
   /** Background timer renewal (never throws); calls onLost if the lock is gone. */
   renewQuietly(onLost: () => void): Promise<void>;
+  /** True only after storage confirms that this token no longer owns the lock. */
+  hasLost(): boolean;
   /** Release the lock exactly once (idempotent across calls). */
   release(): Promise<void>;
 }
 
 export function createWritingLease(novelId: string, token: string, log: Logger): WritingLease {
   let releasePromise: Promise<void> | null = null;
+  let lost = false;
   return {
     async renew() {
       const newExpiry = await renewWritingLock(novelId, token, WRITING_LOCK_TTL_SEC);
@@ -35,6 +38,7 @@ export function createWritingLease(novelId: string, token: string, log: Logger):
         log(START_WRITING_EVENTS.lockRenewed, { expiresAt: new Date(newExpiry).toISOString() });
         return true;
       }
+      lost = true;
       log(START_WRITING_EVENTS.lockFailed, { reason: 'lock_lost_during_run' });
       return false;
     },
@@ -48,12 +52,20 @@ export function createWritingLease(novelId: string, token: string, log: Logger):
           });
           return;
         }
+        lost = true;
         log(START_WRITING_EVENTS.lockFailed, { reason: 'lock_lost_mid_chapter' });
         onLost();
-      } catch {
+      } catch (error) {
         // A single transient DB hiccup shouldn't kill an in-flight chapter;
         // the boundary renew() calls still catch a genuine loss.
+        log(START_WRITING_EVENTS.lockFailed, {
+          reason: 'lock_renewal_error',
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
+    },
+    hasLost() {
+      return lost;
     },
     release() {
       releasePromise ??= releaseWritingLock(novelId, token);

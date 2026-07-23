@@ -34,6 +34,11 @@ import { dirname, join, relative } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import {
+  ENGINE_MANIFEST_FILENAME,
+  validateEngineManifest,
+  writeEngineManifest,
+} from './engine-manifest.mjs';
 
 // ---------------------------------------------------------------------------
 // Pinned asset table
@@ -173,8 +178,12 @@ async function fetchEngine(engine) {
   if (existsSync(sidecar)) {
     const stored = (await readFile(sidecar, 'utf8')).trim();
     if (stored === engine.archiveSha256 && existsSync(destBin)) {
-      console.log(`[${engine.target}] cached — ok`);
-      return;
+      const validation = await validateEngineManifest(destDir, engine.archiveSha256);
+      if (validation.ok) {
+        console.log(`[${engine.target}] cached — ${validation.entries} manifest entries verified`);
+        return;
+      }
+      console.log(`[${engine.target}] cached manifest invalid (${validation.reason}) — re-downloading`);
     }
     if (stored === engine.archiveSha256) {
       console.log(`[${engine.target}] sidecar matches but ${engine.mainBinary} missing — re-downloading`);
@@ -209,10 +218,15 @@ async function fetchEngine(engine) {
     // Ensure main binary is executable
     await chmod(join(destDir, engine.mainBinary), 0o755);
 
+    // Record every extracted file and symlink, not merely the main binary.
+    // Cache reuse is allowed only after the complete archive shape and digests
+    // validate, so a missing dylib can never slip into a desktop package.
+    await writeEngineManifest(destDir, engine.archiveSha256);
+
     // Write sidecar so next run is idempotent
     await writeFile(sidecar, engine.archiveSha256 + '\n', 'utf8');
 
-    console.log(`[${engine.target}] installed → ${destDir}`);
+    console.log(`[${engine.target}] installed with ${ENGINE_MANIFEST_FILENAME} → ${destDir}`);
   } finally {
     try { await unlink(tmpArchive); } catch { /* already gone */ }
   }

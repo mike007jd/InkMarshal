@@ -1,7 +1,7 @@
 // Phase 1 — durable-config cache layer. Verifies the runtime split: web/test
 // goes straight to localStorage (no fetch), desktop write-throughs to SQLite +
 // mirrors localStorage and reads from the in-memory cache, and boot hydration
-// pulls SQLite into the cache then migrates legacy localStorage exactly once.
+// pulls SQLite into the cache without importing unpublished localStorage shapes.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -150,7 +150,7 @@ describe('app-settings-client', () => {
     });
   });
 
-  it('hydrate pulls SQLite into cache and migrates legacy localStorage once', async () => {
+  it('hydrate treats SQLite as authoritative and does not import localStorage', async () => {
     isTauri.mockReturnValue(true);
     const fetchMock = vi.fn().mockImplementation((_url: string, opts?: RequestInit) => {
       if (!opts || opts.method === 'GET') {
@@ -162,7 +162,6 @@ describe('app-settings-client', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) });
     });
     vi.stubGlobal('fetch', fetchMock);
-    // A legacy value present only in localStorage (SQLite doesn't have it yet).
     localStorage.setItem('inkmarshal_settings', '{"theme":"dark"}');
     localStorage.setItem('inkmarshal_workspace_views_v1', '{"stale":"story-deck"}');
 
@@ -170,36 +169,15 @@ describe('app-settings-client', () => {
     await hydrateAppSettings();
 
     expect(getStoredSetting('inkmarshal_connections_v1')).toBe('[]'); // from SQLite
-    expect(getStoredSetting('inkmarshal_settings')).toBe('{"theme":"dark"}'); // migrated
-    const keys = patchCalls(fetchMock).map(c => c.key);
-    expect(keys).toContain('inkmarshal_settings');
-    expect(keys).not.toContain('inkmarshal_workspace_views_v1');
-    expect(keys).toContain('ls_migrated_v1');
-  });
-
-  it('hydrate does not re-migrate when the sentinel is already set', async () => {
-    isTauri.mockReturnValue(true);
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ settings: { ls_migrated_v1: '1' } }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    localStorage.setItem('inkmarshal_settings', '{"theme":"dark"}');
-
-    const { hydrateAppSettings, getStoredSetting } = await load();
-    await hydrateAppSettings();
-
-    // Legacy localStorage value must NOT be migrated back into SQLite.
+    expect(getStoredSetting('inkmarshal_settings')).toBe('{"theme":"dark"}'); // first-paint mirror only
     expect(patchCalls(fetchMock)).toHaveLength(0);
-    // Reads still fall back to the localStorage mirror for an un-hydrated key.
-    expect(getStoredSetting('inkmarshal_settings')).toBe('{"theme":"dark"}');
   });
 
   it('fires hydration listeners once on completion', async () => {
     isTauri.mockReturnValue(true);
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ settings: { ls_migrated_v1: '1' } }) }),
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ settings: {} }) }),
     );
     const { hydrateAppSettings, onAppSettingsHydrated } = await load();
     const cb = vi.fn();
@@ -212,7 +190,7 @@ describe('app-settings-client', () => {
     isTauri.mockReturnValue(true);
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ settings: { ls_migrated_v1: '1' } }) }),
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ settings: {} }) }),
     );
     const { hydrateAppSettings, onAppSettingsHydrated } = await load();
     await hydrateAppSettings();

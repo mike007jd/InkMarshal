@@ -5,9 +5,8 @@
 // versions ship by bumping `version` and toggling `active`, not by editing
 // these rows.
 //
-// The hardcoded templates remain authoritative — lib/ai/* falls back to its
-// inline string when a template lookup misses, so a wiped or corrupt
-// `prompt_templates` table never blocks generation.
+// These rows are the only production prompt source. Missing or corrupt prompt
+// records fail closed instead of falling back to a second inline truth.
 
 import type Database from 'better-sqlite3';
 import { nowIso } from '@/lib/utils';
@@ -607,9 +606,8 @@ Stay on topic, ask one focused question at a time, summarize and reflect back th
   },
 
   // ── P11 chapter Ralph-revise (user) ────────────────────────────────────
-  // Self-repair step of the autonomous-writing loop. Mirrors the inline
-  // RALPH_REVISE_FALLBACK in lib/ai/chapter-quality.ts so the stage is
-  // DB-overridable like every other AI op.
+  // Self-repair step of the autonomous-writing loop. Stored in the DB so the
+  // stage is editable and versioned like every other AI operation.
   {
     id: 'pt_ralph_revise_user_en_1',
     stage: 'chapter_ralph_revise',

@@ -1,7 +1,7 @@
 // E2E-01 — automated-unit desktop boot smoke.
 //
 // Exercises the boot invariants that need no GUI: the local SQLite store opens
-// and migrates on a cold start, and the desktop readiness probe answers with the
+// and initializes the current baseline on a cold start, and the desktop readiness probe answers with the
 // session identity proof. The GUI / engine / WebDriver paths are gated on macOS
 // CI (see smoke-matrix.ts).
 
@@ -34,13 +34,12 @@ afterEach(() => {
 });
 
 describe('desktop boot smoke (automated-unit)', () => {
-  it('boot-sqlite: opens a fresh local DB, migrates to schema 18, and round-trips a novel', async () => {
+  it('boot-sqlite: opens a fresh local DB at the current schema and round-trips a novel', async () => {
     const { getDb, closeDbForTest } = await import('@/lib/db/connection');
     const { createNovel, getNovel } = await import('@/lib/db');
     try {
       const db = getDb();
-      // Migrated to the schema-18 epoch on cold boot.
-      expect(db.pragma('user_version', { simple: true })).toBe(18);
+      expect(db.pragma('user_version', { simple: true })).toBe(1);
       // The DB file was actually created on disk under the data dir.
       expect(existsSync(path.join(tmpDir, 'inkmarshal.db'))).toBe(true);
 

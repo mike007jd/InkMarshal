@@ -18,9 +18,9 @@
  *   6. Verify codesign / spctl / stapler (release-grade gate)
  *   7. Publish to dist/release with a .sha256
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { loadAppleReleaseEnv } from './release-env.mjs';
@@ -92,6 +92,59 @@ function runCapture(command, args, options = {}) {
     throw new Error(`${command} ${redactedCommandArgs(args).join(' ')} failed${output ? `: ${output}` : ''}`);
   }
   return output;
+}
+
+function sleepMs(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function inkMarshalProcessIds() {
+  const result = spawnSync('pgrep', ['-f', '/InkMarshal\\.app/Contents/MacOS/inkmarshal-desktop'], {
+    encoding: 'utf8',
+    shell: false,
+  });
+  if (result.status === 1) return [];
+  if (result.status !== 0) {
+    throw new Error(`Unable to inspect running InkMarshal processes: ${commandOutput(result)}`);
+  }
+  return result.stdout.trim().split(/\s+/).filter(Boolean).map(Number);
+}
+
+function stopRunningInkMarshal() {
+  let pids = inkMarshalProcessIds();
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+  }
+  for (let attempt = 0; attempt < 20 && pids.length > 0; attempt += 1) {
+    sleepMs(250);
+    pids = inkMarshalProcessIds();
+  }
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGKILL'); } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+  }
+  if (inkMarshalProcessIds().length > 0) {
+    throw new Error('InkMarshal processes are still running after termination');
+  }
+}
+
+function detachOldInkMarshalDmgMounts() {
+  if (!existsSync('/Volumes')) return;
+  for (const volume of readdirSync('/Volumes')) {
+    if (!/^InkMarshal(?:$|\s)/.test(volume)) continue;
+    const mountPoint = join('/Volumes', volume);
+    console.log(`[release:mac] detaching stale InkMarshal mount ${mountPoint}`);
+    runCapture('hdiutil', ['detach', mountPoint]);
+  }
+}
+
+function prepareDesktopPackagingEnvironment() {
+  stopRunningInkMarshal();
+  detachOldInkMarshalDmgMounts();
+  run(process.execPath, [join(process.cwd(), 'scripts', 'clean-build-artifacts.mjs')]);
 }
 
 function requireReleaseEnv() {
@@ -437,6 +490,65 @@ function assertMountedDmgAppSignature(dmgPath) {
   }
 }
 
+function exactDmgLaunchSmoke(dmgPath) {
+  stopRunningInkMarshal();
+  detachOldInkMarshalDmgMounts();
+  console.log('[smoke] mounting and launching the exact final DMG...');
+  const attachOutput = runCapture('hdiutil', ['attach', '-nobrowse', '-readonly', dmgPath]);
+  const mountPoint = attachOutput
+    .split(/\r?\n/)
+    .map((line) => line.split('\t').at(-1)?.trim())
+    .find((value) => value?.startsWith('/Volumes/'));
+  if (!mountPoint) throw new Error(`Could not determine final DMG mount point: ${attachOutput}`);
+
+  const smokeHome = mkdtempSync(join(tmpdir(), 'inkmarshal-exact-dmg-smoke-'));
+  try {
+    const mountedApp = join(mountPoint, 'InkMarshal.app');
+    const mountedExecutable = join(mountedApp, 'Contents', 'MacOS', 'inkmarshal-desktop');
+    if (!existsSync(mountedExecutable)) throw new Error(`Mounted executable is missing: ${mountedExecutable}`);
+    runCapture('open', ['-n', '--env', `INKMARSHAL_HOME=${smokeHome}`, mountedApp]);
+
+    let ready = false;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const pids = inkMarshalProcessIds();
+      if (pids.length > 1) {
+        throw new Error(`Expected one InkMarshal app process, found ${pids.join(', ')}`);
+      }
+      if (pids.length === 1) {
+        const command = runCapture('ps', ['-p', String(pids[0]), '-o', 'command=']).trim();
+        if (!command.startsWith(mountedExecutable)) {
+          throw new Error(`InkMarshal executable is not from the current DMG mount: ${command}`);
+        }
+        for (const port of [1421, 1422]) {
+          const health = spawnSync('curl', [
+            '--fail', '--silent', '--show-error', '--max-time', '1',
+            `http://127.0.0.1:${port}/api/health`,
+          ], { encoding: 'utf8', shell: false });
+          if (health.status !== 0) continue;
+          try {
+            const body = JSON.parse(health.stdout);
+            if (body?.ok === true && body.runtime === 'desktop') ready = true;
+          } catch {
+            // Keep polling until a complete JSON response is available.
+          }
+        }
+      }
+      if (ready) break;
+      sleepMs(500);
+    }
+    if (!ready) throw new Error('Exact final DMG app did not become healthy on port 1421 or 1422');
+    const finalPids = inkMarshalProcessIds();
+    if (finalPids.length !== 1) {
+      throw new Error(`Expected exactly one healthy InkMarshal process, found ${finalPids.length}`);
+    }
+    console.log(`[smoke] PASS: exact final DMG launched from ${mountedExecutable}`);
+  } finally {
+    stopRunningInkMarshal();
+    rmSync(smokeHome, { recursive: true, force: true });
+    runCapture('hdiutil', ['detach', mountPoint]);
+  }
+}
+
 function writeSha256(filePath, outputPath) {
   const digest = createHash('sha256').update(readFileSync(filePath)).digest('hex');
   writeFileSync(outputPath, `${digest}  ${STABLE_DMG_NAME}\n`);
@@ -569,6 +681,8 @@ try {
 
 const { signingIdentity, appleId, appleTeamId, applePassword, updaterKeyPath } = requireReleaseEnv();
 
+prepareDesktopPackagingEnvironment();
+
 const releaseDir = join(process.cwd(), 'dist/release');
 mkdirSync(releaseDir, { recursive: true });
 const stableDmgPath = join(releaseDir, STABLE_DMG_NAME);
@@ -653,6 +767,19 @@ publishStableReleaseAssets({
   tempManifestPath,
 });
 resetStableReleaseAssets(producedDmgPath, producedUpdaterPath, producedUpdaterSignaturePath, producedManifestPath);
+
+try {
+  exactDmgLaunchSmoke(stableDmgPath);
+} catch (error) {
+  resetStableReleaseAssets(
+    stableDmgPath,
+    stableShaPath,
+    stableUpdaterPath,
+    stableUpdaterSignaturePath,
+    stableManifestPath,
+  );
+  throw error;
+}
 
 console.log('[release:mac] Release assets ready:');
 console.log(`  ${stableDmgPath}`);
