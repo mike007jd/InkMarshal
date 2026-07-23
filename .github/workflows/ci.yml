@@ -1,4 +1,4 @@
-# Pre-launch CI: enforce the complete quality gate on every push and pull request,
+# CI: enforce the complete quality gate on every push and pull request,
 # including pull requests from forks. Every job uses a fresh GitHub-hosted runner
 # and only the read-only GITHUB_TOKEN granted by the workflow permissions below.
 name: CI

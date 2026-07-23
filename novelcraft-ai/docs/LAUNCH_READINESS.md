@@ -2,7 +2,7 @@
 
 Last checked: 2026-07-23
 
-This is the release operating document for the current prelaunch product after the maintainability audit. It describes the launch path that exists now. This documentation pass does **not** claim that signing, notarization, real-model, BYOK, offline, or manual GUI smoke passed.
+This is the release operating document for the launched product. It describes the launch path that exists now. This documentation pass does **not** claim that signing, notarization, real-model, BYOK, offline, or manual GUI smoke passed.
 
 ## Launch Scope
 
@@ -19,7 +19,7 @@ Explicitly not in scope:
 - Login, account, cloud database, platform credits, or Stripe credit checkout.
 - Server-owned provider API keys.
 
-## Product Contracts (prelaunch)
+## Product Contracts
 
 - `pnpm verify` is lint, typecheck, Knip dead-code analysis, the full Vitest suite, an isolated 80-chapter full-novel QA gate, and production build.
 - Local SQLite supports exactly the current schema v1 baseline. Empty/new databases are created at that shape only; incompatible nonempty databases fail closed without modification. Destructive cleanup is only through `pnpm local-state:reset -- --confirm-delete-inkmarshal-local-state`.

@@ -83,7 +83,7 @@ pnpm verify:desktop
 | `spec/LOCAL_FIRST_WRITING_STUDIO_REQUIREMENTS.md` | Product direction for Studio / providers |
 | `spec/SYSTEM_FRAMEWORK.md` | System framework |
 | `novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md` | What is actually shipped |
-| `CLAUDE.md` / `AGENTS.md` | Agent working rules (prelaunch, no cloud auth) |
+| `CLAUDE.md` / `AGENTS.md` | Agent working rules (launched, local-first, no cloud auth) |
 
 ## Common pitfalls
 

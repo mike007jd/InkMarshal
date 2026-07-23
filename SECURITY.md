@@ -2,12 +2,12 @@
 
 ## Supported versions
 
-InkMarshal is currently pre-release software.
+InkMarshal is publicly released software.
 
 | Version | Security support |
 | --- | --- |
-| Latest commit on `main` before the first public release | Supported on a best-effort basis |
-| Latest stable release after public launch | Supported |
+| Latest stable release | Supported |
+| Latest commit on `main` | Supported on a best-effort basis |
 | Older releases and development branches | Not supported; reproduce against the latest supported version first |
 
 Security fixes may require upgrading to the latest release. The project does not maintain compatibility branches for unpublished internal builds.
@@ -17,7 +17,7 @@ Security fixes may require upgrading to the latest release. The project does not
 Please do not open a public issue for a suspected vulnerability.
 
 1. Prefer [GitHub Security Advisories](https://github.com/mike007jd/InkMarshal/security/advisories/new) to submit a private report with affected versions, impact, reproduction steps, and any proof of concept.
-2. If private vulnerability reporting is unavailable, contact the maintainers through the repository owner's private channel. Before public launch, replace this placeholder with a monitored security mailbox: `security@inkmarshal.example` (**placeholder; not a live inbox**).
+2. If private vulnerability reporting is unavailable, email the maintainers at `mike007jd@gmail.com`.
 3. Do not include real API keys, private manuscripts, personal data, or destructive payloads. Use minimal test data.
 
 Reports about leaked credentials should identify the affected provider and repository location, but should not repeat the credential. Revoke exposed credentials immediately with the provider.

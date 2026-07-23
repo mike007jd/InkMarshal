@@ -13,8 +13,8 @@
 
 # 项目约定
 - Next.js 16，使用 `proxy.ts`（不是 middleware）；它只负责桌面 session 握手与本地 API/页面鉴权。若误跑在生产 Web runtime，桌面页面重定向到 `https://www.inkmarshal.com/download`，但官网源码与 Vercel 构建只属于兄弟仓库 `../../AiNovelSite`。
-- **项目仍处于未上线阶段**：没有真实用户、没有生产数据、没有必须保护的历史兼容合同。以后做清理、重构、修 Bug 时，不为旧内部状态新增迁移、legacy adapter、compat 分支、fallback path 或最小补丁层；旧 schema、旧 API、旧配置、旧 UI 入口、旧脚本、测试/样例/本地假数据、重复实现应直接删除或折叠到当前唯一产品形态。
-- 未上线不等于正常启动可以静默删本机状态。破坏性本地清理继续要求显式 reset 脚本；实现层面要清掉兼容债，而不是为了未发布旧版本写生产级迁移。
+- **项目已于 2026-07-23 公开上线**：已发布构建可能承载真实用户数据。此后凡涉及本地 SQLite schema、vault 结构、`~/.inkmarshal/app/` 数据布局、更新器 manifest、发布资产命名的改动，必须保护既有用户数据和已发布契约：schema 变更要带从每个已发布版本出发的前向迁移，更新链路要能从每个已发布版本升级上来。
+- 上线不等于囤积投机性兼容债：没有已发布版本依赖的死代码、废配置、重复实现照旧直接删。破坏性本地清理仍只允许显式 reset 脚本；正常启动永远不得静默删除或丢弃用户数据。
 - **无云端账号 / 无云数据库 / 无平台积分**。桌面端用本地 SQLite（`lib/db.ts`）。不要在本仓库引入 landing、Vercel、Supabase、Stripe 或任何云端用户态。
 - 不分阶段开发，一步到位。
 - Provider / Studio 相关工作必须先读仓库根 `spec/`（即 `../spec/`）下的 `LOCAL_FIRST_WRITING_STUDIO_REQUIREMENTS.md`；landing 工作在 `../../AiNovelSite` 处理。

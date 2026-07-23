@@ -58,7 +58,7 @@ pnpm build              # Next.js desktop-runtime build
 pnpm lint
 pnpm typecheck
 pnpm test               # vitest
-pnpm verify             # lint + typecheck + test + build
+pnpm verify             # lint + typecheck + dead-code (Knip) + test + full-novel QA gate + build
 pnpm verify:desktop     # rustfmt + clippy + cargo test
 ```
 

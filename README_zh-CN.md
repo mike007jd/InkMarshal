@@ -58,7 +58,7 @@ pnpm build              # Next.js 桌面 runtime 构建
 pnpm lint
 pnpm typecheck
 pnpm test
-pnpm verify             # lint + typecheck + test + build
+pnpm verify             # lint + typecheck + 死代码扫描(Knip) + test + 全书 QA 门 + build
 pnpm verify:desktop     # rustfmt + clippy + cargo test
 ```
 
