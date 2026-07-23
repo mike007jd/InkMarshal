@@ -39,7 +39,8 @@
     "verify": "pnpm lint && pnpm typecheck && pnpm check:dead-code && pnpm test && pnpm qa:full-novel-gate && pnpm build",
     "verify:desktop": "cd src-tauri && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked",
     "verify:all": "pnpm verify && pnpm verify:security && pnpm verify:desktop",
-    "verify:release-desktop": "node scripts/validate-desktop-release.mjs",
+    "verify:third-party-notices": "node scripts/generate-third-party-notices.mjs --check",
+    "verify:release-desktop": "pnpm verify:third-party-notices && node scripts/validate-desktop-release.mjs",
     "verify:mac-library-validation": "node scripts/verify-mac-library-validation.mjs"
   },
   "dependencies": {

@@ -88,6 +88,7 @@ InkMarshal/
 - Bootstrap: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Privacy and network behavior: [PRIVACY.md](PRIVACY.md)
 - Security support and private reporting: [SECURITY.md](SECURITY.md)
+- Third-party licenses and attributions: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 - App scripts / release notes for maintainers: [novelcraft-ai/README.md](novelcraft-ai/README.md)
 - System framework: [spec/SYSTEM_FRAMEWORK.md](spec/SYSTEM_FRAMEWORK.md)
 - Live surfaces: [novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md](novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md)
