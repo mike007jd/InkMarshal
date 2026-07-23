@@ -32,8 +32,7 @@ describe('signed desktop updater contract', () => {
     ]);
     expect(coordinator).toContain('result === null');
     expect(coordinator).not.toContain('.available');
-    expect(coordinator).toContain('requestManuscriptFlush({ createSnapshot: true })');
-    expect(coordinator).toContain('await relaunch()');
+    expect(coordinator).toContain('installDesktopUpdate({');
   });
 
   it('gates only the startup check behind a default-on durable setting and keeps manual checks', () => {

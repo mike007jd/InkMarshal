@@ -20,11 +20,7 @@
 //     and the web landing site never touches SQLite.
 
 import { isTauriRuntime } from '@/lib/desktop-runtime';
-import {
-  APP_SETTINGS_KEYS,
-  APP_SETTINGS_MIGRATION_SENTINEL,
-  isWritableAppSettingKey,
-} from '@/lib/app-settings-keys';
+import { isWritableAppSettingKey } from '@/lib/app-settings-keys';
 
 const cache = new Map<string, string>();
 const settingPatchTails = new Map<string, Promise<boolean>>();
@@ -63,6 +59,7 @@ async function patchSetting(key: string, value: string | null): Promise<boolean>
     try {
       const res = await fetch('/api/app-settings', {
         method: 'PATCH',
+        keepalive: true,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ key, value }),
       });
@@ -116,13 +113,35 @@ export function removeStoredSetting(key: string): void {
 }
 
 /**
- * One-time desktop boot: pull SQLite into the cache, then migrate any durable
- * localStorage key SQLite doesn't have yet. Idempotent across calls and
- * crash-safe: the per-key "only when SQLite is empty" guard plus the
- * sentinel-written-last ordering make a partial run safe to re-run, and the old
- * localStorage keys are intentionally left in place this release as a rollback
- * fallback. No-op off-desktop. Fires hydration listeners on completion so
- * already-mounted consumers re-read the now-authoritative values.
+ * Persist a value and resolve only after the authoritative desktop SQLite
+ * write has completed. The synchronous API remains for low-risk preferences;
+ * crash-recovery payloads use this barrier so callers can observe failure.
+ */
+export function setStoredSettingDurable(key: string, value: string): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    safeLocalSet(key, value);
+    return Promise.resolve(true);
+  }
+  cache.set(key, value);
+  safeLocalSet(key, value);
+  return isWritableAppSettingKey(key) ? patchSetting(key, value) : Promise.resolve(false);
+}
+
+export function removeStoredSettingDurable(key: string): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    safeLocalRemove(key);
+    return Promise.resolve(true);
+  }
+  cache.delete(key);
+  safeLocalRemove(key);
+  return isWritableAppSettingKey(key) ? patchSetting(key, null) : Promise.resolve(false);
+}
+
+/**
+ * Desktop boot: pull the one current product shape from SQLite into the cache.
+ * localStorage is only a first-paint mirror and is never imported into the
+ * authoritative store. No-op off-desktop. Fires hydration listeners on
+ * completion so already-mounted consumers re-read the authoritative values.
  */
 export async function hydrateAppSettings(): Promise<void> {
   if (hydrated || !isTauriRuntime()) return;
@@ -141,30 +160,6 @@ export async function hydrateAppSettings(): Promise<void> {
   }
 
   for (const [key, value] of Object.entries(settings)) cache.set(key, value);
-
-  if (!settings[APP_SETTINGS_MIGRATION_SENTINEL]) {
-    // Migrate each legacy key SQLite doesn't have yet. Cache writes are sync; the
-    // SQLite write-throughs run in parallel, and the sentinel is written only
-    // after they all settle so a crash mid-migration safely re-runs.
-    const migrations: Promise<boolean>[] = [];
-    for (const key of APP_SETTINGS_KEYS) {
-      if (cache.has(key)) continue; // SQLite already authoritative — never overwrite.
-      const legacy = safeLocalGet(key);
-      if (legacy != null) {
-        cache.set(key, legacy);
-        migrations.push(patchSetting(key, legacy));
-      }
-    }
-    // Mark migration done ONLY when every key reached SQLite. A failed write
-    // leaves the sentinel unset so the next boot retries that key (this session
-    // still has it cached, and the localStorage original remains the fallback) —
-    // critical because a later release deletes the localStorage mirror.
-    const results = await Promise.all(migrations);
-    if (results.every(Boolean)) {
-      cache.set(APP_SETTINGS_MIGRATION_SENTINEL, '1');
-      await patchSetting(APP_SETTINGS_MIGRATION_SENTINEL, '1');
-    }
-  }
 
   hydrated = true;
   for (const cb of Array.from(hydratedListeners)) {

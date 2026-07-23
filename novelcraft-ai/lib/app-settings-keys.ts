@@ -1,7 +1,7 @@
 // Allowlist of durable client-config keys mirrored from localStorage into
 // SQLite (`app_settings`). Shared by the client cache layer
 // (lib/app-settings-client.ts) and the API route (app/api/app-settings) so the
-// set of migratable keys has a single source of truth — a compromised renderer
+// set of writable keys has a single source of truth — a compromised renderer
 // cannot write arbitrary rows.
 //
 // NOTE on `locale`: it is intentionally NOT here. The locale cookie is scoped
@@ -12,8 +12,6 @@
 // This module is client-safe: no server-only imports, so the renderer cache
 // layer can import it directly.
 
-/** Sentinel marking that the one-time localStorage→SQLite migration ran. */
-export const APP_SETTINGS_MIGRATION_SENTINEL = 'ls_migrated_v1';
 export const AUTOMATIC_UPDATE_CHECK_SETTING_KEY = 'inkmarshal_auto_update_check_v1';
 
 export const APP_SETTINGS_KEYS = [
@@ -24,8 +22,6 @@ export const APP_SETTINGS_KEYS = [
   'inkmarshal_model_root_v1', // optional custom local model download folder
 ] as const;
 
-// New product-shape settings are writable and hydrated from SQLite, but are
-// intentionally excluded from the old localStorage migration loop.
 export const APP_SETTINGS_CURRENT_ONLY_KEYS = [
   'inkmarshal_workspace_views_v1', // last top-level workspace mode per novel
   AUTOMATIC_UPDATE_CHECK_SETTING_KEY, // default-on startup update checks
@@ -39,7 +35,6 @@ export type AppSettingKey =
 const WRITABLE_KEYS: ReadonlySet<string> = new Set<string>([
   ...APP_SETTINGS_KEYS,
   ...APP_SETTINGS_CURRENT_ONLY_KEYS,
-  APP_SETTINGS_MIGRATION_SENTINEL,
 ]);
 
 /** True for any key the API route is allowed to persist (config keys + sentinel). */

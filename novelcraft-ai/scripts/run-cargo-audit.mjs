@@ -6,7 +6,35 @@ import { spawnSync } from 'node:child_process';
 const TOOL_VERSION = '0.22.2';
 const TOOL_ROOT = join(process.cwd(), '.cargo-tools');
 const LOCAL_BIN = join(TOOL_ROOT, 'bin', process.platform === 'win32' ? 'cargo-audit.exe' : 'cargo-audit');
-const AUDIT_ARGS = ['-f', 'src-tauri/Cargo.lock'];
+// These advisories are transitive desktop-shell dependencies. Keep each ID
+// explicit so a new unmaintained/unsound warning fails the gate instead of
+// silently joining a broad category exemption.
+const ALLOWED_ADVISORIES = [
+  'RUSTSEC-2024-0370',
+  'RUSTSEC-2024-0411',
+  'RUSTSEC-2024-0412',
+  'RUSTSEC-2024-0413',
+  'RUSTSEC-2024-0414',
+  'RUSTSEC-2024-0415',
+  'RUSTSEC-2024-0416',
+  'RUSTSEC-2024-0417',
+  'RUSTSEC-2024-0418',
+  'RUSTSEC-2024-0419',
+  'RUSTSEC-2024-0420',
+  'RUSTSEC-2024-0429',
+  'RUSTSEC-2025-0075',
+  'RUSTSEC-2025-0080',
+  'RUSTSEC-2025-0081',
+  'RUSTSEC-2025-0098',
+  'RUSTSEC-2025-0100',
+];
+const AUDIT_ARGS = [
+  '-f',
+  'src-tauri/Cargo.lock',
+  '-D',
+  'warnings',
+  ...ALLOWED_ADVISORIES.flatMap(id => ['--ignore', id]),
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {

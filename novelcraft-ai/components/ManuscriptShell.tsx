@@ -360,9 +360,9 @@ export function ManuscriptShell({
   // The draft map is read through a ref so persistDraftMapNow stays stable
   // across keystrokes — otherwise the beforeunload listener below would be
   // removed and re-added on every edit.
-  const persistDraftMapNow = useCallback(() => {
-    if (activeNovelRef.current !== novelId) return;
-    persistDrafts(novelId, buildPersistPayload(
+  const persistDraftMapNow = useCallback((): Promise<boolean> => {
+    if (activeNovelRef.current !== novelId) return Promise.resolve(true);
+    return persistDrafts(novelId, buildPersistPayload(
       draftContentRef.current,
       draftVersionsRef.current,
       combinedChaptersRef.current,
@@ -374,13 +374,13 @@ export function ManuscriptShell({
   // reset the debounce timer (that IS the debounce).
   useEffect(() => {
     if (!draftStoreReady || draftRestoreTarget !== null || readOnly) return;
-    const handle = setTimeout(persistDraftMapNow, DRAFT_PERSIST_DEBOUNCE_MS);
+    const handle = setTimeout(() => { void persistDraftMapNow(); }, DRAFT_PERSIST_DEBOUNCE_MS);
     return () => clearTimeout(handle);
   }, [persistDraftMapNow, draftContentByChapter, draftRestoreTarget, draftStoreReady, readOnly]);
 
   useEffect(() => {
     if (!draftStoreReady || readOnly) return;
-    const flush = () => persistDraftMapNow();
+    const flush = () => { void persistDraftMapNow(); };
     window.addEventListener('beforeunload', flush);
     window.addEventListener('pagehide', flush);
     return () => {
@@ -409,7 +409,7 @@ export function ManuscriptShell({
       });
     }
     if (hadStaleEntries) {
-      persistDrafts(novelId, buildPersistPayload(
+      void persistDrafts(novelId, buildPersistPayload(
         restored,
         draftVersionsRef.current,
         combinedChaptersRef.current,

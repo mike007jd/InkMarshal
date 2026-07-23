@@ -62,13 +62,11 @@ describe('resolveTemplate with a custom variant', () => {
     const { resolveTemplate } = await import('@/lib/ai/prompt-runner');
     const { importVariantPack } = await import('@/lib/prompt-pack-io');
 
-    const defaultText = resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK');
-    expect(defaultText).not.toBe('FALLBACK'); // seeded default exists
+    const defaultText = resolveTemplate('chapter_write', 'user', 'en');
+    expect(defaultText.length).toBeGreaterThan(0);
 
-    // No such variant yet → resolveTemplate catches TemplateNotFoundError and
-    // returns the fallback (NOT the default), so a stale variant id never breaks
-    // the chain.
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK', 'nope_variant')).toBe('FALLBACK');
+    expect(() => resolveTemplate('chapter_write', 'user', 'en', 'nope_variant'))
+      .toThrow(/prompt template not found/);
 
     importVariantPack({
       formatVersion: 1,
@@ -76,8 +74,8 @@ describe('resolveTemplate with a custom variant', () => {
       rows: [{ stage: 'chapter_write', role: 'user', locale: 'en', templateText: 'CUSTOM {{title}}' }],
     });
 
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK', 'runner_custom')).toBe('CUSTOM {{title}}');
+    expect(resolveTemplate('chapter_write', 'user', 'en', 'runner_custom')).toBe('CUSTOM {{title}}');
     // Default coordinate is unaffected.
-    expect(resolveTemplate('chapter_write', 'user', 'en', 'FALLBACK')).toBe(defaultText);
+    expect(resolveTemplate('chapter_write', 'user', 'en')).toBe(defaultText);
   });
 });

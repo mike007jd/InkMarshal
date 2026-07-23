@@ -165,11 +165,8 @@ pub(super) fn engine_binary_path(
     Ok(path)
 }
 
-/// Build the registry key. With a label this is the disambiguated form
-/// `"{fmt}:v2:{escaped_path}#{escaped_label}"`; without it we collapse to the legacy
-/// `"{fmt}:{path}"` form so callers that don't yet know about labels still
-/// behave like the single-instance case. Paths containing `#` or the reserved
-/// `v2:` prefix also use the v2 form so they cannot collide with labeled ids.
+/// Build the single current registry-key shape:
+/// `"{fmt}:v2:{escaped_path}"` with an optional `#{escaped_label}` suffix.
 pub fn make_engine_id(format: EngineFormat, path: &str, label: &Option<String>) -> String {
     let fmt = format_wire(format);
     match label {
@@ -180,10 +177,7 @@ pub fn make_engine_id(format: EngineFormat, path: &str, label: &Option<String>) 
                 encode_engine_id_component(l)
             )
         }
-        _ if path.contains('#') || path.starts_with("v2:") => {
-            format!("{fmt}:v2:{}", encode_engine_id_component(path))
-        }
-        _ => format!("{fmt}:{path}"),
+        _ => format!("{fmt}:v2:{}", encode_engine_id_component(path)),
     }
 }
 

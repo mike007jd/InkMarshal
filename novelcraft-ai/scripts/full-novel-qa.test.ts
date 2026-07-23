@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -19,8 +20,9 @@ function assertHarnessPaths(dataDir: string): void {
     throw new Error('FULL_NOVEL_QA_DATA_DIR must point at an isolated copied DB, not the real InkMarshal data dir.');
   }
   const resolvedExportDir = path.resolve(exportDir);
-  if (!resolvedExportDir.startsWith('/tmp/')) {
-    throw new Error('FULL_NOVEL_QA_EXPORT_DIR must stay under /tmp for this destructive export rewrite.');
+  const relativeToTemp = path.relative(path.resolve(tmpdir()), resolvedExportDir);
+  if (relativeToTemp.startsWith('..') || path.isAbsolute(relativeToTemp)) {
+    throw new Error('FULL_NOVEL_QA_EXPORT_DIR must stay under the OS temporary directory for this destructive export rewrite.');
   }
 }
 

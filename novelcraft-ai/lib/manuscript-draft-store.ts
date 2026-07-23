@@ -16,8 +16,8 @@
 
 import {
   getStoredSetting,
-  removeStoredSetting,
-  setStoredSetting,
+  removeStoredSettingDurable,
+  setStoredSettingDurable,
 } from '@/lib/app-settings-client';
 
 export interface PersistedDraft {
@@ -38,16 +38,33 @@ interface ChapterLike {
 
 export const MANUSCRIPT_RECOVERY_SETTING_KEY = 'inkmarshal_manuscript_recovery_v1';
 
-function sanitizeDraftMap(value: unknown): PersistedDraftMap {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+export class CorruptManuscriptRecoveryError extends Error {
+  constructor(detail: string) {
+    super(`Stored manuscript recovery data is corrupt (${detail}). It was left unchanged; reset it explicitly after preserving any recoverable text.`);
+    this.name = 'CorruptManuscriptRecoveryError';
+  }
+}
+
+function parseDraftMap(value: unknown, context: string): PersistedDraftMap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new CorruptManuscriptRecoveryError(`${context} is not an object`);
+  }
   const out: PersistedDraftMap = {};
   for (const [key, candidate] of Object.entries(value as Record<string, unknown>)) {
-    if (!/^\d+$/.test(key) || !candidate || typeof candidate !== 'object') continue;
+    if (!/^\d+$/.test(key) || !candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new CorruptManuscriptRecoveryError(`${context}.${key} is invalid`);
+    }
     const draft = candidate as Partial<PersistedDraft>;
-    if (typeof draft.content !== 'string' || typeof draft.version !== 'number') continue;
+    if (
+      typeof draft.content !== 'string' ||
+      !Number.isInteger(draft.version) ||
+      (draft.savedAt !== undefined && typeof draft.savedAt !== 'number')
+    ) {
+      throw new CorruptManuscriptRecoveryError(`${context}.${key} has an invalid draft shape`);
+    }
     out[key] = {
       content: draft.content,
-      version: draft.version,
+      version: draft.version as number,
       savedAt: typeof draft.savedAt === 'number' ? draft.savedAt : 0,
     };
   }
@@ -55,36 +72,39 @@ function sanitizeDraftMap(value: unknown): PersistedDraftMap {
 }
 
 function loadRecoveryEnvelope(): PersistedRecoveryEnvelope {
+  const raw = getStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY);
+  if (!raw) return {};
+  let parsed: unknown;
   try {
-    const raw = getStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY);
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: PersistedRecoveryEnvelope = {};
-    for (const [novelId, value] of Object.entries(parsed as Record<string, unknown>)) {
-      const drafts = sanitizeDraftMap(value);
-      if (Object.keys(drafts).length > 0) out[novelId] = drafts;
-    }
-    return out;
+    parsed = JSON.parse(raw);
   } catch {
-    return {};
+    throw new CorruptManuscriptRecoveryError('payload is not valid JSON');
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new CorruptManuscriptRecoveryError('payload is not an object');
+  }
+  const out: PersistedRecoveryEnvelope = {};
+  for (const [novelId, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const drafts = parseDraftMap(value, novelId);
+    if (Object.keys(drafts).length > 0) out[novelId] = drafts;
+  }
+  return out;
 }
 
 export function loadPersistedDrafts(novelId: string): PersistedDraftMap {
   return loadRecoveryEnvelope()[novelId] ?? {};
 }
 
-export function persistDrafts(novelId: string, drafts: PersistedDraftMap): void {
+export function persistDrafts(novelId: string, drafts: PersistedDraftMap): Promise<boolean> {
   const envelope = loadRecoveryEnvelope();
-  const sanitized = sanitizeDraftMap(drafts);
+  const sanitized = parseDraftMap(drafts, novelId);
   if (Object.keys(sanitized).length === 0) delete envelope[novelId];
   else envelope[novelId] = sanitized;
 
   if (Object.keys(envelope).length === 0) {
-    removeStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY);
+    return removeStoredSettingDurable(MANUSCRIPT_RECOVERY_SETTING_KEY);
   } else {
-    setStoredSetting(MANUSCRIPT_RECOVERY_SETTING_KEY, JSON.stringify(envelope));
+    return setStoredSettingDurable(MANUSCRIPT_RECOVERY_SETTING_KEY, JSON.stringify(envelope));
   }
 }
 

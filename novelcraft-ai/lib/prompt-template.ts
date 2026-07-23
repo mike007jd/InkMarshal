@@ -1,7 +1,7 @@
 // Server-only prompt template resolver.
 //
-// The `prompt_templates` SQLite table (see lib/db/schema/0004_prompt_templates)
-// stores the active text for every (stage, role, locale, variant) combination.
+// The baseline `prompt_templates` SQLite table stores the active text for every
+// (stage, role, locale, variant) combination.
 // `getPromptTemplate` looks the requested record up with a locale fallback
 // chain (zh-TW → zh-CN → en) so a missing translation never blocks generation.
 //

@@ -77,11 +77,12 @@ pub async fn runtime_health(input: HealthInput) -> Result<ConnectionHealth, Stri
     let started = Instant::now();
 
     match input.transport.as_str() {
+        "openai-compatible" => {
+            probe_openai(&client, &base_url, started, input.secret.as_deref()).await
+        }
         "ollama-native" => probe_ollama(&client, &base_url, started).await,
         "anthropic" => probe_anthropic(&client, &base_url, started, input.secret.as_deref()).await,
-        // "openai-compatible" and any unknown value fall back to the OpenAI
-        // `/v1/models` probe — the broadest, safest assumption.
-        _ => probe_openai(&client, &base_url, started, input.secret.as_deref()).await,
+        other => Err(format!("Unsupported runtime transport: {other}")),
     }
 }
 
@@ -466,6 +467,19 @@ mod tests {
         .expect_err("remote plain HTTP secret transport must be rejected");
 
         assert!(err.contains("HTTPS or a loopback HTTP runtime"));
+    }
+
+    #[test]
+    fn runtime_health_rejects_unknown_transport() {
+        let err = tauri::async_runtime::block_on(runtime_health(HealthInput {
+            connection_id: "unknown-transport".to_string(),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            transport: "guessed-provider".to_string(),
+            secret: None,
+        }))
+        .expect_err("unknown transport must fail closed");
+
+        assert_eq!(err, "Unsupported runtime transport: guessed-provider");
     }
 
     #[test]

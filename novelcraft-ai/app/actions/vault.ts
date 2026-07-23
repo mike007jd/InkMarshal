@@ -52,6 +52,11 @@ import {
 import { isUuid, nowIso, parseJsonField } from '@/lib/utils';
 import type { VaultEntry } from '@/lib/vault/entry';
 import type { KnowledgeEntryRow } from '@/lib/db/queries-knowledge';
+import { getKnowledgeVaultOutboxIntent } from '@/lib/db/queries-knowledge-vault-outbox';
+import {
+  tryDeleteKnowledgeEntryFromVault,
+  trySyncKnowledgeEntryToVault,
+} from '@/lib/knowledge/apply-write';
 
 const MAX_VAULT_CHANGED_FILES = 64;
 const MAX_VAULT_FILE_CONTENT_LENGTH = 128 * 1024;
@@ -152,6 +157,26 @@ export async function reconcileVaultChangedFiles(
     try {
       const previousIndex = await getKnowledgeIndexRowByPath(novelId, change.path);
       if (change.content === null) {
+        const intent = getKnowledgeVaultOutboxIntent(
+          novelId,
+          previousIndex?.id ?? null,
+          change.path,
+        );
+        if (intent?.operation === 'upsert') {
+          await trySyncKnowledgeEntryToVault(novelId, intent.entryId, 'reconcileVaultChangedFiles.restoreMirror');
+          updated++;
+          continue;
+        }
+        if (intent?.operation === 'delete') {
+          await tryDeleteKnowledgeEntryFromVault(
+            novelId,
+            intent.entryId,
+            intent.relPath,
+            'reconcileVaultChangedFiles.confirmDelete',
+          );
+          deleted++;
+          continue;
+        }
         if (previousIndex) {
           const movedInSameBatch = Array.from(incomingIdsByPath.entries())
             .some(([path, id]) => path !== change.path && id === previousIndex.id);
@@ -173,6 +198,22 @@ export async function reconcileVaultChangedFiles(
         continue;
       }
       const { entry, projection } = parsed;
+      const intent = getKnowledgeVaultOutboxIntent(novelId, entry.id, change.path);
+      if (intent?.operation === 'delete') {
+        await tryDeleteKnowledgeEntryFromVault(
+          novelId,
+          intent.entryId,
+          intent.relPath ?? change.path,
+          'reconcileVaultChangedFiles.rejectResurrection',
+        );
+        deleted++;
+        continue;
+      }
+      if (intent?.operation === 'upsert') {
+        await trySyncKnowledgeEntryToVault(novelId, intent.entryId, 'reconcileVaultChangedFiles.replayMirror');
+        updated++;
+        continue;
+      }
       const existing = await getKnowledgeEntryById(entry.id);
       if (existing && existing.novel_id !== novelId) {
         skipped++;
@@ -200,6 +241,24 @@ export async function reconcileVaultChangedFiles(
         continue;
       }
       const contentHash = await hashContent(change.content);
+      if (existingIndexForId?.contentHash === contentHash) {
+        continue;
+      }
+      if (
+        existing &&
+        !(
+          existingIndexForId &&
+          existingIndexForId.path !== change.path &&
+          deletedPaths.has(existingIndexForId.path)
+        ) &&
+        Number.isFinite(Date.parse(existing.updated_at)) &&
+        Number.isFinite(Date.parse(now)) &&
+        Date.parse(now) <= Date.parse(existing.updated_at)
+      ) {
+        await trySyncKnowledgeEntryToVault(novelId, entry.id, 'reconcileVaultChangedFiles.rejectStaleMirror');
+        updated++;
+        continue;
+      }
       const previousEntry = previousIndex && previousIndex.id !== entry.id
         ? await getKnowledgeEntryById(previousIndex.id)
         : undefined;

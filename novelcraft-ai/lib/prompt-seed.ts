@@ -5,9 +5,8 @@
 // versions ship by bumping `version` and toggling `active`, not by editing
 // these rows.
 //
-// The hardcoded templates remain authoritative — lib/ai/* falls back to its
-// inline string when a template lookup misses, so a wiped or corrupt
-// `prompt_templates` table never blocks generation.
+// These rows are the only production prompt source. Missing or corrupt prompt
+// records fail closed instead of falling back to a second inline truth.
 
 import type Database from 'better-sqlite3';
 import { nowIso } from '@/lib/utils';

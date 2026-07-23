@@ -1,20 +1,22 @@
 import Database from 'better-sqlite3';
-import { migrations as allMigrations, type Migration } from '@/lib/db/schema';
+
+import {
+  CURRENT_SCHEMA_TABLES,
+  CURRENT_SCHEMA_VERSION,
+  currentSchemaSql,
+} from '@/lib/db/schema';
 
 const SCHEMA_VERSION_DDL = `
-CREATE TABLE IF NOT EXISTS _schema_version (
+CREATE TABLE _schema_version (
   version     INTEGER NOT NULL,
   description TEXT NOT NULL,
   applied_at  TEXT NOT NULL
 );
 `;
 
-/**
- * DB-02: raised when the database was written by a NEWER app than this one (its
- * recorded schema version exceeds every migration we know about). Opening it
- * fails closed — the caller must NOT fall through to reading/writing, or a newer
- * on-disk shape would be silently corrupted by an older binary.
- */
+const RESET_GUIDANCE =
+  'Run `pnpm local-state:reset -- --confirm-delete-inkmarshal-local-state` only if you intend to delete this unpublished local state.';
+
 export class DatabaseFromNewerAppVersionError extends Error {
   constructor(
     readonly dbVersion: number,
@@ -22,152 +24,91 @@ export class DatabaseFromNewerAppVersionError extends Error {
   ) {
     super(
       `Local database schema ${dbVersion} was created by a newer version of InkMarshal ` +
-        `than this build supports (up to schema ${appMaxVersion}). Refusing to open it to ` +
-        `avoid corrupting your data — please update the app.`,
+        `than this build supports (schema ${appMaxVersion}). Refusing to open it to avoid ` +
+        'corrupting your data; update InkMarshal before opening this database.',
     );
     this.name = 'DatabaseFromNewerAppVersionError';
   }
 }
 
-function currentSchemaVersion(db: Database.Database): number {
-  const row = db
-    .prepare('SELECT version FROM _schema_version ORDER BY version DESC LIMIT 1')
-    .get() as { version: number } | undefined;
-  return row?.version ?? 0;
-}
-
-function maxKnownVersion(migrations: Migration[]): number {
-  return migrations.reduce((max, m) => Math.max(max, m.version), 0);
-}
-
-export function inspectMigrations(
-  db: Database.Database,
-  migrations: Migration[] = allMigrations,
-): { current: number; pending: number; pendingDestructive: boolean } {
-  db.exec(SCHEMA_VERSION_DDL);
-  const current = currentSchemaVersion(db);
-  const pending = migrations.filter(m => m.version > current);
-  return {
-    current,
-    pending: pending.length,
-    pendingDestructive: pending.some(m => m.destructive === true),
-  };
-}
-
-/**
- * DB-02: create a verified snapshot of the live database next to it before a
- * migration touches an already-populated database. `VACUUM INTO` writes a
- * consistent copy without holding a long lock, then we reopen the copy and run
- * `PRAGMA integrity_check`. Returns the backup path, or null when there is
- * nothing to back up (in-memory or a fresh/empty database). Throws if the
- * snapshot cannot be written or fails its integrity check — the caller decides
- * whether that is fatal.
- */
-export function createVerifiedBackup(db: Database.Database, fromVersion: number): string | null {
-  const dbPath = db.name;
-  if (!dbPath || dbPath === ':memory:') return null;
-
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const backupPath = `${dbPath}.pre-migration-v${fromVersion}-${stamp}.bak`;
-  // VACUUM INTO cannot run inside an open transaction; callers invoke this
-  // before BEGIN.
-  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
-
-  let backup: Database.Database | undefined;
-  try {
-    backup = new Database(backupPath, { readonly: true });
-    const result = backup.pragma('integrity_check', { simple: true });
-    if (result !== 'ok') {
-      throw new Error(`integrity_check on the pre-migration backup returned "${String(result)}"`);
-    }
-  } finally {
-    backup?.close();
+export class IncompatibleDatabaseSchemaError extends Error {
+  constructor(message: string) {
+    super(`InkMarshal local database is incompatible with this prelaunch build: ${message} ${RESET_GUIDANCE}`);
+    this.name = 'IncompatibleDatabaseSchemaError';
   }
-  return backupPath;
 }
 
-export function runMigrations(
+function tableNames(db: Database.Database): string[] {
+  return db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all()
+    .map(row => (row as { name: string }).name)
+    .filter(name => !name.startsWith('sqlite_'));
+}
+
+function recordedSchemaVersion(db: Database.Database): number {
+  const hasVersionTable = db
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = '_schema_version'")
+    .get() as { present: number } | undefined;
+  if (!hasVersionTable) {
+    throw new IncompatibleDatabaseSchemaError('the nonempty database has no schema marker.');
+  }
+  const rows = db
+    .prepare('SELECT version FROM _schema_version ORDER BY version DESC')
+    .all() as Array<{ version: number }>;
+  if (rows.length !== 1 || !Number.isInteger(rows[0].version)) {
+    throw new IncompatibleDatabaseSchemaError('the schema marker is missing or ambiguous.');
+  }
+  return rows[0].version;
+}
+
+/** Read-only validation for an existing database. Never creates tables, seeds
+ * rows, mirrors pragmas, or attempts to reinterpret unpublished old shapes. */
+export function assertCurrentSchema(db: Database.Database): void {
+  const version = recordedSchemaVersion(db);
+  if (version > CURRENT_SCHEMA_VERSION) {
+    throw new DatabaseFromNewerAppVersionError(version, CURRENT_SCHEMA_VERSION);
+  }
+  if (version !== CURRENT_SCHEMA_VERSION) {
+    throw new IncompatibleDatabaseSchemaError(
+      `found schema ${version}; this build requires schema ${CURRENT_SCHEMA_VERSION}.`,
+    );
+  }
+
+  const actualTables = tableNames(db);
+  if (actualTables.join('\n') !== CURRENT_SCHEMA_TABLES.join('\n')) {
+    throw new IncompatibleDatabaseSchemaError('the table set does not match the current baseline.');
+  }
+  const integrity = db.pragma('quick_check', { simple: true });
+  if (integrity !== 'ok') {
+    throw new IncompatibleDatabaseSchemaError(`SQLite quick_check returned ${String(integrity)}.`);
+  }
+}
+
+/** Initialize one disposable empty database directly at the current product
+ * shape. There is intentionally no migration chain in this prelaunch app. */
+export function initializeCurrentSchema(
   db: Database.Database,
-  migrations: Migration[] = allMigrations,
-  // Injectable so the destructive-backup gate can be exercised without forcing a
-  // real VACUUM INTO failure; production always uses createVerifiedBackup.
-  backupFn: (db: Database.Database, fromVersion: number) => string | null = createVerifiedBackup,
+  bootstrapRows: () => void = () => undefined,
 ): void {
-  db.exec(SCHEMA_VERSION_DDL);
-  const current = currentSchemaVersion(db);
-  const appMax = maxKnownVersion(migrations);
-
-  // Fail closed if the on-disk schema is newer than anything this build knows.
-  if (current > appMax) {
-    throw new DatabaseFromNewerAppVersionError(current, appMax);
-  }
-
-  const pending = migrations
-    .filter(m => m.version > current)
-    .sort((a, b) => a.version - b.version);
-
-  if (pending.length === 0) {
-    mirrorUserVersion(db, current);
-    return;
-  }
-
-  // Snapshot a populated database before migrating. A missing/failed backup is
-  // fatal when any pending step is destructive; otherwise (purely additive
-  // steps) we log and proceed so a backup-dir hiccup can't wedge startup.
-  if (current > 0) {
-    const hasDestructive = pending.some(m => m.destructive === true);
-    try {
-      backupFn(db, current);
-    } catch (e) {
-      if (hasDestructive) {
-        throw new Error(
-          `Refusing to run a destructive migration without a verified backup: ${(e as Error).message}`,
-          { cause: e },
-        );
-      }
-      console.warn(
-        `[migrations] pre-migration backup failed (proceeding: no destructive step pending): ${(e as Error).message}`,
-      );
-    }
-  }
-
-  const targetVersion = pending[pending.length - 1]?.version ?? current;
   let transactionOpen = false;
   try {
     db.exec('BEGIN IMMEDIATE');
     transactionOpen = true;
-    for (const m of pending) {
-      try {
-        db.exec(m.sql);
-        db.prepare(
-          'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
-        ).run(m.version, m.description, new Date().toISOString());
-      } catch (e) {
-        throw new Error(
-          `Schema migration ${m.version} "${m.description}" failed. Cause: ${(e as Error).message}`,
-          { cause: e },
-        );
-      }
-    }
+    db.exec(currentSchemaSql);
+    db.exec(SCHEMA_VERSION_DDL);
+    db.prepare(
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+    ).run(CURRENT_SCHEMA_VERSION, 'current_prelaunch_baseline', new Date().toISOString());
+    db.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
+    bootstrapRows();
     db.exec('COMMIT');
     transactionOpen = false;
-    mirrorUserVersion(db, targetVersion);
-  } catch (e) {
+  } catch (error) {
     if (transactionOpen) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // Preserve the original schema failure.
-      }
+      try { db.exec('ROLLBACK'); } catch { /* preserve the original failure */ }
     }
-    throw e;
+    throw error;
   }
-}
-
-function mirrorUserVersion(db: Database.Database, version: number): void {
-  try {
-    db.pragma(`user_version = ${version}`);
-  } catch {
-    // user_version is a cross-check, not the source of truth.
-  }
+  assertCurrentSchema(db);
 }

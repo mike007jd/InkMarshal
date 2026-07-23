@@ -25,6 +25,67 @@ afterAll(async () => {
 });
 
 describe('vault server actions', () => {
+  it('does not resurrect a deleted DB entry from stale vault markdown', async () => {
+    const {
+      createKnowledgeEntryWithIndex,
+      createNovel,
+      deleteKnowledgeEntry,
+      deleteNovelCascade,
+      getKnowledgeEntry,
+    } = await import('@/lib/db');
+    const { reconcileVaultChangedFiles } = await import('@/app/actions/vault');
+
+    const novel = await createNovel({ userId: 'local-user', title: 'Vault delete tombstone' });
+    const entryId = randomUUID();
+    const now = new Date().toISOString();
+    const relPath = `characters/${entryId}.md`;
+    const content = [
+      '---',
+      `id: ${entryId}`,
+      'type: character',
+      'title: Deleted Character',
+      `createdAt: ${Date.parse(now)}`,
+      `updatedAt: ${Date.parse(now)}`,
+      '---',
+      'This stale file must not restore the deleted row.',
+      '',
+    ].join('\n');
+    try {
+      await createKnowledgeEntryWithIndex({
+        id: entryId,
+        novelId: novel.id,
+        type: 'character',
+        title: 'Deleted Character',
+        summary: '',
+        data: '{}',
+        sortOrder: 0,
+        tags: '[]',
+        createdAt: now,
+        updatedAt: now,
+      }, {
+        id: entryId,
+        novelId: novel.id,
+        type: 'character',
+        path: relPath,
+        title: 'Deleted Character',
+        tags: '[]',
+        aliases: '[]',
+        importance: null,
+        data: '{}',
+        outgoingLinks: '[]',
+        contentHash: 'before-delete',
+        updatedAt: now,
+      });
+      await deleteKnowledgeEntry(entryId);
+
+      expect(await reconcileVaultChangedFiles(novel.id, [{ path: relPath, content }]))
+        .toEqual({ updated: 0, deleted: 1, skipped: 0 });
+      expect(await getKnowledgeEntry(entryId, novel.id)).toBeUndefined();
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('persists only bounded absolute vault paths', async () => {
     const { createNovel, deleteNovelCascade } = await import('@/lib/db');
     const { getNovelVault } = await import('@/lib/db/queries-vault');

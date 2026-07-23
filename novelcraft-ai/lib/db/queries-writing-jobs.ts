@@ -4,6 +4,8 @@
 // only advances progress without touching status. See lib/db/schema/0012_writing_jobs.ts.
 
 import { getDb } from '@/lib/db/connection';
+import { applyNovelUpdate } from '@/lib/db/queries-novel';
+import type { Novel } from '@/lib/db-types';
 import { nowIso } from '@/lib/utils';
 
 export type WritingJobStatus = 'running' | 'paused' | 'completed' | 'failed';
@@ -59,15 +61,18 @@ export function createWritingJob(novelId: string): WritingJob {
   const db = getDb();
   const now = nowIso();
   const id = crypto.randomUUID();
-  // Reclaim a crashed prior run (no terminal write reached). Idempotent.
-  db.prepare(
-    `UPDATE writing_jobs SET status='paused', end_reason='superseded', updated_at=?
-     WHERE novel_id=? AND status='running'`,
-  ).run(now, novelId);
-  db.prepare(
-    `INSERT INTO writing_jobs (id, novel_id, status, completed_in_run, seq, started_at, updated_at)
-     VALUES (?, ?, 'running', 0, 0, ?, ?)`,
-  ).run(id, novelId, now, now);
+  db.transaction(() => {
+    // Reclaim a crashed prior run and insert its successor atomically: a crash
+    // can leave the old job running or the new job running, never neither.
+    db.prepare(
+      `UPDATE writing_jobs SET status='paused', end_reason='superseded', updated_at=?
+       WHERE novel_id=? AND status='running'`,
+    ).run(now, novelId);
+    db.prepare(
+      `INSERT INTO writing_jobs (id, novel_id, status, completed_in_run, seq, started_at, updated_at)
+       VALUES (?, ?, 'running', 0, 0, ?, ?)`,
+    ).run(id, novelId, now, now);
+  })();
   return {
     id,
     novelId,
@@ -96,15 +101,32 @@ export function bumpWritingJobProgress(id: string, currentChapter: number, seq: 
 /** The single terminal write. */
 export function finalizeWritingJob(
   id: string,
+  novelId: string,
   status: Exclude<WritingJobStatus, 'running'>,
   endReason?: string | null,
   errorMessage?: string | null,
-): void {
-  getDb()
-    .prepare(
-      `UPDATE writing_jobs SET status=?, end_reason=?, error_message=?, updated_at=? WHERE id=?`,
-    )
-    .run(status, endReason ?? null, errorMessage ?? null, nowIso(), id);
+  novelUpdate: Partial<Novel> = {},
+  assistantMessage?: string,
+): Novel {
+  const db = getDb();
+  return db.transaction(() => {
+    const novel = applyNovelUpdate(db, novelId, novelUpdate);
+    if (!novel) throw new Error('Novel not found while finalizing writing job');
+    if (assistantMessage) {
+      db.prepare(
+        `INSERT INTO messages (id, novel_id, role, content, conversation_id, created_at)
+         VALUES (?, ?, 'assistant', ?, NULL, ?)`,
+      ).run(crypto.randomUUID(), novelId, assistantMessage, nowIso());
+    }
+    const info = db
+      .prepare(
+        `UPDATE writing_jobs SET status=?, end_reason=?, error_message=?, updated_at=?
+         WHERE id=? AND novel_id=? AND status='running'`,
+      )
+      .run(status, endReason ?? null, errorMessage ?? null, nowIso(), id, novelId);
+    if (info.changes !== 1) throw new Error('Writing job is missing or already terminal');
+    return novel;
+  })();
 }
 
 /** Most recent run for a novel (UI: "last run stopped because…"). */

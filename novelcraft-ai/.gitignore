@@ -34,9 +34,3 @@ src-tauri/engines/mlx-server/.build/
 .agents/
 .claude/skills/
 .vercel
-
-# Local Ralph run state.
-scripts/ralph/loop.json
-scripts/ralph/progress.txt
-scripts/ralph/.last-loop*
-scripts/ralph/archive/

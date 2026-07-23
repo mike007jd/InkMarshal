@@ -4,12 +4,17 @@
 // the DB from client code" convention into an enforced module boundary (Phase 2).
 import 'server-only';
 import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { nowIso } from '@/lib/utils';
 import { LOCAL_USER_ID, LOCAL_USER_EMAIL } from '@/lib/local-user';
 import { resolveLocalDbPath } from '@/lib/db-local-path';
-import { runMigrations, DatabaseFromNewerAppVersionError } from '@/lib/db/migrations';
+import {
+  assertCurrentSchema,
+  DatabaseFromNewerAppVersionError,
+  IncompatibleDatabaseSchemaError,
+  initializeCurrentSchema,
+} from '@/lib/db/migrations';
 import { seedPromptTemplates } from '@/lib/prompt-seed';
 
 let _db: Database.Database | null = null;
@@ -46,22 +51,37 @@ export function getDb(): Database.Database {
   let db: Database.Database | undefined;
   try {
     mkdirSync(path.dirname(dbPath), { recursive: true });
+    const hasExistingDatabase = existsSync(dbPath) && statSync(dbPath).size > 0;
+    if (hasExistingDatabase) {
+      const verifier = new Database(dbPath, { readonly: true, fileMustExist: true });
+      try {
+        assertCurrentSchema(verifier);
+      } finally {
+        verifier.close();
+      }
+    }
     db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
     db.pragma('synchronous = NORMAL');
     db.pragma('temp_store = MEMORY');
-    runMigrations(db);
-    seedLocalUser(db);
-    seedPromptTemplates(db);
+    if (!hasExistingDatabase) {
+      initializeCurrentSchema(db, () => {
+        seedLocalUser(db!);
+        seedPromptTemplates(db!);
+      });
+    }
   } catch (e) {
     db?.close();
     // Fail closed on a newer-than-supported database: surface the typed error
     // unchanged so the shell can tell the user to update rather than treating it
     // as a generic open failure. The handle is already closed — no read/write
     // touched the newer on-disk shape.
-    if (e instanceof DatabaseFromNewerAppVersionError) throw e;
+    if (
+      e instanceof DatabaseFromNewerAppVersionError ||
+      e instanceof IncompatibleDatabaseSchemaError
+    ) throw e;
     throw new Error(
       `InkMarshal: could not open local database at ${dbPath}: ${(e as Error).message}`,
       { cause: e },

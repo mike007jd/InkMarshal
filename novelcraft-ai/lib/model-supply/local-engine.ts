@@ -13,7 +13,7 @@ const LOCAL_ENGINE_CONNECTION_PREFIX = 'local-engine:';
  * its own connection row so the broker can route different capability roles
  * to different localhost ports without rows overwriting each other.
  *
- * The engineId is the Rust-side identity ("{fmt}:{path}" or "{fmt}:{path}#{label}");
+ * The engineId is the Rust-side escaped identity (`{fmt}:v2:{path}[#{label}]`);
  * prefixing with `local-engine:` keeps it visibly local in the connections list.
  */
 export function localEngineConnectionId(engineId: string): string {

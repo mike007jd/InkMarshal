@@ -30,20 +30,6 @@ export interface GenerateGreenlightArgs {
   promptVariant?: string;
 }
 
-const FALLBACK_TEMPLATE = `Based on the following conversation between the user and the AI novel producer, generate a comprehensive Writing Plan (Greenlight Pack).
-
-CONVERSATION:
-{{conversationText}}
-
-Current novel metadata:
-Title: {{title}}
-Genre: {{genre}}
-Story Direction: {{storySummary}}
-Characters: {{characterSummary}}
-Arc: {{arcSummary}}
-
-Extract and synthesize all story information from the conversation to produce the greenlight pack.`;
-
 
 export async function generateGreenlightPack(args: GenerateGreenlightArgs): Promise<{
   pack: GreenlightPack;
@@ -56,7 +42,7 @@ export async function generateGreenlightPack(args: GenerateGreenlightArgs): Prom
     .map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`)
     .join('\n\n');
 
-  const template = resolveTemplate('greenlight_pack', 'user', language, FALLBACK_TEMPLATE, variant);
+  const template = resolveTemplate('greenlight_pack', 'user', language, variant);
   const prompt = renderTemplate(template, {
     conversationText,
     title: novelContext.title ?? '',

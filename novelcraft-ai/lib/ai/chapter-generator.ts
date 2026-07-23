@@ -87,19 +87,6 @@ export function selectChapterPlansToWrite(
 
 // ── generateBookBlueprint ──────────────────────────────────────────────────
 
-const BLUEPRINT_FALLBACK = `You are a professional novelist. Based on this novel blueprint, create a full-book chapter-by-chapter outline.
-
-Novel details:
-Title: {{title}}
-Genre: {{genre}}
-Target length: approximately {{targetWords}} words
-Story: {{storySummary}}
-Characters: {{characterSummary}}
-Arc: {{arcSummary}}
-
-{{langNote}}
-Aim for {{chapterCount}} chapters covering the entire novel from opening hook through resolution. Each chapter should be self-contained but lead into the next. chapterNumber must start from 1 and increase sequentially. Respect any character/world facts provided in the system context — do not invent contradictions.`;
-
 export interface GenerateBookBlueprintArgs {
   model: LanguageModel;
   novelContext: {
@@ -131,7 +118,7 @@ export async function generateBookBlueprint(args: GenerateBookBlueprintArgs): Pr
   const targetWords = Number(novelContext.targetWords) || 80_000;
   const chapterCount = getTargetChapterCount(targetWords);
 
-  const template = tryResolveTemplate('book_blueprint', 'user', language, BLUEPRINT_FALLBACK, variant);
+  const template = tryResolveTemplate('book_blueprint', 'user', language, variant);
   const prompt = renderTemplate(template, {
     title: novelContext.title ?? '',
     genre: novelContext.genre ?? '',
@@ -169,22 +156,6 @@ export async function generateBookBlueprint(args: GenerateBookBlueprintArgs): Pr
 }
 
 // ── streamChapter ──────────────────────────────────────────────────────────
-
-const CHAPTER_WRITE_USER_FALLBACK = `You are writing Chapter {{chapterNumber}}: "{{title}}".
-
-Novel: {{novelTitle}} ({{genre}})
-Story context: {{storySummary}}
-Characters: {{characterSummary}}
-
-Chapter summary (what must happen): {{blueprintSummary}}
-
-{{memorySections}}
-
-{{langNote}}
-
-Write the full chapter now. Use vivid prose, natural dialogue, and strong scene-setting. Do NOT include the chapter title in the text — start directly with the narrative. Stay strictly consistent with character names, world facts, and recent events shown above.`;
-
-const CHAPTER_WRITE_SYSTEM_FALLBACK = 'You are a professional novelist.';
 
 export interface StreamChapterArgs {
   model: LanguageModel;
@@ -273,10 +244,10 @@ export function streamChapter(args: StreamChapterArgs) {
     );
   }
 
-  const sysTemplate = tryResolveTemplate('chapter_write', 'system', language, CHAPTER_WRITE_SYSTEM_FALLBACK, variant);
+  const sysTemplate = tryResolveTemplate('chapter_write', 'system', language, variant);
   const baseSystem = systemPrompt && systemPrompt.trim().length > 0 ? systemPrompt : sysTemplate;
 
-  const userTemplate = tryResolveTemplate('chapter_write', 'user', language, CHAPTER_WRITE_USER_FALLBACK, variant);
+  const userTemplate = tryResolveTemplate('chapter_write', 'user', language, variant);
   const prompt = renderTemplate(userTemplate, {
     chapterNumber: blueprint.chapterNumber,
     title: blueprint.title,
@@ -312,19 +283,6 @@ export function streamChapter(args: StreamChapterArgs) {
 }
 
 // ── streamChapterContinuation ──────────────────────────────────────────────
-
-const CONTINUATION_FALLBACK = `Chapter {{chapterNumber}}: "{{title}}" of "{{novelTitle}}" ({{genre}}).
-
-Chapter summary (what must happen): {{blueprintSummary}}
-
-The chapter so far:
----
-{{existingContent}}
----
-
-{{langNote}}
-
-Continue from exactly where the text above ends. Do NOT repeat or summarise what already happened — just write the next paragraphs. Keep the voice, POV, and facts identical. Do not include the chapter title.`;
 
 export interface ContinueChapterArgs {
   model: LanguageModel;
@@ -364,7 +322,7 @@ export function streamChapterContinuation(args: ContinueChapterArgs) {
     ? `用中文继续写，自然衔接已有结尾，预计再写 ${targetExtraWords} 字。`
     : `Continue in English, picking up seamlessly from the existing ending; aim for about ${targetExtraWords} more words.`;
 
-  const sysTemplate = tryResolveTemplate('chapter_write', 'system', language, CHAPTER_WRITE_SYSTEM_FALLBACK, variant);
+  const sysTemplate = tryResolveTemplate('chapter_write', 'system', language, variant);
   const baseSystem = systemPrompt && systemPrompt.trim().length > 0 ? systemPrompt : sysTemplate;
 
   // The continuation user prompt has its own stage, so a variant pack can tune
@@ -380,7 +338,7 @@ export function streamChapterContinuation(args: ContinueChapterArgs) {
       ? existingContent.slice(-CONTINUATION_CONTEXT_TAIL_CHARS)
       : existingContent;
 
-  const template = tryResolveTemplate('chapter_continuation', 'user', language, CONTINUATION_FALLBACK, continuationVariant);
+  const template = tryResolveTemplate('chapter_continuation', 'user', language, continuationVariant);
   const prompt = renderTemplate(template, {
     chapterNumber: blueprint.chapterNumber,
     title: blueprint.title,

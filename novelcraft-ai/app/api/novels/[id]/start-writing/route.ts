@@ -73,7 +73,13 @@ export async function POST(
     );
   }
 
-  const currentNovel = await getNovel(id);
+  let currentNovel: Awaited<ReturnType<typeof getNovel>>;
+  try {
+    currentNovel = await getNovel(id);
+  } catch (error) {
+    await releaseWritingLock(id, lock.token).catch(() => undefined);
+    throw error;
+  }
   if (!currentNovel || currentNovel.userId !== user.id) {
     await releaseWritingLock(id, lock.token).catch(() => undefined);
     return Response.json({ error: 'Novel not found' }, { status: 404 });
@@ -171,8 +177,16 @@ export async function POST(
   }
   const jobs: WritingJobPort = {
     bumpProgress: (chapter, seq) => bumpWritingJobProgress(job.id, chapter, seq),
-    finalize: (status, endReason, errorMessage) =>
-      finalizeWritingJob(job.id, status, endReason, errorMessage),
+    finalize: (status, endReason, errorMessage, novelUpdate, assistantMessage) =>
+      finalizeWritingJob(
+        job.id,
+        id,
+        status,
+        endReason,
+        errorMessage,
+        novelUpdate,
+        assistantMessage,
+      ),
   };
 
   const lifecycle = createAIStreamLifecycle(request.signal);

@@ -1,4 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/lib/db/queries-knowledge-vault', () => ({
+  getKnowledgeIndexById: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('@/lib/db/queries-vault', () => ({
+  getKnowledgeIndexRowByPath: vi.fn().mockResolvedValue(null),
+}));
 import {
   mergeSharedEntryForNovel,
   buildSharedProjectionInsert,

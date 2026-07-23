@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import { isTauriRuntime } from '@/lib/desktop-runtime';
+import { installDesktopUpdate } from '@/lib/desktop-update-install';
 import { isCriticalDesktopUpdate, updateProgressPercent } from '@/lib/desktop-updates';
 import {
   DESKTOP_UPDATE_MANUAL_CHECK_EVENT,
@@ -97,26 +98,26 @@ export function DesktopUpdateCoordinator() {
     downloadedRef.current = 0;
     totalBytesRef.current = undefined;
     try {
-      await update.downloadAndInstall(event => {
-        if (event.event === 'Started') {
-          totalBytesRef.current = event.data.contentLength;
-          setProgress(updateProgressPercent(0, event.data.contentLength));
-          return;
-        }
-        if (event.event === 'Progress') {
-          downloadedRef.current += event.data.chunkLength;
-          setProgress(updateProgressPercent(downloadedRef.current, totalBytesRef.current));
-          return;
-        }
-        if (event.event === 'Finished') setProgress(100);
-      });
-
-      // Installing can replace files while the current process is alive. Flush
-      // the editor and create a snapshot immediately before relaunch.
-      const save = await requestManuscriptFlush({ createSnapshot: true });
-      if (!save.ok) throw new Error(t.updateSaveFailed);
       const { relaunch } = await import('@tauri-apps/plugin-process');
-      await relaunch();
+      await installDesktopUpdate({
+        update,
+        flush: () => requestManuscriptFlush({ createSnapshot: true }),
+        relaunch,
+        saveFailedMessage: t.updateSaveFailed,
+        onDownloadEvent(event) {
+          if (event.event === 'Started') {
+            totalBytesRef.current = event.data.contentLength;
+            setProgress(updateProgressPercent(0, event.data.contentLength));
+            return;
+          }
+          if (event.event === 'Progress') {
+            downloadedRef.current += event.data.chunkLength;
+            setProgress(updateProgressPercent(downloadedRef.current, totalBytesRef.current));
+            return;
+          }
+          if (event.event === 'Finished') setProgress(100);
+        },
+      });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t.updateInstallFailed);
       setInstalling(false);

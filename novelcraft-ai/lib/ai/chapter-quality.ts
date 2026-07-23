@@ -22,19 +22,6 @@ import { countWords } from '@/lib/utils';
 
 // ── summarizeChapter ───────────────────────────────────────────────────────
 
-const SUMMARIZE_FALLBACK = `Summarise Chapter {{chapterNumber}} ("{{chapterTitle}}") below into a structured digest.
-
-Chapter prose:
----
-{{chapterContent}}
----
-
-The chapter was planned to cover: {{blueprintSummary}}
-
-{{langNote}}
-
-Produce a 200–400 word "summary" capturing what actually happened (not what was planned), and fill keyFacts with the named characters present, locations used, plot-relevant items, and 1–10 short bullets describing what advanced.`;
-
 export interface SummarizeChapterArgs {
   model: LanguageModel;
   chapterContent: string;
@@ -56,7 +43,7 @@ export async function summarizeChapter(args: SummarizeChapterArgs): Promise<{
     ? '用中文输出 summary 字段。keyFacts 中的角色/地点/物品也用中文记录。'
     : 'Write the summary in English; use English names in keyFacts when present.';
 
-  const template = tryResolveTemplate('chapter_summarize', 'user', language, SUMMARIZE_FALLBACK, promptVariant);
+  const template = tryResolveTemplate('chapter_summarize', 'user', language, promptVariant);
   const prompt = renderTemplate(template, {
     chapterNumber: blueprint.chapterNumber,
     chapterTitle,
@@ -142,23 +129,6 @@ ${joined}`;
 
 // ── validateChapter ────────────────────────────────────────────────────────
 
-const VALIDATE_FALLBACK = `Review the chapter below for cross-context consistency. Flag only real problems — no stylistic nitpicks.
-
-Chapter title: {{chapterTitle}}
-
-Chapter prose:
----
-{{chapterContent}}
----
-
-{{knowledgeSection}}
-{{previousFactsSection}}
-{{targetWordsSection}}
-
-{{langNote}}
-
-Categorise each issue: character_name (mismatched/misspelled), setting (world facts wrong), timeline (date/order wrong), pov (POV slipped), length (significantly under target), or other. Severity 'major' = breaks reader trust; 'minor' = small drift. overallScore 0–100 where 100 is flawless.`;
-
 export interface ValidateChapterArgs {
   model: LanguageModel;
   chapterContent: string;
@@ -182,7 +152,7 @@ export async function validateChapter(args: ValidateChapterArgs): Promise<{
     ? '问题描述请用中文。'
     : 'Describe issues in English.';
 
-  const template = tryResolveTemplate('chapter_validate', 'user', language, VALIDATE_FALLBACK, promptVariant);
+  const template = tryResolveTemplate('chapter_validate', 'user', language, promptVariant);
   const prompt = renderTemplate(template, {
     chapterTitle,
     chapterContent,
@@ -210,26 +180,6 @@ export async function validateChapter(args: ValidateChapterArgs): Promise<{
 }
 
 // ── reviseChapterForRalphLoop ─────────────────────────────────────────────
-
-const RALPH_REVISE_FALLBACK = `You are running a Ralph-style long-form writing loop: draft, check, repair, continue.
-
-Revise the chapter below so it passes the quality brief. Keep the same chapter, plot beats, POV, and prose intent. Make only the changes required to fix continuity, timeline, POV, setting, naming, or substantial length problems. Do not summarize. Do not add markdown. Return only the complete revised chapter prose.
-
-Novel: {{novelTitle}} ({{genre}})
-Chapter {{chapterNumber}}: {{chapterTitle}}
-
-Chapter plan:
-{{blueprintSummary}}
-
-Quality brief:
-{{revisionBrief}}
-
-Current chapter:
----
-{{chapterContent}}
----
-
-{{langNote}}`;
 
 export interface ReviseChapterForRalphLoopArgs {
   model: LanguageModel;
@@ -271,7 +221,7 @@ export async function reviseChapterForRalphLoop(args: ReviseChapterForRalphLoopA
   const langNote = isZhLocale(language)
     ? '请用中文输出完整修订后章节正文。'
     : 'Return the complete revised chapter in English.';
-  const template = tryResolveTemplate('chapter_ralph_revise', 'user', language, RALPH_REVISE_FALLBACK, variant);
+  const template = tryResolveTemplate('chapter_ralph_revise', 'user', language, variant);
   const prompt = renderTemplate(template, {
     novelTitle: novelContext.title ?? '',
     genre: novelContext.genre ?? '',
