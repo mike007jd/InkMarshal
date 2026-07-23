@@ -47,6 +47,8 @@
     "createUpdaterArtifacts": false,
     "targets": ["app"],
     "resources": {
+      "../../NOTICE": "NOTICE",
+      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "resources/next-server/": "next-server",
       "resources/node/": "node",
       "resources/engines/": "engines"

@@ -88,6 +88,7 @@ InkMarshal/
 - 上手：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 隐私与联网行为：[PRIVACY.md](PRIVACY.md)
 - 安全支持与私密报告：[SECURITY.md](SECURITY.md)
+- 第三方许可证与归属声明：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 - 应用脚本 / 维护者发布笔记：[novelcraft-ai/README.md](novelcraft-ai/README.md)
 - 系统框架：[spec/SYSTEM_FRAMEWORK.md](spec/SYSTEM_FRAMEWORK.md)
 - 已交付表面：[novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md](novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md)
