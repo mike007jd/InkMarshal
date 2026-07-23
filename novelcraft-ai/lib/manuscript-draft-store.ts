@@ -95,6 +95,11 @@ export function loadPersistedDrafts(novelId: string): PersistedDraftMap {
   return loadRecoveryEnvelope()[novelId] ?? {};
 }
 
+/** Explicit operator action: remove the complete recovery envelope without parsing it. */
+export function clearManuscriptRecovery(): Promise<boolean> {
+  return removeStoredSettingDurable(MANUSCRIPT_RECOVERY_SETTING_KEY);
+}
+
 export function persistDrafts(novelId: string, drafts: PersistedDraftMap): Promise<boolean> {
   const envelope = loadRecoveryEnvelope();
   const sanitized = parseDraftMap(drafts, novelId);

@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   buildPersistPayload,
+  clearManuscriptRecovery,
   CorruptManuscriptRecoveryError,
   loadPersistedDrafts,
   persistDrafts,
@@ -58,6 +59,13 @@ describe('durable manuscript recovery store', () => {
       '1': { content: 'replacement', version: 1, savedAt: 1 },
     })).toThrow(CorruptManuscriptRecoveryError);
     expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).toBe(raw);
+  });
+
+  it('explicitly clears corrupt recovery data without parsing or rewriting it', async () => {
+    localStorage.setItem('inkmarshal_manuscript_recovery_v1', '{"broken":');
+
+    await expect(clearManuscriptRecovery()).resolves.toBe(true);
+    expect(localStorage.getItem('inkmarshal_manuscript_recovery_v1')).toBeNull();
   });
 });
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import React from 'react';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -21,6 +21,11 @@ const readingProbe = vi.hoisted(() => ({
     onActiveChapterChange?: (n: number) => void;
     onChapterJump?: (n: number) => void;
   },
+}));
+
+const recoveryProbe = vi.hoisted(() => ({
+  raw: null as string | null,
+  remove: vi.fn(async (_key: string) => true),
 }));
 
 vi.mock('@/components/ManuscriptReadingView', async () => {
@@ -55,9 +60,14 @@ vi.mock('@/lib/desktop-runtime', () => ({
 
 vi.mock('@/lib/app-settings-client', () => ({
   onAppSettingsHydrated: () => () => {},
-  getStoredSetting: () => null,
+  getStoredSetting: () => recoveryProbe.raw,
   setStoredSetting: () => {},
   removeStoredSetting: () => {},
+  setStoredSettingDurable: vi.fn(async () => true),
+  removeStoredSettingDurable: (key: string) => {
+    recoveryProbe.raw = null;
+    return recoveryProbe.remove(key);
+  },
 }));
 
 function run(overrides: Partial<WritingRunState> = {}): WritingRunState {
@@ -176,6 +186,12 @@ function renderShell(props: {
 describe('ManuscriptShell compact writing-run status', () => {
   beforeEach(() => {
     readingProbe.props = null;
+    recoveryProbe.raw = null;
+    recoveryProbe.remove.mockClear();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: vi.fn(),
+    });
     vi.stubGlobal('matchMedia', vi.fn(() => ({
       matches: false,
       media: '',
@@ -288,11 +304,31 @@ describe('ManuscriptShell compact writing-run status', () => {
       expect(hint.closest('[role="status"]')).not.toBeNull();
     }
   });
+
+  it('keeps editing available when recovery data is corrupt and only resumes after explicit clear', async () => {
+    recoveryProbe.raw = '{"broken":';
+    renderShell({ mode: 'reading-review' });
+
+    expect((await screen.findByRole('alert')).textContent)
+      .toContain('Draft recovery data is damaged');
+    expect(screen.getByTestId('reading-view')).toBeTruthy();
+
+    fireEvent.click(screen.getAllByRole('radio', { name: 'Editing' })[0]);
+    expect(await screen.findByTestId('editing-view')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear recovery data' }));
+    await waitFor(() => {
+      expect(recoveryProbe.remove).toHaveBeenCalledWith('inkmarshal_manuscript_recovery_v1');
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  });
 });
 
 describe('ManuscriptShell chapter-selection routing', () => {
   beforeEach(() => {
     readingProbe.props = null;
+    recoveryProbe.raw = null;
+    recoveryProbe.remove.mockClear();
     vi.stubGlobal('matchMedia', vi.fn(() => ({
       matches: false,
       media: '',

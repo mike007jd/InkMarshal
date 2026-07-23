@@ -606,9 +606,8 @@ Stay on topic, ask one focused question at a time, summarize and reflect back th
   },
 
   // ── P11 chapter Ralph-revise (user) ────────────────────────────────────
-  // Self-repair step of the autonomous-writing loop. Mirrors the inline
-  // RALPH_REVISE_FALLBACK in lib/ai/chapter-quality.ts so the stage is
-  // DB-overridable like every other AI op.
+  // Self-repair step of the autonomous-writing loop. Stored in the DB so the
+  // stage is editable and versioned like every other AI operation.
   {
     id: 'pt_ralph_revise_user_en_1',
     stage: 'chapter_ralph_revise',

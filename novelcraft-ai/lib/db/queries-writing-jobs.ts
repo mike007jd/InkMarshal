@@ -1,7 +1,7 @@
 // Thin run-history queries for the autonomous writing flow (Phase 3). Server-only
 // (loads better-sqlite3 via getDb). There are exactly TWO status writes:
 // createWritingJob (entry) and finalizeWritingJob (terminal); bumpWritingJobProgress
-// only advances progress without touching status. See lib/db/schema/0012_writing_jobs.ts.
+// only advances progress without touching status. See lib/db/schema/0001_initial.ts.
 
 import { getDb } from '@/lib/db/connection';
 import { applyNovelUpdate } from '@/lib/db/queries-novel';

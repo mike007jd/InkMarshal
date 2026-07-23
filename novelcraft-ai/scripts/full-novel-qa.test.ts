@@ -7,7 +7,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 const NOVEL_ID = 'qa-full-novel-scale';
 const SETTINGS_KEY = 'inkmarshal_settings';
 const qaDataDir = process.env.FULL_NOVEL_QA_DATA_DIR?.trim();
-const exportDir = process.env.FULL_NOVEL_QA_EXPORT_DIR?.trim() || '/tmp/inkmarshal-live-qa/exports';
+const exportDir = process.env.FULL_NOVEL_QA_EXPORT_DIR?.trim()
+  || path.join(tmpdir(), 'inkmarshal-live-qa', 'exports');
 const requiresQaEnv = process.env.npm_lifecycle_event === 'qa:full-novel-coverage';
 
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;

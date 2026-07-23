@@ -67,11 +67,10 @@ export function getDb(): Database.Database {
     db.pragma('synchronous = NORMAL');
     db.pragma('temp_store = MEMORY');
     if (!hasExistingDatabase) {
-      initializeCurrentSchema(db, () => {
-        seedLocalUser(db!);
-        seedPromptTemplates(db!);
-      });
+      initializeCurrentSchema(db);
     }
+    seedLocalUser(db);
+    seedPromptTemplates(db);
   } catch (e) {
     db?.close();
     // Fail closed on a newer-than-supported database: surface the typed error

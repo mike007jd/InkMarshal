@@ -58,7 +58,7 @@ describe('current prelaunch schema baseline', () => {
       .toBeGreaterThan(0);
   });
 
-  it('opens a current-schema database without DDL or implicit seed writes', () => {
+  it('opens a current-schema database without DDL and idempotently provisions seed rows', () => {
     const setup = new Database(dbPath());
     initializeCurrentSchema(setup);
     setup.close();
@@ -66,8 +66,30 @@ describe('current prelaunch schema baseline', () => {
     const db = getDb();
     expect(() => assertCurrentSchema(db)).not.toThrow();
     expect(db.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 1 });
-    expect(db.prepare('SELECT COUNT(*) AS count FROM users').get()).toEqual({ count: 0 });
-    expect(db.prepare('SELECT COUNT(*) AS count FROM prompt_templates').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM users').get()).toEqual({ count: 1 });
+    expect((db.prepare('SELECT COUNT(*) AS count FROM prompt_templates').get() as { count: number }).count)
+      .toBeGreaterThan(0);
+  });
+
+  it('restores a missing seed row on reopen without overwriting an existing row', () => {
+    const first = getDb();
+    first.prepare('DELETE FROM prompt_templates WHERE id = ?').run('pt_unification_user_en_1');
+    first.prepare(
+      'UPDATE prompt_templates SET version = ?, template_text = ? WHERE id = ?',
+    ).run(42, 'CUSTOM KEEP', 'pt_unification_user_zhCN_1');
+    closeDbForTest();
+
+    const reopened = getDb();
+    expect(
+      reopened.prepare(
+        'SELECT version, template_text AS templateText FROM prompt_templates WHERE id = ?',
+      ).get('pt_unification_user_en_1'),
+    ).toMatchObject({ version: 1 });
+    expect(
+      reopened.prepare(
+        'SELECT version, template_text AS templateText FROM prompt_templates WHERE id = ?',
+      ).get('pt_unification_user_zhCN_1'),
+    ).toEqual({ version: 42, templateText: 'CUSTOM KEEP' });
   });
 
   it('leaves an incompatible nonempty database byte-identical and fails closed with reset guidance', () => {

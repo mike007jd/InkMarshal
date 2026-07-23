@@ -37,7 +37,7 @@ const WRITABLE_KEYS: ReadonlySet<string> = new Set<string>([
   ...APP_SETTINGS_CURRENT_ONLY_KEYS,
 ]);
 
-/** True for any key the API route is allowed to persist (config keys + sentinel). */
+/** True for any current config or recovery key the API route may persist. */
 export function isWritableAppSettingKey(key: string): boolean {
   return WRITABLE_KEYS.has(key);
 }

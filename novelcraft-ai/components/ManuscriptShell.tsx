@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ListTree } from 'lucide-react';
+import { AlertTriangle, ListTree } from 'lucide-react';
 import { countWords } from '@/lib/utils';
 import {
   isWritingRunBusyPhase,
@@ -23,6 +23,8 @@ import { onAppSettingsHydrated } from '@/lib/app-settings-client';
 import { isTauriRuntime } from '@/lib/desktop-runtime';
 import {
   buildPersistPayload,
+  clearManuscriptRecovery,
+  CorruptManuscriptRecoveryError,
   loadPersistedDrafts,
   persistDrafts,
   reconcilePersistedDrafts,
@@ -209,6 +211,9 @@ export function ManuscriptShell({
   const [draftContentByChapter, setDraftContentByChapter] = useState<Map<number, string>>(() => new Map());
   const draftContentRef = useRef(new Map<number, string>());
   const [draftStoreReady, setDraftStoreReady] = useState(() => !isTauriRuntime());
+  const [draftRecoveryDisabled, setDraftRecoveryDisabled] = useState(false);
+  const [draftRecoveryClearing, setDraftRecoveryClearing] = useState(false);
+  const draftRecoveryDisabledRef = useRef(false);
   // Live optimistic-concurrency base per dirty chapter, reported by the
   // editing view (more current than the chapter prop after a save round-trip).
   const draftVersionsRef = useRef(new Map<number, number>());
@@ -220,6 +225,16 @@ export function ManuscriptShell({
   const appliedRequestedChapterKeyRef = useRef<string | null>(null);
   const searchJumpSeqRef = useRef(0);
   const appliedRequestedSearchKeyRef = useRef<string | null>(null);
+
+  const disableCorruptDraftRecovery = useCallback((error: unknown): boolean => {
+    if (!(error instanceof CorruptManuscriptRecoveryError)) return false;
+    draftRecoveryDisabledRef.current = true;
+    queueMicrotask(() => {
+      setDraftRecoveryDisabled(true);
+      setDraftRestoreTarget(null);
+    });
+    return true;
+  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -310,7 +325,7 @@ export function ManuscriptShell({
       setSaveState('idle');
       setLastSavedAt(null);
       setDraftContentByChapter(new Map());
-      setDraftRestoreTarget(novelId);
+      setDraftRestoreTarget(draftRecoveryDisabledRef.current ? null : novelId);
     });
     return () => {
       cancelled = true;
@@ -360,26 +375,44 @@ export function ManuscriptShell({
   // The draft map is read through a ref so persistDraftMapNow stays stable
   // across keystrokes — otherwise the beforeunload listener below would be
   // removed and re-added on every edit.
+  const persistDraftPayload = useCallback((drafts: Parameters<typeof persistDrafts>[1]): Promise<boolean> => {
+    if (draftRecoveryDisabledRef.current || activeNovelRef.current !== novelId) {
+      return Promise.resolve(true);
+    }
+    try {
+      return persistDrafts(novelId, drafts);
+    } catch (error) {
+      if (disableCorruptDraftRecovery(error)) return Promise.resolve(false);
+      throw error;
+    }
+  }, [disableCorruptDraftRecovery, novelId]);
+
   const persistDraftMapNow = useCallback((): Promise<boolean> => {
-    if (activeNovelRef.current !== novelId) return Promise.resolve(true);
-    return persistDrafts(novelId, buildPersistPayload(
+    return persistDraftPayload(buildPersistPayload(
       draftContentRef.current,
       draftVersionsRef.current,
       combinedChaptersRef.current,
       Date.now(),
     ));
-  }, [novelId]);
+  }, [persistDraftPayload]);
 
   // draftContentByChapter is deliberately a dependency: every edit must
   // reset the debounce timer (that IS the debounce).
   useEffect(() => {
-    if (!draftStoreReady || draftRestoreTarget !== null || readOnly) return;
+    if (!draftStoreReady || draftRecoveryDisabled || draftRestoreTarget !== null || readOnly) return;
     const handle = setTimeout(() => { void persistDraftMapNow(); }, DRAFT_PERSIST_DEBOUNCE_MS);
     return () => clearTimeout(handle);
-  }, [persistDraftMapNow, draftContentByChapter, draftRestoreTarget, draftStoreReady, readOnly]);
+  }, [
+    persistDraftMapNow,
+    draftContentByChapter,
+    draftRecoveryDisabled,
+    draftRestoreTarget,
+    draftStoreReady,
+    readOnly,
+  ]);
 
   useEffect(() => {
-    if (!draftStoreReady || readOnly) return;
+    if (!draftStoreReady || draftRecoveryDisabled || readOnly) return;
     const flush = () => { void persistDraftMapNow(); };
     window.addEventListener('beforeunload', flush);
     window.addEventListener('pagehide', flush);
@@ -387,16 +420,28 @@ export function ManuscriptShell({
       window.removeEventListener('beforeunload', flush);
       window.removeEventListener('pagehide', flush);
     };
-  }, [draftStoreReady, persistDraftMapNow, readOnly]);
+  }, [draftRecoveryDisabled, draftStoreReady, persistDraftMapNow, readOnly]);
 
   // Restore persisted drafts once the chapter list for this novel is loaded.
   // Version-guarded: a draft is only restored when the chapter is still at
   // the version the draft was taken against, so a recovered draft can never
   // clobber newer DB content (see lib/manuscript-draft-store.ts).
   useEffect(() => {
-    if (!draftStoreReady || readOnly || draftRestoreTarget === null || draftRestoreTarget !== novelId) return;
+    if (
+      !draftStoreReady
+      || draftRecoveryDisabled
+      || readOnly
+      || draftRestoreTarget === null
+      || draftRestoreTarget !== novelId
+    ) return;
     if (chapters.length === 0 && liveChapter === null) return;
-    const stored = loadPersistedDrafts(novelId);
+    let stored;
+    try {
+      stored = loadPersistedDrafts(novelId);
+    } catch (error) {
+      if (disableCorruptDraftRecovery(error)) return;
+      throw error;
+    }
     const { restored, hadStaleEntries } = reconcilePersistedDrafts(stored, combinedChaptersRef.current);
     if (restored.size > 0) {
       setDraftContentByChapter(prev => {
@@ -409,7 +454,7 @@ export function ManuscriptShell({
       });
     }
     if (hadStaleEntries) {
-      void persistDrafts(novelId, buildPersistPayload(
+      void persistDraftPayload(buildPersistPayload(
         restored,
         draftVersionsRef.current,
         combinedChaptersRef.current,
@@ -417,7 +462,30 @@ export function ManuscriptShell({
       ));
     }
     setDraftRestoreTarget(null);
-  }, [draftRestoreTarget, draftStoreReady, novelId, chapters, liveChapter, readOnly]);
+  }, [
+    chapters,
+    disableCorruptDraftRecovery,
+    draftRecoveryDisabled,
+    draftRestoreTarget,
+    draftStoreReady,
+    liveChapter,
+    novelId,
+    persistDraftPayload,
+    readOnly,
+  ]);
+
+  const handleClearDraftRecovery = useCallback(async () => {
+    setDraftRecoveryClearing(true);
+    try {
+      const cleared = await clearManuscriptRecovery();
+      if (!cleared) return;
+      draftRecoveryDisabledRef.current = false;
+      setDraftRecoveryDisabled(false);
+      setDraftRestoreTarget(novelId);
+    } finally {
+      setDraftRecoveryClearing(false);
+    }
+  }, [novelId]);
 
   /** Add wordCount for sidebar */
   const sidebarChapters = useMemo(() =>
@@ -580,6 +648,28 @@ export function ManuscriptShell({
           </div>
         </div>
       </div>
+
+      {draftRecoveryDisabled && !readOnly && (
+        <div
+          role="alert"
+          className="mb-2 flex shrink-0 items-center gap-3 rounded-md border border-book-warning-border bg-book-warning-light px-3 py-2 text-xs text-book-warning"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+          <p className="min-w-0 flex-1">{t.manuscriptRecoveryCorrupt}</p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={draftRecoveryClearing}
+            onClick={() => { void handleClearDraftRecovery(); }}
+          >
+            {draftRecoveryClearing
+              ? t.manuscriptRecoveryClearing
+              : t.manuscriptRecoveryClear}
+          </Button>
+        </div>
+      )}
 
       <Sheet open={mobileChaptersOpen} onOpenChange={setMobileChaptersOpen}>
         <SheetContent aria-describedby={undefined} side="right" className="flex w-[20rem] max-w-[88vw] flex-col gap-0 border-book-border bg-book-bg-primary p-0 lg:hidden">
