@@ -85,8 +85,12 @@ function run(command, args, options = {}) {
   }
 }
 
+function runCaptureResult(command, args, options = {}) {
+  return spawnSync(command, args, { encoding: 'utf8', shell: false, ...options });
+}
+
 function runCapture(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', shell: false, ...options });
+  const result = runCaptureResult(command, args, options);
   const output = commandOutput(result);
   if (result.status !== 0) {
     throw new Error(`${command} ${redactedCommandArgs(args).join(' ')} failed${output ? `: ${output}` : ''}`);
@@ -134,10 +138,7 @@ function stopRunningInkMarshal() {
 function detachDmgMount(mountPoint) {
   let lastOutput = '';
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const result = spawnSync('hdiutil', ['detach', mountPoint], {
-      encoding: 'utf8',
-      shell: false,
-    });
+    const result = runCaptureResult('hdiutil', ['detach', mountPoint]);
     if (result.status === 0) return;
     lastOutput = commandOutput(result);
     if (!/Resource busy/i.test(lastOutput)) {
