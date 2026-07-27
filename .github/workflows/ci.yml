@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The maintainability ratchet compares source with HEAD^.
+          fetch-depth: 2
       - uses: pnpm/action-setup@v6
         with:
           version: 10.15.1
@@ -46,6 +48,7 @@ jobs:
         run: |
           pnpm lint
           pnpm typecheck
+          pnpm check:maintainability
           pnpm test
           pnpm verify:security
           pnpm build
