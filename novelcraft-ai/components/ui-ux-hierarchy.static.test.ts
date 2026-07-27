@@ -49,10 +49,10 @@ describe('UI/UX hierarchy contracts', () => {
   });
 
   it('keeps responsive drawers keyboard-safe and closes them on wide resize', () => {
-    const workspace = source('components/NovelWorkspace.tsx');
+    const agentWorkspace = source('components/novel-workspace/AgentWorkspacePane.tsx');
     const manuscript = source('components/ManuscriptShell.tsx');
     const sidebar = source('components/ManuscriptSidebar.tsx');
-    expect(workspace).toContain("window.matchMedia('(min-width: 1024px)')");
+    expect(agentWorkspace).toContain("window.matchMedia('(min-width: 1024px)')");
     expect(manuscript).toContain("window.matchMedia('(min-width: 1024px)')");
     expect(manuscript).toContain('aria-label={t.manuscriptChapters}');
     expect(sidebar).toContain('variant="unstyled"');

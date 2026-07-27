@@ -72,6 +72,7 @@ vi.mock('@/lib/app-settings-client', () => ({
 
 function run(overrides: Partial<WritingRunState> = {}): WritingRunState {
   return {
+    runId: 1,
     phase: 'planning',
     statusLabel: 'Planning chapter blueprint',
     liveWordCount: 0,
@@ -146,6 +147,7 @@ const shellChapters: ManuscriptChapter[] = [
 
 function liveRun(overrides: Partial<WritingRunState> = {}): WritingRunState {
   return {
+    runId: 1,
     phase: 'drafting',
     statusLabel: 'Drafting chapter',
     modelLabel: 'Qwen3.5 9B',

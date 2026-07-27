@@ -19,6 +19,7 @@ const NOW = Date.parse('2026-07-21T12:00:00.000Z');
 
 function activeRun(overrides: Partial<WritingRunState> = {}): WritingRunState {
   return {
+    runId: 1,
     phase: 'drafting',
     statusLabel: 'Drafting chapter',
     modelLabel: 'Qwen3.5 9B',

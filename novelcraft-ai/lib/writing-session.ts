@@ -8,6 +8,10 @@ import {
   createChunkBatcher,
 } from '@/lib/streaming-client';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
+import {
+  IDLE_WRITING_RUN_STATE,
+  type WritingRunState,
+} from '@/lib/writing/writing-run-reducer';
 
 export interface LiveWritingChapter {
   id: string;
@@ -24,6 +28,8 @@ export interface WritingSessionCopy {
 }
 
 export type { WritingPhase };
+export { IDLE_WRITING_RUN_STATE };
+export type { WritingRunState };
 
 export function isWritingRunBusyPhase(phase: 'idle' | WritingPhase): boolean {
   return phase === 'preparing'
@@ -33,55 +39,55 @@ export function isWritingRunBusyPhase(phase: 'idle' | WritingPhase): boolean {
     || phase === 'chapter_complete';
 }
 
-export interface WritingRunState {
-  phase: 'idle' | WritingPhase;
-  statusLabel: string;
-  modelLabel?: string;
-  chapterNumber?: number;
-  chapterTitle?: string;
-  liveWordCount: number;
-  completedChapters: number;
-  totalChapters?: number;
-  progress: number;
-  startedAt?: string;
-  lastActivityAt?: string;
-  error?: string;
-}
-
-export const IDLE_WRITING_RUN_STATE: WritingRunState = {
-  phase: 'idle',
-  statusLabel: '',
-  liveWordCount: 0,
-  completedChapters: 0,
-  progress: 0,
-};
-
-export interface BatchDonePayload {
-  /** Next un-written chapter, or null when the whole book is done. */
-  nextChapter: number | null;
-  /** Chapters left in the blueprint after this batch. */
-  remaining: number;
-  completedChapters: number;
-  totalChapters: number;
-}
+export type WritingSessionRunEvent =
+  | { type: 'activity-received'; at: string }
+  | {
+      type: 'phase-received';
+      phase: WritingPhase;
+      statusLabel: string;
+      progress?: number;
+      chapterNumber?: number;
+      chapterTitle?: string;
+      completedChapters?: number;
+      totalChapters?: number;
+      at: string;
+    }
+  | { type: 'progress-received'; statusLabel: string; progress?: number; at: string }
+  | { type: 'blueprint-received'; totalChapters?: number; at: string }
+  | {
+      type: 'chapter-started';
+      chapterNumber: number;
+      chapterTitle?: string;
+      at: string;
+    }
+  | {
+      type: 'chapter-completed';
+      progress?: number;
+      completedChapters?: number;
+      totalChapters?: number;
+      wordCount: number;
+      at: string;
+    }
+  | {
+      type: 'batch-completed';
+      statusLabel: string;
+      nextChapter: number | null;
+      remaining: number;
+      completedChapters: number;
+      totalChapters: number;
+      at: string;
+    }
+  | { type: 'completed'; statusLabel: string; at: string }
+  | { type: 'failed'; statusLabel: string; error: string; at: string };
 
 export interface WritingSessionHandlers {
-  setStatusLabel(label: string): void;
   patchNovel(patch: Partial<Novel>): void;
   replaceNovel(novel: Novel): void;
   appendLiveChapter(chunk: string): void;
   setLiveChapter(chapter: LiveWritingChapter | null): void;
   upsertChapter(chapter: Chapter): void;
   refreshChapters(): Promise<void>;
-  onDone(): void;
-  onError(message: string): void;
-  updateRunState?(patch: Partial<WritingRunState>): void;
-  /** Optional: fires when the server completes a chapter batch (chaptersLimit /
-   *  untilChapter reached) but the whole book is not yet done. */
-  onBatchDone?(payload: BatchDonePayload): void;
-  /** Optional: fires when writing was abruptly stopped (abort, error) mid-
-   *  chapter so the client can persist the half-written `liveChapter`. */
-  onPartialChapter?(chapter: LiveWritingChapter): void;
+  onRunEvent(event: WritingSessionRunEvent): void;
 }
 
 export const WRITING_SESSION_OPERATIONS = ['outline', 'chapter', 'summarize', 'validate', 'polish'] as const;
@@ -140,8 +146,9 @@ export async function applyWritingSessionEvent(
 
   switch (type) {
     case 'heartbeat':
-      handlers.updateRunState?.({
-        lastActivityAt: text(event.at) ?? new Date().toISOString(),
+      handlers.onRunEvent({
+        type: 'activity-received',
+        at: text(event.at) ?? new Date().toISOString(),
       });
       return true;
 
@@ -149,8 +156,8 @@ export async function applyWritingSessionEvent(
       const phase = text(event.phase) as WritingPhase | null;
       if (!phase) return false;
       const statusLabel = text(event.message) ?? copy.writingLabel;
-      handlers.setStatusLabel(statusLabel);
-      handlers.updateRunState?.({
+      handlers.onRunEvent({
+        type: 'phase-received',
         phase,
         statusLabel,
         ...(numberValue(event.progress) == null ? {} : { progress: numberValue(event.progress)! }),
@@ -158,24 +165,23 @@ export async function applyWritingSessionEvent(
         ...(text(event.chapterTitle) == null ? {} : { chapterTitle: text(event.chapterTitle)! }),
         ...(numberValue(event.completedChapters) == null ? {} : { completedChapters: numberValue(event.completedChapters)! }),
         ...(numberValue(event.totalChapters) == null ? {} : { totalChapters: numberValue(event.totalChapters)! }),
-        lastActivityAt: new Date().toISOString(),
-        ...(phase === 'failed' ? { error: statusLabel } : { error: undefined }),
+        at: new Date().toISOString(),
       });
       return true;
     }
 
     case 'progress': {
       batcher.flush();
-      handlers.setStatusLabel(text(event.message) ?? copy.writingLabel);
       const progress = numberValue(event.progress);
       handlers.patchNovel({
         ...(progress == null ? {} : { progress }),
         stage: 'autonomous_writing',
       });
-      handlers.updateRunState?.({
+      handlers.onRunEvent({
+        type: 'progress-received',
         statusLabel: text(event.message) ?? copy.writingLabel,
         ...(progress == null ? {} : { progress }),
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       return true;
     }
@@ -183,9 +189,10 @@ export async function applyWritingSessionEvent(
     case 'blueprint': {
       batcher.flush();
       handlers.patchNovel({ blueprint: event.blueprint as Novel['blueprint'] });
-      handlers.updateRunState?.({
+      handlers.onRunEvent({
+        type: 'blueprint-received',
         totalChapters: numberValue(event.total) ?? undefined,
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       return true;
     }
@@ -199,11 +206,11 @@ export async function applyWritingSessionEvent(
         title: text(event.title) ?? `Chapter ${String(chapterNumber).padStart(2, '0')}`,
         content: '',
       });
-      handlers.updateRunState?.({
-        phase: 'drafting',
+      handlers.onRunEvent({
+        type: 'chapter-started',
         chapterNumber,
         chapterTitle: text(event.title) ?? undefined,
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       batcher.enqueue(text(event.chunk) ?? '');
       return true;
@@ -219,13 +226,13 @@ export async function applyWritingSessionEvent(
       handlers.setLiveChapter(null);
       const chapter = chapterFromWritingDoneEvent(event, novelId);
       if (chapter) handlers.upsertChapter(chapter);
-      handlers.updateRunState?.({
-        phase: 'chapter_complete',
+      handlers.onRunEvent({
+        type: 'chapter-completed',
         ...(progress == null ? {} : { progress }),
         ...(numberValue(event.completedChapters) == null ? {} : { completedChapters: numberValue(event.completedChapters)! }),
         ...(numberValue(event.totalChapters) == null ? {} : { totalChapters: numberValue(event.totalChapters)! }),
-        liveWordCount: numberValue(event.wordCount) ?? 0,
-        lastActivityAt: new Date().toISOString(),
+        wordCount: numberValue(event.wordCount) ?? 0,
+        at: new Date().toISOString(),
       });
       return true;
     }
@@ -233,23 +240,18 @@ export async function applyWritingSessionEvent(
     case 'batch_done': {
       batcher.cancel();
       handlers.setLiveChapter(null);
-      handlers.setStatusLabel(copy.readingLabel);
       const nextChapter = numberValue(event.nextChapter);
       const remaining = numberValue(event.remaining) ?? 0;
       const completedChapters = numberValue(event.completedChapters) ?? 0;
       const totalChapters = numberValue(event.totalChapters) ?? 0;
-      handlers.onBatchDone?.({
+      handlers.onRunEvent({
+        type: 'batch-completed',
+        statusLabel: copy.readingLabel,
         nextChapter,
         remaining,
         completedChapters,
         totalChapters,
-      });
-      handlers.updateRunState?.({
-        phase: 'paused',
-        statusLabel: copy.readingLabel,
-        completedChapters,
-        totalChapters,
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       await handlers.refreshChapters();
       return true;
@@ -259,13 +261,10 @@ export async function applyWritingSessionEvent(
       batcher.cancel();
       handlers.setLiveChapter(null);
       if (event.novel) handlers.replaceNovel(event.novel as Novel);
-      handlers.setStatusLabel(copy.readingLabel);
-      handlers.onDone();
-      handlers.updateRunState?.({
-        phase: 'complete',
+      handlers.onRunEvent({
+        type: 'completed',
         statusLabel: text(event.message) ?? copy.readingLabel,
-        progress: 100,
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       await handlers.refreshChapters();
       return true;
@@ -273,17 +272,15 @@ export async function applyWritingSessionEvent(
 
     case 'error': {
       batcher.cancel();
-      handlers.setLiveChapter(null);
       // The unified error frame key is `error` (lib/streaming-helpers). The old
       // `message` fallback was dead — client and server ship together in the same
       // desktop bundle, so there is no rolling-release skew to read across.
       const error = text(event.error) ?? copy.errorLabel;
-      handlers.onError(error);
-      handlers.updateRunState?.({
-        phase: 'failed',
+      handlers.onRunEvent({
+        type: 'failed',
         statusLabel: error,
         error,
-        lastActivityAt: new Date().toISOString(),
+        at: new Date().toISOString(),
       });
       await Promise.allSettled([handlers.refreshChapters()]);
       return true;
@@ -341,36 +338,7 @@ export async function startWritingSession(args: {
     throw new Error(text(err.error) ?? `HTTP ${response.status}`);
   }
 
-  let liveChapter: LiveWritingChapter | null = null;
-  let partialEmitted = false;
-  const emitPartialChapter = () => {
-    if (partialEmitted || !liveChapter?.content) return;
-    partialEmitted = true;
-    handlers.onPartialChapter?.(liveChapter);
-  };
-  const trackedHandlers: WritingSessionHandlers = {
-    ...handlers,
-    appendLiveChapter(chunk) {
-      if (liveChapter) liveChapter = { ...liveChapter, content: liveChapter.content + chunk };
-      handlers.appendLiveChapter(chunk);
-    },
-    setLiveChapter(chapter) {
-      if (chapter) {
-        liveChapter = liveChapter ?? { ...chapter };
-        partialEmitted = false;
-      } else {
-        liveChapter = null;
-      }
-      handlers.setLiveChapter(chapter);
-    },
-    upsertChapter(chapter) {
-      liveChapter = null;
-      partialEmitted = false;
-      handlers.upsertChapter(chapter);
-    },
-  };
-
-  const batcher = createChunkBatcher(trackedHandlers.appendLiveChapter);
+  const batcher = createChunkBatcher(handlers.appendLiveChapter);
   let terminalFrameSeen = false;
   try {
     await consumeNdjsonStream(
@@ -379,13 +347,12 @@ export async function startWritingSession(args: {
         async onEvent(event) {
           if (event.type === 'error') {
             batcher.flush();
-            emitPartialChapter();
           }
           const handled = await applyWritingSessionEvent(event, {
             novelId,
             copy,
             batcher,
-            handlers: trackedHandlers,
+            handlers,
           });
           if (
             handled &&
@@ -410,6 +377,5 @@ export async function startWritingSession(args: {
     }
   } finally {
     batcher.flush();
-    emitPartialChapter();
   }
 }

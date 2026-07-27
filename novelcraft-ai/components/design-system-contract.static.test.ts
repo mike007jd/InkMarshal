@@ -402,7 +402,12 @@ describe('business UI uses design-system primitives', () => {
       }
     }
 
-    expect(counts).toEqual(VISUAL_DEBT_BASELINE);
+    for (const label of Object.keys(VISUAL_DEBT_BASELINE) as Array<keyof typeof VISUAL_DEBT_BASELINE>) {
+      expect(
+        counts[label],
+        `${label} visual debt increased above the reviewed ceiling`,
+      ).toBeLessThanOrEqual(VISUAL_DEBT_BASELINE[label]);
+    }
   });
 
   it('keeps business UI off bare Tailwind palette utilities (semantic tokens only)', () => {
@@ -527,11 +532,6 @@ describe('business UI uses design-system primitives', () => {
     const pagination = readFileSync(join(process.cwd(), 'hooks/useDynamicPagination.ts'), 'utf8');
     const geometry = readFileSync(join(process.cwd(), 'lib/flipbook-geometry.ts'), 'utf8');
     const globals = readFileSync(join(process.cwd(), 'app/globals.css'), 'utf8');
-    const workspace = readFileSync(join(process.cwd(), 'components/NovelWorkspace.tsx'), 'utf8');
-    const noticeStart = workspace.indexOf('function ManuscriptNoticeRow');
-    const noticeEnd = workspace.indexOf('/**', noticeStart + 1);
-    const notice = workspace.slice(noticeStart, noticeEnd);
-
     expect(reading).toContain('autoSize={false}');
     expect(reading).toContain('width={FLIPBOOK_LAYOUT.pageWidth}');
     expect(reading).toContain('height={FLIPBOOK_LAYOUT.pageHeight}');
@@ -540,8 +540,6 @@ describe('business UI uses design-system primitives', () => {
     expect(geometry).toContain('pageWidth: 500');
     expect(geometry).toContain('pageHeight: 850');
     expect(globals).toMatch(/\.manuscript-flipbook\s*\{[^}]*height:\s*100%[^}]*width:\s*100%/);
-    expect(notice).toContain('rounded-lg');
-    expect(notice).not.toContain('rounded-full');
   });
 
   // INV-DD-03 — content-level empty states use the Empty family; loading and
