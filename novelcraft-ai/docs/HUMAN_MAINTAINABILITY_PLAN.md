@@ -123,7 +123,8 @@ Rendered behavior, accessibility, reducer transitions, and persisted outcomes ar
 
 - fails if a known hotspot grows above its current reviewed ceiling;
 - allows every reduction without editing a baseline;
-- fails when an unregistered source file exceeds its category budget;
+- rejects a new oversized source file and rejects growth in an already-oversized legacy file;
+- compares against `HEAD^`, while explicit named hotspots also have fixed reviewed ceilings;
 - prints the intended next extraction boundary beside each remaining hotspot.
 
 This prevents another AI pass from "solving" a local request by adding 150 lines to an already overloaded module.
