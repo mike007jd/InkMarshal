@@ -1,0 +1,67 @@
+{
+  "$schemaVersion": 1,
+  "roots": [
+    "app",
+    "components",
+    "hooks",
+    "lib",
+    "scripts",
+    "src-tauri/src"
+  ],
+  "extensions": [
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".rs",
+    ".ts",
+    ".tsx"
+  ],
+  "ignore": [
+    "**/*.d.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "components/ui/**",
+    "scripts/generate-third-party-notices.mjs"
+  ],
+  "limits": {
+    "route": 350,
+    "hook": 500,
+    "react": 650,
+    "rust": 800,
+    "script": 1000,
+    "source": 700,
+    "test": 900
+  },
+  "hotspots": {
+    "components/NovelWorkspace.tsx": {
+      "category": "react",
+      "ceilingLines": 1086,
+      "targetLines": 400,
+      "reason": "Owns URL/view synchronization, Story Deck coverage, conversation selection, export, desktop events, and all three workspace modes.",
+      "nextBoundary": "Extract workspace navigation/export controllers, then split AgentMode, StoryDeckMode, and manuscript pane ownership."
+    },
+    "lib/use-manuscript-session.ts": {
+      "category": "hook",
+      "ceilingLines": 750,
+      "targetLines": 350,
+      "reason": "Combines durable reconciliation, run ownership, pause/resume, transport cancellation, timers, and presentation state.",
+      "nextBoundary": "Introduce an explicit writing-run reducer and move durable job reconciliation into a separate hook."
+    },
+    "lib/writing/start-writing-usecase.ts": {
+      "category": "source",
+      "ceilingLines": 801,
+      "targetLines": 400,
+      "reason": "Owns blueprint preparation, batch iteration, per-chapter dependency construction, digest updates, and terminal settlement.",
+      "nextBoundary": "Extract prepareWritingRun, createWriteChapterDeps, writeChapterBatch, and settleWritingRun without changing terminal ordering."
+    },
+    "components/design-system-contract.static.test.ts": {
+      "category": "test",
+      "ceilingLines": 610,
+      "targetLines": 300,
+      "reason": "Source-text assertions couple harmless refactors to exact imports, class strings, counts, and function placement.",
+      "nextBoundary": "Keep a small lint-style contract layer; move behavior and accessibility assertions to rendered tests."
+    }
+  }
+}
