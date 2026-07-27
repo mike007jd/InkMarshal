@@ -254,6 +254,162 @@ describe('manuscript session transport integration', () => {
 
     expect(result.current.writingRunState.phase).toBe('complete');
   });
+
+  it('ignores a stale paused settlement after a newer run completes', async () => {
+    stubManuscriptFetch(fetchMock);
+    let settleRun1!: (error: unknown) => void;
+    writingSessionMock.startWritingSession
+      .mockImplementationOnce(async (args) => {
+        const { signal, handlers } = args as {
+          signal?: AbortSignal;
+          handlers: WritingSessionHandlers;
+        };
+        handlers.setLiveChapter({
+          id: 'live-1',
+          chapterNumber: 1,
+          title: 'One',
+          content: '',
+        });
+        handlers.appendLiveChapter('run1 stale');
+        await new Promise<void>((_resolve, reject) => {
+          settleRun1 = (error: unknown) => {
+            reject(error);
+          };
+          signal?.addEventListener('abort', () => {
+            // Pause clears active immediately; keep run1 unsettled until
+            // after run2 finishes so the late paused outcome is stale.
+          }, { once: true });
+        });
+      })
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-2',
+          chapterNumber: 2,
+          title: 'Two',
+          content: '',
+        });
+        handlers.appendLiveChapter('run2 final prose');
+        handlers.onRunEvent({
+          type: 'completed',
+          statusLabel: 'Complete',
+          at: '2026-07-27T00:00:02.000Z',
+        });
+      });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let run1Promise!: Promise<void>;
+    act(() => {
+      run1Promise = result.current.startWriting();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.pauseWriting();
+    });
+
+    let run2Promise!: Promise<void>;
+    await act(async () => {
+      run2Promise = result.current.startWriting();
+      await run2Promise;
+    });
+
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+    const run2LiveChapter = result.current.liveChapter;
+    const run2Phase = result.current.writingRunState.phase;
+
+    await act(async () => {
+      settleRun1(new DOMException('Paused', 'AbortError'));
+      await run1Promise;
+    });
+
+    expect(result.current.liveChapter).toEqual(run2LiveChapter);
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe(run2Phase);
+    expect(result.current.writingRunState.phase).toBe('complete');
+    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a failed run after its late refresh is superseded by Retry', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-1',
+          chapterNumber: 1,
+          title: 'One',
+          content: '',
+        });
+        handlers.appendLiveChapter('run1 failed prose');
+        handlers.onRunEvent({
+          type: 'failed',
+          statusLabel: 'Run 1 failed',
+          error: 'Run 1 failed',
+          at: '2026-07-27T00:00:01.000Z',
+        });
+        throw new Error('Run 1 failed');
+      })
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-2',
+          chapterNumber: 2,
+          title: 'Two',
+          content: '',
+        });
+        handlers.appendLiveChapter('run2 final prose');
+        handlers.onRunEvent({
+          type: 'completed',
+          statusLabel: 'Complete',
+          at: '2026-07-27T00:00:02.000Z',
+        });
+      });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let resolveFailedNovel!: (value: Response) => void;
+    let resolveFailedChapters!: (value: Response) => void;
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(resolve => {
+        resolveFailedNovel = resolve;
+      }))
+      .mockImplementationOnce(() => new Promise<Response>(resolve => {
+        resolveFailedChapters = resolve;
+      }));
+
+    let run1Promise!: Promise<void>;
+    act(() => {
+      run1Promise = result.current.startWriting();
+    });
+    await flushSessionEffects();
+    expect(result.current.writingRunState.phase).toBe('failed');
+
+    await act(async () => {
+      await result.current.startWriting();
+    });
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+
+    await act(async () => {
+      resolveFailedNovel(response(midWritingNovel()));
+      resolveFailedChapters(response([{ id: 'chapter-1', chapterNumber: 1 }]));
+      await run1Promise;
+    });
+
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('manuscript session pure boundaries', () => {

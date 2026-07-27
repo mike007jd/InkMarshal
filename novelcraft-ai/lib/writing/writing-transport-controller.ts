@@ -76,6 +76,10 @@ export class WritingTransportController {
     return this.active !== null;
   }
 
+  isLatestRun(runId: number): boolean {
+    return this.latestRunId === runId;
+  }
+
   async start(
     input: WritingTransportStart,
     callbacks: WritingTransportCallbacks,
@@ -142,8 +146,22 @@ export class WritingTransportController {
           },
           setLiveChapter: chapter => {
             if (isActive()) {
-              run.liveChapter = chapter ? { ...chapter } : null;
-              callbacks.setLiveChapter(chapter);
+              // Null is an explicit clear (chapter_done / batch_done / done).
+              // Non-null frames re-initialize only once per chapter so a
+              // per-chunk writing frame cannot wipe prose already appended
+              // after an earlier batcher drain.
+              if (chapter === null) {
+                run.liveChapter = null;
+                callbacks.setLiveChapter(null);
+                return;
+              }
+              if (
+                !run.liveChapter
+                || run.liveChapter.chapterNumber !== chapter.chapterNumber
+              ) {
+                run.liveChapter = { ...chapter };
+                callbacks.setLiveChapter(run.liveChapter);
+              }
               return;
             }
             if (!canApplyPausedProse() || !chapter) return;

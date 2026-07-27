@@ -76,10 +76,15 @@ export async function executeWritingChapterBatch(args: {
   let abortedReason: StartWritingEndReason = 'unknown';
   let errorMessage: string | null = null;
   let seq = 0;
-  const digestParams = adaptiveDigestParams(
-    novel.targetWords || 80_000,
-    Math.max(1, blueprint.chapters.length),
-  );
+  let digestParams;
+  try {
+    digestParams = adaptiveDigestParams(
+      novel.targetWords || 80_000,
+      Math.max(1, blueprint.chapters.length),
+    );
+  } catch {
+    digestParams = { recentWindow: 2, tailCharsPerChapter: 1500, maxBatchChars: 80_000 };
+  }
   const digestSources: RollingDigestSource[] = blueprint.chapters
     .map(plan => existingByNumber.get(plan.chapterNumber))
     .filter((chapter): chapter is Chapter => chapter !== undefined)
@@ -91,7 +96,7 @@ export async function executeWritingChapterBatch(args: {
       summaryStale: chapter.generationMeta?.summaryStale === true,
       keyFacts: chapter.keyFacts ?? null,
     }));
-  let volumeSummaries = await getVolumeSummaries(novelId);
+  let volumeSummaries = await getVolumeSummaries(novelId).catch(() => []);
 
   for (let index = 0; index < blueprint.chapters.length; index += 1) {
     if (sink.isClosed() || lifecycle.signal.aborted) {

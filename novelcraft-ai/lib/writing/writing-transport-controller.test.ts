@@ -1,8 +1,29 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { WritingSessionHandlers } from '@/lib/writing-session';
+import { createChunkBatcher } from '@/lib/streaming-client';
+import {
+  applyWritingSessionEvent,
+  type LiveWritingChapter,
+  type WritingSessionCopy,
+  type WritingSessionHandlers,
+} from '@/lib/writing-session';
 import { WritingTransportController } from '@/lib/writing/writing-transport-controller';
 import type { WritingRunEvent } from '@/lib/writing/writing-run-reducer';
+
+const SESSION_COPY: WritingSessionCopy = {
+  writingLabel: 'Writing',
+  readingLabel: 'Reading',
+  errorLabel: 'Failed',
+  timeoutLabel: 'Timed out',
+};
+
+async function drainBatcherMicrotasks(times = 3): Promise<void> {
+  for (let index = 0; index < times; index += 1) {
+    await new Promise<void>(resolve => {
+      queueMicrotask(resolve);
+    });
+  }
+}
 
 const START = {
   novelId: 'novel-1',
@@ -24,17 +45,28 @@ const START = {
 function callbacks() {
   const events: WritingRunEvent[] = [];
   let prose = '';
+  let liveChapter: LiveWritingChapter | null = null;
   return {
     events,
     prose: () => prose,
+    liveChapter: () => liveChapter,
     callbacks: {
       onRunEvent: (event: WritingRunEvent) => events.push(event),
       patchNovel: vi.fn(),
       replaceNovel: vi.fn(),
       appendLiveChapter: (chunk: string) => {
         prose += chunk;
+        if (liveChapter) {
+          liveChapter = {
+            ...liveChapter,
+            content: liveChapter.content + chunk,
+          };
+        }
       },
-      setLiveChapter: vi.fn(),
+      setLiveChapter: (chapter: LiveWritingChapter | null) => {
+        liveChapter = chapter ? { ...chapter } : null;
+        prose = chapter?.content ?? '';
+      },
       upsertChapter: vi.fn(),
       refreshDurableState: vi.fn(async () => {}),
     },
@@ -167,5 +199,125 @@ describe('WritingTransportController', () => {
 
     await expect(pending).resolves.toMatchObject({ kind: 'cancelled' });
     expect(state.events.map(event => event.type)).toEqual(['run-started']);
+  });
+
+  it('accumulates same-chapter writing frames across separate batcher drains', async () => {
+    let sessionHandlers!: WritingSessionHandlers;
+    let settle!: (error?: unknown) => void;
+    const runSession = vi.fn(({ handlers }: { handlers: WritingSessionHandlers }) => {
+      sessionHandlers = handlers;
+      return new Promise<void>((resolve, reject) => {
+        settle = (error?: unknown) => {
+          if (error) reject(error);
+          else resolve();
+        };
+      });
+    });
+    const transport = new WritingTransportController(runSession as never);
+    const state = callbacks();
+    const pending = transport.start(START, state.callbacks);
+    await Promise.resolve();
+
+    const batcher = createChunkBatcher(chunk => {
+      sessionHandlers.appendLiveChapter(chunk);
+    });
+
+    await applyWritingSessionEvent({
+      type: 'writing',
+      chapterNumber: 1,
+      title: 'One',
+      chunk: 'Alpha ',
+    }, {
+      novelId: 'novel-1',
+      copy: SESSION_COPY,
+      batcher,
+      handlers: sessionHandlers,
+    });
+    await drainBatcherMicrotasks();
+
+    await applyWritingSessionEvent({
+      type: 'writing',
+      chapterNumber: 1,
+      title: 'One',
+      chunk: 'Beta ',
+    }, {
+      novelId: 'novel-1',
+      copy: SESSION_COPY,
+      batcher,
+      handlers: sessionHandlers,
+    });
+    await drainBatcherMicrotasks();
+
+    await applyWritingSessionEvent({
+      type: 'writing',
+      chapterNumber: 1,
+      title: 'One',
+      chunk: 'Gamma',
+    }, {
+      novelId: 'novel-1',
+      copy: SESSION_COPY,
+      batcher,
+      handlers: sessionHandlers,
+    });
+    await drainBatcherMicrotasks();
+
+    expect(state.liveChapter()?.content).toBe('Alpha Beta Gamma');
+
+    expect(transport.pause('Paused')).toBe(true);
+    settle(new DOMException('Paused', 'AbortError'));
+    const outcome = await pending;
+
+    expect(outcome).toMatchObject({
+      kind: 'paused',
+      isLatestRun: true,
+      partial: { content: 'Alpha Beta Gamma' },
+    });
+    expect(state.liveChapter()?.content).toBe('Alpha Beta Gamma');
+  });
+
+  it('re-initializes on chapter-number change and still clears on explicit null', async () => {
+    let sessionHandlers!: WritingSessionHandlers;
+    let resolveSession!: () => void;
+    const runSession = vi.fn(({ handlers }: { handlers: WritingSessionHandlers }) => {
+      sessionHandlers = handlers;
+      return new Promise<void>(resolve => {
+        resolveSession = resolve;
+      });
+    });
+    const transport = new WritingTransportController(runSession as never);
+    const state = callbacks();
+    const pending = transport.start(START, state.callbacks);
+    await Promise.resolve();
+
+    sessionHandlers.setLiveChapter({
+      id: 'live-1',
+      chapterNumber: 1,
+      title: 'One',
+      content: '',
+    });
+    sessionHandlers.appendLiveChapter('chapter-one');
+    expect(state.liveChapter()).toMatchObject({
+      chapterNumber: 1,
+      content: 'chapter-one',
+    });
+
+    sessionHandlers.setLiveChapter({
+      id: 'live-2',
+      chapterNumber: 2,
+      title: 'Two',
+      content: '',
+    });
+    expect(state.liveChapter()).toMatchObject({
+      chapterNumber: 2,
+      content: '',
+    });
+    sessionHandlers.appendLiveChapter('chapter-two');
+    expect(state.liveChapter()?.content).toBe('chapter-two');
+
+    sessionHandlers.setLiveChapter(null);
+    expect(state.liveChapter()).toBeNull();
+
+    resolveSession();
+    await pending;
   });
 });

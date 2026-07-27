@@ -221,13 +221,18 @@ export function useManuscriptSession(opts: {
     );
 
     if (outcome.kind === 'paused') {
+      // A newer run may already own rendered prose and terminal phase.
+      // Stale paused settlements must not write or refresh anything.
+      if (
+        !outcome.isLatestRun
+        || !transportRef.current.isLatestRun(outcome.runId)
+      ) return;
       if (outcome.partial) setLiveChapter(outcome.partial);
-      if (outcome.isLatestRun) {
-        await Promise.allSettled([fetchNovel()]);
-      }
+      await Promise.allSettled([fetchNovel()]);
       return;
     }
     if (outcome.kind !== 'failed') return;
+    if (!transportRef.current.isLatestRun(outcome.runId)) return;
 
     if (isAIActionGateCancellation(outcome.error)) {
       setLiveChapter(null);
@@ -236,6 +241,10 @@ export function useManuscriptSession(opts: {
     }
 
     await Promise.allSettled([fetchNovel(), fetchChapters()]);
+    // A Retry can start while the failed run's durable refresh is in flight.
+    // Its invalidated reads are harmless, but the old partial/toast must not
+    // overwrite or distract from the newer run.
+    if (!transportRef.current.isLatestRun(outcome.runId)) return;
     const message = outcome.error instanceof Error
       ? outcome.error.message
       : t.errorWritingFailed;
