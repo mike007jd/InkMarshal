@@ -714,7 +714,7 @@ requirement is retained.
 | npm | `minimist` | 1.2.8 | [source](https://github.com/minimistjs/minimist) |
 | npm | `mkdirp-classic` | 0.5.3 | [source](https://github.com/mafintosh/mkdirp-classic) |
 | npm | `ms` | 2.1.3 | [source](https://www.npmjs.com/package/ms/v/2.1.3) |
-| npm | `nanoid` | 3.3.12 | [source](https://www.npmjs.com/package/nanoid/v/3.3.12) |
+| npm | `nanoid` | 3.3.16 | [source](https://www.npmjs.com/package/nanoid/v/3.3.16) |
 | npm | `nanoid` | 5.1.11 | [source](https://www.npmjs.com/package/nanoid/v/5.1.11) |
 | npm | `napi-build-utils` | 2.0.0 | [source](https://github.com/inspiredware/napi-build-utils) |
 | npm | `next` | 16.2.11 | [source](https://www.npmjs.com/package/next/v/16.2.11) |
@@ -725,7 +725,7 @@ requirement is retained.
 | npm | `path-is-absolute` | 1.0.1 | [source](https://www.npmjs.com/package/path-is-absolute/v/1.0.1) |
 | npm | `pdf-lib` | 1.17.1 | [source](https://github.com/Hopding/pdf-lib) |
 | npm | `pkce-challenge` | 5.0.1 | [source](https://github.com/crouchcd/pkce-challenge) |
-| npm | `postcss` | 8.5.10 | [source](https://www.npmjs.com/package/postcss/v/8.5.10) |
+| npm | `postcss` | 8.5.23 | [source](https://www.npmjs.com/package/postcss/v/8.5.23) |
 | npm | `prebuild-install` | 7.1.3 | [source](https://github.com/prebuild/prebuild-install) |
 | npm | `process-nextick-args` | 2.0.1 | [source](https://github.com/calvinmetcalf/process-nextick-args) |
 | npm | `property-information` | 7.2.0 | [source](https://www.npmjs.com/package/property-information/v/7.2.0) |
@@ -1489,7 +1489,7 @@ Applied to:
 - npm `minimist` 1.2.8 — COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `mkdirp-classic` 0.5.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2020 James Halliday (mail@substack.net) and Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `ms` 2.1.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2020 Vercel, Inc.; The above copyright notice and this permission notice shall be included in all
-- npm `nanoid` 3.3.12 — Copyright 2017 Andrey Sitnik <andrey@sitnik.ru>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
+- npm `nanoid` 3.3.16 — Copyright 2017 Andrey Sitnik <andrey@sitnik.ru>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `nanoid` 5.1.11 — Copyright 2017 Andrey Sitnik <andrey@sitnik.es>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `napi-build-utils` 2.0.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2018 inspiredware; The above copyright notice and this permission notice shall be included in all
 - npm `next` 16.2.11 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2025 Vercel, Inc.; The above copyright notice and this permission notice shall be included in all
@@ -1501,7 +1501,7 @@ Applied to:
 - npm `path-is-absolute` 1.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (sindresorhus.com); The above copyright notice and this permission notice shall be included in
 - npm `pdf-lib` 1.17.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2019 Andrew Dillon; The above copyright notice and this permission notice shall be included in all
 - npm `pkce-challenge` 5.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2019; The above copyright notice and this permission notice shall be included in all
-- npm `postcss` 8.5.10 — Copyright 2013 Andrey Sitnik <andrey@sitnik.es>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
+- npm `postcss` 8.5.23 — Copyright 2013 Andrey Sitnik <andrey@sitnik.es>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `prebuild-install` 7.1.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2015 Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `process-nextick-args` 2.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2015 Calvin Metcalf; The above copyright notice and this permission notice shall be included in all
 - npm `property-information` 7.2.0 — Copyright (c) Titus Wormer <mailto:tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
