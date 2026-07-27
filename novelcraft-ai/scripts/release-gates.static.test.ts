@@ -73,6 +73,15 @@ describe('mac release target gate', () => {
     expect(source).toContain('`${STABLE_DMG_NAME}.tmp.dmg`');
   });
 
+  it('retries transient busy-volume failures when detaching release DMGs', () => {
+    const source = scriptSource('build-mac-release.mjs');
+
+    expect(source).toContain('function detachDmgMount(mountPoint)');
+    expect(source).toContain('for (let attempt = 0; attempt < 20; attempt += 1)');
+    expect(source).toContain('/Resource busy/i.test(lastOutput)');
+    expect(source.match(/detachDmgMount\(mountPoint\);/g)).toHaveLength(3);
+  });
+
   it('does not reject a notarized DMG only because host Gatekeeper is disabled', () => {
     const source = scriptSource('build-mac-release.mjs');
 

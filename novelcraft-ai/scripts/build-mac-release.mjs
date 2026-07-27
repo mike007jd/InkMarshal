@@ -85,8 +85,12 @@ function run(command, args, options = {}) {
   }
 }
 
+function runCaptureResult(command, args, options = {}) {
+  return spawnSync(command, args, { encoding: 'utf8', shell: false, ...options });
+}
+
 function runCapture(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', shell: false, ...options });
+  const result = runCaptureResult(command, args, options);
   const output = commandOutput(result);
   if (result.status !== 0) {
     throw new Error(`${command} ${redactedCommandArgs(args).join(' ')} failed${output ? `: ${output}` : ''}`);
@@ -131,13 +135,27 @@ function stopRunningInkMarshal() {
   }
 }
 
+function detachDmgMount(mountPoint) {
+  let lastOutput = '';
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const result = runCaptureResult('hdiutil', ['detach', mountPoint]);
+    if (result.status === 0) return;
+    lastOutput = commandOutput(result);
+    if (!/Resource busy/i.test(lastOutput)) {
+      throw new Error(`hdiutil detach ${mountPoint} failed${lastOutput ? `: ${lastOutput}` : ''}`);
+    }
+    sleepMs(250);
+  }
+  throw new Error(`hdiutil detach ${mountPoint} failed after retries${lastOutput ? `: ${lastOutput}` : ''}`);
+}
+
 function detachOldInkMarshalDmgMounts() {
   if (!existsSync('/Volumes')) return;
   for (const volume of readdirSync('/Volumes')) {
     if (!/^InkMarshal(?:$|\s)/.test(volume)) continue;
     const mountPoint = join('/Volumes', volume);
     console.log(`[release:mac] detaching stale InkMarshal mount ${mountPoint}`);
-    runCapture('hdiutil', ['detach', mountPoint]);
+    detachDmgMount(mountPoint);
   }
 }
 
@@ -486,7 +504,7 @@ function assertMountedDmgAppSignature(dmgPath) {
     runCapture('codesign', ['--verify', '--deep', '--strict', '--verbose=4', mountedApp]);
     console.log('[verify] exact mounted DMG app signature OK.');
   } finally {
-    runCapture('hdiutil', ['detach', mountPoint]);
+    detachDmgMount(mountPoint);
   }
 }
 
@@ -545,7 +563,7 @@ function exactDmgLaunchSmoke(dmgPath) {
   } finally {
     stopRunningInkMarshal();
     rmSync(smokeHome, { recursive: true, force: true });
-    runCapture('hdiutil', ['detach', mountPoint]);
+    detachDmgMount(mountPoint);
   }
 }
 
