@@ -137,7 +137,7 @@ function stopRunningInkMarshal() {
 
 function detachDmgMount(mountPoint) {
   let lastOutput = '';
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     const result = runCaptureResult('hdiutil', ['detach', mountPoint]);
     if (result.status === 0) return;
     lastOutput = commandOutput(result);

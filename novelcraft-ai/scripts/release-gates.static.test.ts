@@ -77,7 +77,7 @@ describe('mac release target gate', () => {
     const source = scriptSource('build-mac-release.mjs');
 
     expect(source).toContain('function detachDmgMount(mountPoint)');
-    expect(source).toContain('for (let attempt = 0; attempt < 20; attempt += 1)');
+    expect(source).toContain('for (let attempt = 0; attempt < 120; attempt += 1)');
     expect(source).toContain('/Resource busy/i.test(lastOutput)');
     expect(source.match(/detachDmgMount\(mountPoint\);/g)).toHaveLength(3);
   });
