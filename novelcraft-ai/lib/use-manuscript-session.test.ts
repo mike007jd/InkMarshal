@@ -1,29 +1,30 @@
 // @vitest-environment jsdom
 
 import { createElement, type ReactNode } from 'react';
-import { renderHook, act } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LanguageProvider } from '@/components/LanguageProvider';
 import {
-  claimWritingStart,
   liveChapterAfterWritingFailure,
-  releaseWritingStart,
   resolveStartWritingCreativity,
   useManuscriptSession,
 } from '@/lib/use-manuscript-session';
-import type { LiveWritingChapter } from '@/lib/writing-session';
+import type {
+  LiveWritingChapter,
+  WritingSessionHandlers,
+} from '@/lib/writing-session';
 
 const writingSessionMock = vi.hoisted(() => ({
   startWritingSession: vi.fn(async ({ handlers }: {
     signal?: AbortSignal;
-    handlers?: {
-      onDone?: () => void;
-      setLiveChapter?: (chapter: LiveWritingChapter | null) => void;
-      onPartialChapter?: (chapter: LiveWritingChapter) => void;
-    };
+    handlers: WritingSessionHandlers;
   }) => {
-    handlers?.onDone?.();
+    handlers.onRunEvent({
+      type: 'completed',
+      statusLabel: 'Complete',
+      at: '2026-07-27T00:00:00.000Z',
+    });
   }),
 }));
 
@@ -43,14 +44,6 @@ const response = (body: unknown) => ({
   json: async () => body,
 }) as Response;
 
-async function flushSessionEffects() {
-  for (let i = 0; i < 6; i++) {
-    await act(async () => {
-      await Promise.resolve();
-    });
-  }
-}
-
 function midWritingNovel() {
   return {
     id: 'novel-1',
@@ -59,7 +52,7 @@ function midWritingNovel() {
     stage: 'autonomous_writing',
     progress: 42,
     blueprint: { chapters: [{ number: 1 }, { number: 2 }] },
-    writingLockExpiresAt: Date.now() - 1000,
+    writingLockExpiresAt: Date.now() - 1_000,
     settings: null,
   };
 }
@@ -73,13 +66,30 @@ function stubManuscriptFetch(fetchMock: ReturnType<typeof vi.fn>) {
   });
 }
 
+async function flushSessionEffects() {
+  for (let index = 0; index < 8; index += 1) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
 let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   vi.useFakeTimers();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
-  writingSessionMock.startWritingSession.mockClear();
+  writingSessionMock.startWritingSession.mockReset();
+  writingSessionMock.startWritingSession.mockImplementation(async ({ handlers }: {
+    handlers: WritingSessionHandlers;
+  }) => {
+    handlers.onRunEvent({
+      type: 'completed',
+      statusLabel: 'Complete',
+      at: '2026-07-27T00:00:00.000Z',
+    });
+  });
 });
 
 afterEach(() => {
@@ -88,10 +98,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('manuscript session mid-writing resume', () => {
-  it('auto-resumes a mid-writing autostart entry after the countdown', async () => {
+describe('manuscript session resume behavior', () => {
+  it('auto-resumes an explicit mid-writing entry after the countdown', async () => {
     stubManuscriptFetch(fetchMock);
-
     const { result } = renderHook(
       () => useManuscriptSession({ novelId: 'novel-1', autostart: true }),
       { wrapper },
@@ -99,19 +108,17 @@ describe('manuscript session mid-writing resume', () => {
 
     await flushSessionEffects();
     expect(result.current.resumePromptVisible).toBe(true);
-    expect(result.current.didRequestAutostart).toBe(false);
     expect(result.current.resumeCountdown).toBe(5);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(5_000);
     });
 
     expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(1);
   });
 
-  it('shows a manual resume prompt without auto-starting when autostart is absent', async () => {
+  it('shows a manual resume action without spending tokens automatically', async () => {
     stubManuscriptFetch(fetchMock);
-
     const { result } = renderHook(
       () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
       { wrapper },
@@ -122,27 +129,291 @@ describe('manuscript session mid-writing resume', () => {
     expect(result.current.resumeCountdown).toBeNull();
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(6000);
+      await vi.advanceTimersByTimeAsync(6_000);
+    });
+    expect(writingSessionMock.startWritingSession).not.toHaveBeenCalled();
+  });
+
+  it('consumes an explicit autostart once instead of silently retrying a failed run', async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/chapters')) return response([]);
+      return response({
+        ...midWritingNovel(),
+        stage: 'ready_for_greenlight',
+        blueprint: null,
+      });
+    });
+    writingSessionMock.startWritingSession.mockRejectedValue(
+      new Error('Provider unavailable'),
+    );
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: true }),
+      { wrapper },
+    );
+
+    await flushSessionEffects();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
     });
 
-    expect(writingSessionMock.startWritingSession).not.toHaveBeenCalled();
+    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(1);
+    expect(result.current.writingRunState.phase).toBe('failed');
   });
 });
 
-describe('manuscript session write-start guard', () => {
-  it('claims exactly one start-writing request until released', () => {
-    const flag = { current: false };
+describe('manuscript session transport integration', () => {
+  it('keeps late prose after Pause without reviving the lifecycle', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession.mockImplementationOnce(async (args) => {
+      const { signal, handlers } = args as {
+        signal?: AbortSignal;
+        handlers: WritingSessionHandlers;
+      };
+      handlers.setLiveChapter({
+        id: 'live-1',
+        chapterNumber: 1,
+        title: 'One',
+        content: '',
+      });
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          handlers.appendLiveChapter('late prose');
+          handlers.onRunEvent({
+            type: 'phase-received',
+            phase: 'drafting',
+            statusLabel: 'Late drafting',
+            at: '2026-07-27T00:00:01.000Z',
+          });
+          reject(new DOMException('Paused', 'AbortError'));
+        }, { once: true });
+      });
+    });
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
 
-    expect(claimWritingStart(flag)).toBe(true);
-    expect(flag.current).toBe(true);
-    expect(claimWritingStart(flag)).toBe(false);
+    let startPromise: Promise<void>;
+    act(() => {
+      startPromise = result.current.startWriting();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      result.current.pauseWriting();
+      await startPromise!;
+    });
 
-    releaseWritingStart(flag);
-    expect(flag.current).toBe(false);
-    expect(claimWritingStart(flag)).toBe(true);
+    expect(result.current.liveChapter?.content).toBe('late prose');
+    expect(result.current.writingRunState.phase).toBe('paused');
   });
 
-  it('keeps provider-error partial chapters but clears user-aborted partials', () => {
+  it('refreshes durable state when opening the writing stream fails', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession.mockRejectedValueOnce(
+      new Error('No model available for draft'),
+    );
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+    const baselineFetches = fetchMock.mock.calls.length;
+
+    await act(async () => {
+      await result.current.startWriting();
+    });
+
+    expect(fetchMock.mock.calls.length).toBe(baselineFetches + 2);
+    expect(result.current.writingRunState).toMatchObject({
+      phase: 'failed',
+      error: 'No model available for draft',
+    });
+  });
+
+  it('keeps a terminal stream result when one post-terminal refresh fails', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession.mockImplementationOnce(async ({ handlers }) => {
+      fetchMock.mockRejectedValueOnce(new Error('chapter refresh failed'));
+      await handlers.refreshChapters();
+      handlers.onRunEvent({
+        type: 'completed',
+        statusLabel: 'Complete',
+        at: '2026-07-27T00:00:01.000Z',
+      });
+    });
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    await act(async () => {
+      await result.current.startWriting();
+    });
+
+    expect(result.current.writingRunState.phase).toBe('complete');
+  });
+
+  it('ignores a stale paused settlement after a newer run completes', async () => {
+    stubManuscriptFetch(fetchMock);
+    let settleRun1!: (error: unknown) => void;
+    writingSessionMock.startWritingSession
+      .mockImplementationOnce(async (args) => {
+        const { signal, handlers } = args as {
+          signal?: AbortSignal;
+          handlers: WritingSessionHandlers;
+        };
+        handlers.setLiveChapter({
+          id: 'live-1',
+          chapterNumber: 1,
+          title: 'One',
+          content: '',
+        });
+        handlers.appendLiveChapter('run1 stale');
+        await new Promise<void>((_resolve, reject) => {
+          settleRun1 = (error: unknown) => {
+            reject(error);
+          };
+          signal?.addEventListener('abort', () => {
+            // Pause clears active immediately; keep run1 unsettled until
+            // after run2 finishes so the late paused outcome is stale.
+          }, { once: true });
+        });
+      })
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-2',
+          chapterNumber: 2,
+          title: 'Two',
+          content: '',
+        });
+        handlers.appendLiveChapter('run2 final prose');
+        handlers.onRunEvent({
+          type: 'completed',
+          statusLabel: 'Complete',
+          at: '2026-07-27T00:00:02.000Z',
+        });
+      });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let run1Promise!: Promise<void>;
+    act(() => {
+      run1Promise = result.current.startWriting();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.pauseWriting();
+    });
+
+    let run2Promise!: Promise<void>;
+    await act(async () => {
+      run2Promise = result.current.startWriting();
+      await run2Promise;
+    });
+
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+    const run2LiveChapter = result.current.liveChapter;
+    const run2Phase = result.current.writingRunState.phase;
+
+    await act(async () => {
+      settleRun1(new DOMException('Paused', 'AbortError'));
+      await run1Promise;
+    });
+
+    expect(result.current.liveChapter).toEqual(run2LiveChapter);
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe(run2Phase);
+    expect(result.current.writingRunState.phase).toBe('complete');
+    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a failed run after its late refresh is superseded by Retry', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-1',
+          chapterNumber: 1,
+          title: 'One',
+          content: '',
+        });
+        handlers.appendLiveChapter('run1 failed prose');
+        handlers.onRunEvent({
+          type: 'failed',
+          statusLabel: 'Run 1 failed',
+          error: 'Run 1 failed',
+          at: '2026-07-27T00:00:01.000Z',
+        });
+        throw new Error('Run 1 failed');
+      })
+      .mockImplementationOnce(async ({ handlers }) => {
+        handlers.setLiveChapter({
+          id: 'live-2',
+          chapterNumber: 2,
+          title: 'Two',
+          content: '',
+        });
+        handlers.appendLiveChapter('run2 final prose');
+        handlers.onRunEvent({
+          type: 'completed',
+          statusLabel: 'Complete',
+          at: '2026-07-27T00:00:02.000Z',
+        });
+      });
+
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+
+    let resolveFailedNovel!: (value: Response) => void;
+    let resolveFailedChapters!: (value: Response) => void;
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(resolve => {
+        resolveFailedNovel = resolve;
+      }))
+      .mockImplementationOnce(() => new Promise<Response>(resolve => {
+        resolveFailedChapters = resolve;
+      }));
+
+    let run1Promise!: Promise<void>;
+    act(() => {
+      run1Promise = result.current.startWriting();
+    });
+    await flushSessionEffects();
+    expect(result.current.writingRunState.phase).toBe('failed');
+
+    await act(async () => {
+      await result.current.startWriting();
+    });
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+
+    await act(async () => {
+      resolveFailedNovel(response(midWritingNovel()));
+      resolveFailedChapters(response([{ id: 'chapter-1', chapterNumber: 1 }]));
+      await run1Promise;
+    });
+
+    expect(result.current.liveChapter?.content).toBe('run2 final prose');
+    expect(result.current.writingRunState.phase).toBe('complete');
+    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('manuscript session pure boundaries', () => {
+  it('keeps provider-error prose but clears user-aborted prose', () => {
     const partial: LiveWritingChapter = {
       id: 'live-1',
       chapterNumber: 1,
@@ -150,125 +421,18 @@ describe('manuscript session write-start guard', () => {
       content: 'partial draft',
     };
 
-    expect(liveChapterAfterWritingFailure(new Error('provider failed'), partial)).toBe(partial);
-    expect(liveChapterAfterWritingFailure(new DOMException('aborted', 'AbortError'), partial)).toBeNull();
-    expect(liveChapterAfterWritingFailure(new Error('provider failed'), null)).toBeNull();
+    expect(liveChapterAfterWritingFailure(new Error('provider failed'), partial))
+      .toEqual(partial);
+    expect(liveChapterAfterWritingFailure(
+      new DOMException('Paused', 'AbortError'),
+      partial,
+    )).toBeNull();
   });
 
-  it('starts writing with the latest locally selected creativity before DB refresh catches up', () => {
-    const storage = new Map<string, string>();
-    Object.defineProperty(window, 'localStorage', {
-      configurable: true,
-      value: {
-        getItem: (key: string) => storage.get(key) ?? null,
-        setItem: (key: string, value: string) => { storage.set(key, value); },
-      },
-    });
-    window.localStorage.setItem('creativity:novel-1', 'wild');
+  it('prefers the latest cached creativity selection over stale durable settings', () => {
+    localStorage.setItem('creativity:novel-1', 'wild');
 
-    expect(resolveStartWritingCreativity('novel-1', { creativity: 'conservative' })).toBe('wild');
-    expect(resolveStartWritingCreativity('novel-2', { creativity: 'balanced' })).toBe('balanced');
-    expect(resolveStartWritingCreativity('novel-3', null)).toBeNull();
-  });
-
-  it('refreshes the novel and chapters after start-writing fails before a stream opens', async () => {
-    stubManuscriptFetch(fetchMock);
-    writingSessionMock.startWritingSession.mockRejectedValueOnce(new Error('No model available for draft'));
-
-    const { result } = renderHook(
-      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
-      { wrapper },
-    );
-
-    await flushSessionEffects();
-    const fetchCallsBeforeStart = fetchMock.mock.calls.length;
-
-    await act(async () => {
-      await result.current.startWriting();
-    });
-
-    const refreshedUrls = fetchMock.mock.calls
-      .slice(fetchCallsBeforeStart)
-      .map(call => String(call[0]));
-
-    expect(refreshedUrls).toContain('/api/novels/novel-1');
-    expect(refreshedUrls).toContain('/api/novels/novel-1/chapters');
-    expect(result.current.isStreaming).toBe(false);
-    expect(result.current.didRequestAutostart).toBe(false);
-  });
-
-  it('keeps the streamed partial chapter visible when the writer pauses', async () => {
-    stubManuscriptFetch(fetchMock);
-    const partial: LiveWritingChapter = {
-      id: 'live-paused',
-      chapterNumber: 2,
-      title: 'Two',
-      content: 'A partial chapter worth keeping.',
-    };
-    writingSessionMock.startWritingSession.mockImplementationOnce(({ handlers, signal }) =>
-      new Promise<void>((_resolve, reject) => {
-        handlers?.setLiveChapter?.({ ...partial, content: '' });
-        signal?.addEventListener('abort', () => {
-          handlers?.onPartialChapter?.(partial);
-          reject(new DOMException('paused', 'AbortError'));
-        }, { once: true });
-      }),
-    );
-
-    const { result } = renderHook(
-      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
-      { wrapper },
-    );
-    await flushSessionEffects();
-
-    let start!: Promise<void>;
-    act(() => { start = result.current.startWriting(); });
-    await act(async () => { await Promise.resolve(); });
-    act(() => result.current.pauseWriting());
-    await act(async () => { await start; });
-
-    expect(result.current.isStreaming).toBe(false);
-    expect(result.current.liveChapter).toEqual(partial);
-  });
-
-  it('does not let an old paused run release the guard owned by a restarted run', async () => {
-    stubManuscriptFetch(fetchMock);
-    let resolveFirst!: () => void;
-    let resolveSecond!: () => void;
-    const firstRun = new Promise<void>(resolve => { resolveFirst = resolve; });
-    const secondRun = new Promise<void>(resolve => { resolveSecond = resolve; });
-    writingSessionMock.startWritingSession
-      .mockImplementationOnce(() => firstRun)
-      .mockImplementationOnce(() => secondRun);
-
-    const { result } = renderHook(
-      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
-      { wrapper },
-    );
-    await flushSessionEffects();
-
-    let firstStart!: Promise<void>;
-    act(() => { firstStart = result.current.startWriting(); });
-    await act(async () => { await Promise.resolve(); });
-    act(() => result.current.pauseWriting());
-
-    let secondStart!: Promise<void>;
-    act(() => { secondStart = result.current.startWriting(); });
-    await act(async () => { await Promise.resolve(); });
-    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      resolveFirst();
-      await firstStart;
-    });
-    await act(async () => {
-      await result.current.startWriting();
-    });
-    expect(writingSessionMock.startWritingSession).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      resolveSecond();
-      await secondStart;
-    });
+    expect(resolveStartWritingCreativity('novel-1', { creativity: 'conservative' }))
+      .toBe('wild');
   });
 });

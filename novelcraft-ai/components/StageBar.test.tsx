@@ -1,8 +1,14 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
 
-import { buildStageBarSteps, progressBarWidthClass } from '@/components/StageBar';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { LocaleProvider } from '@/components/LanguageProvider';
+import {
+  buildStageBarSteps,
+  progressBarWidthClass,
+  StageBar,
+} from '@/components/StageBar';
 
 const LABELS = {
   brainstorm: 'Brainstorm',
@@ -10,6 +16,8 @@ const LABELS = {
   approval: 'Approval',
   writing: 'Writing',
 };
+
+afterEach(cleanup);
 
 describe('buildStageBarSteps', () => {
   it('marks brainstorm current during the discovery interview', () => {
@@ -70,31 +78,62 @@ describe('progressBarWidthClass', () => {
 });
 
 describe('StageBar stage surface contract', () => {
-  const bar = readFileSync(join(process.cwd(), 'components/StageBar.tsx'), 'utf8');
+  it('exposes the current step and performs the ready-stage action in one click', () => {
+    const onApprove = vi.fn();
+    render(
+      <LocaleProvider>
+        <StageBar
+          stage="ready_for_greenlight"
+          storyDeckComplete
+          onApprove={onApprove}
+          labels={{ navAriaLabel: 'Project status' }}
+        />
+      </LocaleProvider>,
+    );
 
-  it('is an accessible step navigation with a single visible primary action', () => {
-    // Native <nav> already exposes the navigation landmark; do not restate
-    // role="navigation" (redundant ARIA on a semantic element).
-    expect(bar).toContain('<nav');
-    expect(bar).toContain('aria-label={labels?.navAriaLabel ?? t.projectStatus}');
-    expect(bar).not.toContain('role="navigation"');
-    expect(bar).toContain("aria-current={step.state === 'current' ? 'step' : undefined}");
-    // Approve & Begin Writing renders inline at the ready stage — never
-    // behind a popover/disclosure.
-    expect(bar).toContain('{t.approveStart}');
-    expect(bar).toContain('onClick={onApprove}');
-    expect(bar).not.toContain('Popover');
-    // The step projection honours deck completeness so a ready stage with an
-    // incomplete deck stays on Story Ready instead of Approval.
-    expect(bar).toContain('buildStageBarSteps(stage, stepLabels, { storyDeckComplete })');
-    // WritingRunStatus is the single Pause owner at every density.
-    expect(bar).not.toContain('onPauseWriting');
-    expect(bar).not.toContain('StopStreamingButton');
+    const navigation = screen.getByRole('navigation', { name: 'Project status' });
+    const currentSteps = navigation.querySelectorAll('[aria-current="step"]');
+    expect(currentSteps).toHaveLength(1);
+    expect(currentSteps[0]?.textContent).toContain('Approval');
+    fireEvent.click(screen.getByRole('button', { name: /Approve & Begin Writing/ }));
+    expect(onApprove).toHaveBeenCalledOnce();
   });
 
-  it('keeps the narrow-window pill toggle keyboard-reachable with aria state', () => {
-    expect(bar).toContain('data-shape="stage-pill"');
-    expect(bar).toContain('aria-expanded={stepsOpen}');
-    expect(bar).toContain('aria-controls={stepsId}');
+  it('offers Story Deck repair instead of approve until coverage is complete', () => {
+    const onCompleteDeck = vi.fn();
+    const onApprove = vi.fn();
+    render(
+      <LocaleProvider>
+        <StageBar
+          stage="ready_for_greenlight"
+          storyDeckComplete={false}
+          onCompleteDeck={onCompleteDeck}
+          onApprove={onApprove}
+        />
+      </LocaleProvider>,
+    );
+
+    const currentStep = screen
+      .getByRole('navigation')
+      .querySelector('[aria-current="step"]');
+    expect(currentStep?.textContent).toContain('Story Ready');
+    expect(screen.queryByRole('button', { name: /Approve & Begin Writing/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Complete Story Deck/ }));
+    expect(onCompleteDeck).toHaveBeenCalledOnce();
+    expect(onApprove).not.toHaveBeenCalled();
+  });
+
+  it('keeps the narrow-window step disclosure keyboard-reachable with aria state', () => {
+    render(
+      <LocaleProvider>
+        <StageBar stage="autonomous_writing" />
+      </LocaleProvider>,
+    );
+    const toggle = screen.getByRole('button', { expanded: false });
+    const controlledId = toggle.getAttribute('aria-controls');
+    expect(controlledId).toBeTruthy();
+    expect(document.getElementById(controlledId!)).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
   });
 });

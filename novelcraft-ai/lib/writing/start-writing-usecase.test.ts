@@ -22,14 +22,14 @@ const usage = vi.hoisted(() => ({
 }));
 const db = vi.hoisted(() => ({
   completeWritingDraft: vi.fn(async () => ({ id: 'n1' })),
-  getVolumeSummaries: vi.fn(async () => []),
+  getVolumeSummaries: vi.fn(async (): Promise<unknown[]> => []),
   updateChapterMeta: vi.fn(async () => {}),
   updateNovel: vi.fn(async () => ({})),
   upsertChapter: vi.fn(async () => ({})),
 }));
 const ai = vi.hoisted(() => ({
   adaptiveDigestParams: vi.fn(() => ({ recentWindow: 2, tailCharsPerChapter: 1500, maxBatchChars: 80_000 })),
-  buildRollingDigest: vi.fn(() => ({ earlierDigest: '', recentTails: '' })),
+  buildRollingDigest: vi.fn((..._args: unknown[]) => ({ earlierDigest: '', recentTails: '' })),
   getTargetWordsPerChapter: vi.fn(() => 800),
   selectChapterPlansToWrite: vi.fn((chapters: unknown[]) => chapters),
   streamChapter: vi.fn(),
@@ -489,5 +489,77 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     expect(orch.writeChapter).not.toHaveBeenCalled();
     expectFinalized(jobs, 'paused', 'controller_closed', 'Writing stopped before any chapter was created because the client connection closed.');
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'phase', phase: 'failed' }));
+  });
+});
+
+describe('executeStartWriting — optional memory fallbacks', () => {
+  it('falls back adaptive digest sizing and still writes when adaptiveDigestParams throws', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockResolvedValue(writtenOutcome(1));
+    ai.adaptiveDigestParams.mockImplementationOnce(() => {
+      throw new Error('adaptive sizing exploded');
+    });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(orch.writeChapter).toHaveBeenCalledTimes(1);
+    expect(ai.buildRollingDigest).toHaveBeenCalledWith(
+      expect.any(Array),
+      2,
+      1500,
+      expect.objectContaining({ volumeSummaries: [] }),
+    );
+    expectFinalized(jobs, 'completed', 'complete', null);
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
+  });
+
+  it('uses an empty volume-summary list when the initial load throws and still writes', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockResolvedValue(writtenOutcome(1));
+    db.getVolumeSummaries.mockRejectedValueOnce(new Error('volume table unavailable'));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(orch.writeChapter).toHaveBeenCalledTimes(1);
+    expect(ai.buildRollingDigest).toHaveBeenCalledWith(
+      expect.any(Array),
+      2,
+      1500,
+      { volumeSummaries: [] },
+    );
+    expectFinalized(jobs, 'completed', 'complete', null);
+  });
+
+  it('retains the prior durable volume summaries when a refresh throws', async () => {
+    const priorVolumes = [{
+      start: 1,
+      end: 100,
+      summary: 'Volume one',
+    }];
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(2));
+    orch.writeChapter
+      .mockResolvedValueOnce(writtenOutcome(1))
+      .mockResolvedValueOnce(writtenOutcome(2));
+    db.getVolumeSummaries
+      .mockResolvedValueOnce(priorVolumes)
+      .mockRejectedValueOnce(new Error('refresh unavailable'));
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx({ chaptersLimit: 2 });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(orch.writeChapter).toHaveBeenCalledTimes(2);
+    expect(ai.buildRollingDigest).toHaveBeenCalledTimes(2);
+    expect(ai.buildRollingDigest.mock.calls[0]?.[3]).toEqual({
+      volumeSummaries: priorVolumes,
+    });
+    expect(ai.buildRollingDigest.mock.calls[1]?.[3]).toEqual({
+      volumeSummaries: priorVolumes,
+    });
+    expectFinalized(jobs, 'completed', 'complete', null);
   });
 });

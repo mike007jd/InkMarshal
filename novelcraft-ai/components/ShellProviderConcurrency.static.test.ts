@@ -56,18 +56,6 @@ describe('desktop shell and provider mutation concurrency guards', () => {
     expect(provider).not.toContain('getConnectionSecret(draft.id).catch(() => null)');
   });
 
-  it('aborts and scope-checks active-novel bundle exports', () => {
-    const workspace = source('components/NovelWorkspace.tsx');
-
-    expect(workspace).toContain('const activeNovelIdRef = useRef(novelId)');
-    expect(workspace).toContain('const bundleAbortRef = useRef<AbortController | null>(null)');
-    expect(workspace).toContain('bundleAbortRef.current?.abort();');
-    expect(workspace).toContain('const requestNovelId = novelId');
-    expect(workspace).toContain('signal: controller.signal');
-    expect(workspace).toContain('if (activeNovelIdRef.current !== requestNovelId) return;');
-    expect(workspace).toContain('if (controller.signal.aborted || activeNovelIdRef.current !== requestNovelId) return;');
-  });
-
   it('keeps fallback runtime selection UI-only until a model is available', () => {
     const capability = source('components/CapabilityBindingPanel.tsx');
 

@@ -21,15 +21,6 @@ const copy: WritingSessionCopy = {
   timeoutLabel: 'Timed out',
 };
 
-describe('start-writing model routing', () => {
-  it('covers every writing role in the scoped model headers', () => {
-    expect(WRITING_SESSION_OPERATIONS).toEqual(['outline', 'chapter', 'summarize', 'validate', 'polish']);
-    expect(new Set(WRITING_SESSION_OPERATIONS.map(operation => OPERATION_ROLE[operation]))).toEqual(
-      new Set(['planning', 'draft', 'recall', 'rewrite']),
-    );
-  });
-});
-
 function createHarness() {
   const calls: string[] = [];
   const batcher = {
@@ -38,22 +29,34 @@ function createHarness() {
     cancel: vi.fn(() => calls.push('cancel')),
   };
   const handlers: WritingSessionHandlers = {
-    setStatusLabel: vi.fn(label => calls.push(`status:${label}`)),
     patchNovel: vi.fn(patch => calls.push(`patch:${JSON.stringify(patch)}`)),
     replaceNovel: vi.fn(() => calls.push('replaceNovel')),
-    appendLiveChapter: vi.fn(),
+    appendLiveChapter: vi.fn(chunk => calls.push(`append:${chunk}`)),
     setLiveChapter: vi.fn(chapter => calls.push(`live:${chapter?.chapterNumber ?? 'null'}`)),
     upsertChapter: vi.fn(chapter => calls.push(`chapter:${chapter.chapterNumber}`)),
     refreshChapters: vi.fn(async () => { calls.push('refreshChapters'); }),
-    onDone: vi.fn(() => calls.push('done')),
-    onError: vi.fn(message => calls.push(`error:${message}`)),
-    updateRunState: vi.fn(),
+    onRunEvent: vi.fn(event => calls.push(`event:${event.type}`)),
   };
   return { calls, batcher, handlers };
 }
 
+describe('start-writing model routing', () => {
+  it('covers every writing role in the scoped model headers', () => {
+    expect(WRITING_SESSION_OPERATIONS).toEqual([
+      'outline',
+      'chapter',
+      'summarize',
+      'validate',
+      'polish',
+    ]);
+    expect(new Set(WRITING_SESSION_OPERATIONS.map(
+      operation => OPERATION_ROLE[operation],
+    ))).toEqual(new Set(['planning', 'draft', 'recall', 'rewrite']));
+  });
+});
+
 describe('chapterFromWritingDoneEvent', () => {
-  it('normalizes a chapter_done event into a local Chapter shape', () => {
+  it('normalizes a persisted chapter event into the local Chapter shape', () => {
     const chapter = chapterFromWritingDoneEvent({
       type: 'chapter_done',
       id: 'server-ch-1',
@@ -79,13 +82,16 @@ describe('chapterFromWritingDoneEvent', () => {
     expect(chapter?.qualityIssues).toHaveLength(1);
   });
 
-  it('rejects malformed chapter_done payloads', () => {
-    expect(chapterFromWritingDoneEvent({ chapterNumber: 1, title: 'Missing content' }, 'novel-1')).toBeNull();
+  it('rejects malformed persisted chapter events', () => {
+    expect(chapterFromWritingDoneEvent(
+      { chapterNumber: 1, title: 'Missing content' },
+      'novel-1',
+    )).toBeNull();
   });
 });
 
 describe('applyWritingSessionEvent', () => {
-  it('surfaces explicit planning phase and heartbeat activity', async () => {
+  it('emits explicit planning and heartbeat facts', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
@@ -101,19 +107,20 @@ describe('applyWritingSessionEvent', () => {
       at: '2026-07-21T00:00:00.000Z',
     }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
 
-    expect(h.handlers.setStatusLabel).toHaveBeenCalledWith('Planning chapter blueprint...');
-    expect(h.handlers.updateRunState).toHaveBeenNthCalledWith(1, expect.objectContaining({
+    expect(h.handlers.onRunEvent).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      type: 'phase-received',
       phase: 'planning',
       progress: 5,
       completedChapters: 0,
       totalChapters: 12,
     }));
-    expect(h.handlers.updateRunState).toHaveBeenNthCalledWith(2, {
-      lastActivityAt: '2026-07-21T00:00:00.000Z',
+    expect(h.handlers.onRunEvent).toHaveBeenNthCalledWith(2, {
+      type: 'activity-received',
+      at: '2026-07-21T00:00:00.000Z',
     });
   });
 
-  it('flushes pending prose before progress and patches the novel stage', async () => {
+  it('flushes prose before publishing durable progress', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
@@ -122,14 +129,17 @@ describe('applyWritingSessionEvent', () => {
       message: 'Writing chapter 2',
     }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
 
-    expect(h.calls).toEqual([
+    expect(h.calls.slice(0, 2)).toEqual([
       'flush',
-      'status:Writing chapter 2',
       'patch:{"progress":42,"stage":"autonomous_writing"}',
     ]);
+    expect(h.handlers.onRunEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'progress-received',
+      progress: 42,
+    }));
   });
 
-  it('starts the live chapter and queues writing chunks without leaking parser details to the page', async () => {
+  it('starts a live chapter and queues its prose', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
@@ -139,10 +149,14 @@ describe('applyWritingSessionEvent', () => {
       chunk: 'First sentence.',
     }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
 
-    expect(h.calls).toEqual(['live:3', 'enqueue:First sentence.']);
+    expect(h.calls).toEqual([
+      'live:3',
+      'event:chapter-started',
+      'enqueue:First sentence.',
+    ]);
   });
 
-  it('turns chapter_done into a single upsert and clears the live chapter', async () => {
+  it('turns chapter_done into one upsert and one lifecycle event', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
@@ -158,28 +172,29 @@ describe('applyWritingSessionEvent', () => {
       'patch:{"progress":55,"stage":"autonomous_writing"}',
       'live:null',
       'chapter:2',
+      'event:chapter-completed',
     ]);
   });
 
-  it('awaits final chapter refresh before marking the writing session done', async () => {
+  it('publishes terminal completion before awaiting the durable refresh', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
       type: 'done',
       novel: { id: 'novel-1' },
+      message: 'Complete',
     }, { novelId: 'novel-1', copy, batcher: h.batcher, handlers: h.handlers });
 
     expect(h.calls).toEqual([
       'cancel',
       'live:null',
       'replaceNovel',
-      'status:Reading Copy',
-      'done',
+      'event:completed',
       'refreshChapters',
     ]);
   });
 
-  it('clears the unpersisted live chapter when the stream reports an error', async () => {
+  it('preserves partial prose when the stream reports an error', async () => {
     const h = createHarness();
 
     await applyWritingSessionEvent({
@@ -189,25 +204,22 @@ describe('applyWritingSessionEvent', () => {
 
     expect(h.calls).toEqual([
       'cancel',
-      'live:null',
-      'error:provider failed',
+      'event:failed',
       'refreshChapters',
     ]);
   });
 });
 
-describe('startWritingSession partial chapter handling', () => {
-  it('rejects a clean EOF without a terminal frame after preserving partial prose', async () => {
+describe('startWritingSession terminal protocol', () => {
+  it('rejects EOF without a terminal frame after flushing received prose', async () => {
     const encoder = new TextEncoder();
-    const partials: unknown[] = [];
     const h = createHarness();
-    h.handlers.onPartialChapter = vi.fn(chapter => partials.push(chapter));
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(new ReadableStream({
         start(controller) {
           controller.enqueue(encoder.encode(
-            '{"type":"writing","chapterNumber":3,"title":"Cut Short","chunk":"saved "}\n' +
-            '{"type":"writing","chapterNumber":3,"title":"Cut Short","chunk":"draft"}\n',
+            '{"type":"writing","chapterNumber":3,"title":"Cut Short","chunk":"saved "}\n'
+            + '{"type":"writing","chapterNumber":3,"title":"Cut Short","chunk":"draft"}\n',
           ));
           controller.close();
         },
@@ -222,26 +234,23 @@ describe('startWritingSession partial chapter handling', () => {
       handlers: h.handlers,
     })).rejects.toThrow('before the server confirmed completion');
 
-    expect(partials).toEqual([
-      {
-        id: 'live-3',
-        chapterNumber: 3,
-        title: 'Cut Short',
-        content: 'saved draft',
-      },
-    ]);
-    expect(h.handlers.onDone).not.toHaveBeenCalled();
+    expect(vi.mocked(h.handlers.appendLiveChapter).mock.calls.flat().join(''))
+      .toBe('saved draft');
+    expect(h.handlers.onRunEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'completed' }),
+    );
     fetchMock.mockRestore();
   });
 
-  it('accepts a clean EOF after a batch_done terminal frame', async () => {
+  it('accepts EOF after a batch terminal frame', async () => {
     const encoder = new TextEncoder();
     const h = createHarness();
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(new ReadableStream({
         start(controller) {
           controller.enqueue(encoder.encode(
-            '{"type":"batch_done","nextChapter":2,"remaining":1,"completedChapters":1,"totalChapters":2}\n',
+            '{"type":"batch_done","nextChapter":2,"remaining":1,'
+            + '"completedChapters":1,"totalChapters":2}\n',
           ));
           controller.close();
         },
@@ -256,53 +265,17 @@ describe('startWritingSession partial chapter handling', () => {
       handlers: h.handlers,
     })).resolves.toBeUndefined();
 
+    expect(h.handlers.onRunEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'batch-completed',
+      remaining: 1,
+    }));
     expect(h.handlers.refreshChapters).toHaveBeenCalledTimes(1);
     fetchMock.mockRestore();
   });
 
-  it('emits a partial live chapter when the server reports a stream error mid-chapter', async () => {
+  it('keeps received prose available to the transport owner when the stream fails', async () => {
     const encoder = new TextEncoder();
-    const partials: unknown[] = [];
     const h = createHarness();
-    h.handlers.onPartialChapter = vi.fn(chapter => partials.push(chapter));
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(new ReadableStream({
-        start(controller) {
-          controller.enqueue(encoder.encode(
-            '{"type":"writing","chapterNumber":4,"title":"Half","chunk":"first "}\n' +
-            '{"type":"writing","chapterNumber":4,"title":"Half","chunk":"draft"}\n' +
-            '{"type":"error","message":"provider failed"}\n',
-          ));
-          controller.close();
-        },
-      })),
-    );
-
-    await startWritingSession({
-      novelId: 'novel-1',
-      locale: 'en',
-      signal: new AbortController().signal,
-      copy,
-      handlers: h.handlers,
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(partials).toEqual([
-      {
-        id: 'live-4',
-        chapterNumber: 4,
-        title: 'Half',
-        content: 'first draft',
-      },
-    ]);
-    fetchMock.mockRestore();
-  });
-
-  it('emits a partial live chapter when the stream fails after receiving prose', async () => {
-    const encoder = new TextEncoder();
-    const partials: unknown[] = [];
-    const h = createHarness();
-    h.handlers.onPartialChapter = vi.fn(chapter => partials.push(chapter));
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(new ReadableStream({
         start(controller) {
@@ -322,14 +295,7 @@ describe('startWritingSession partial chapter handling', () => {
       handlers: h.handlers,
     })).rejects.toThrow('socket closed');
 
-    expect(partials).toEqual([
-      {
-        id: 'live-5',
-        chapterNumber: 5,
-        title: 'Interrupted',
-        content: 'opening',
-      },
-    ]);
+    expect(h.handlers.appendLiveChapter).toHaveBeenCalledWith('opening');
     fetchMock.mockRestore();
   });
 });

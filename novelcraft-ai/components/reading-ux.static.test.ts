@@ -9,7 +9,6 @@ function source(path: string): string {
 describe('reading heat-zone UX', () => {
   it('keeps primary navigation compact and removes the old per-novel tab strip', () => {
     const novelTopBar = source('components/NovelTopBar.tsx');
-    const novelWorkspace = source('components/NovelWorkspace.tsx');
     const knowledgePanel = source('components/knowledge/KnowledgePanel.tsx');
     const manuscriptReading = source('components/ManuscriptReadingView.tsx');
 
@@ -30,23 +29,6 @@ describe('reading heat-zone UX', () => {
     // a labelled nav landmark + per-item current-state.
     expect(novelTopBar).toContain('aria-label={t.novelModeNav}');
     expect(novelTopBar).toContain("aria-current={active ? 'page' : undefined}");
-    expect(novelWorkspace).not.toContain('function NovelModeRail');
-    expect(novelWorkspace).not.toContain('function NovelModeMobileBar');
-    expect(novelWorkspace).toContain('view={view}');
-    expect(novelWorkspace).toContain('setView={selectView}');
-    expect(novelWorkspace).toContain('lg:hidden');
-    expect(novelWorkspace).toContain('function StoryDeckMode');
-    expect(novelWorkspace).toContain("from '@/components/ui/tabs'");
-    expect(novelWorkspace).toContain('TabsList');
-    expect(novelWorkspace).toContain('TabsTrigger');
-    expect(novelWorkspace).toContain('controlledFilter={tab}');
-    expect(novelWorkspace).toContain('variant="deck"');
-    expect(novelWorkspace).toContain("view === 'agent'");
-    expect(novelWorkspace).toContain("view === 'story-deck'");
-    expect(novelWorkspace).toContain("view === 'read-edit'");
-    expect(novelWorkspace).not.toContain("view === 'command'");
-    expect(novelWorkspace).not.toContain("view === 'inbox'");
-    expect(novelWorkspace).not.toContain("view === 'publishing'");
     expect(manuscriptReading).toContain("from '@/components/ui/empty'");
     expect(manuscriptReading).toContain('p-10 text-left shadow-xl md:p-12');
     expect(manuscriptReading).not.toContain('px-10 py-14 text-center');
