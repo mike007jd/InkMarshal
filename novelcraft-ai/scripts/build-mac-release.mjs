@@ -23,7 +23,6 @@ import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { loadAppleReleaseEnv } from './release-env.mjs';
 import { createMacDmg } from './mac-dmg.mjs';
 
 const STABLE_DMG_NAME = 'InkMarshal-mac-aarch64.dmg';
@@ -62,7 +61,9 @@ function commandOutput(result) {
 }
 
 function redactedCommandArgs(args) {
-  const sensitiveValueFlags = new Set(['--apple-id', '--password']);
+  // Only the updater signer password is a secret argv value on this path.
+  // Notary auth uses a non-secret --keychain-profile name.
+  const sensitiveValueFlags = new Set(['--password']);
   let redactNext = false;
   return args.map((arg) => {
     if (redactNext) {
@@ -174,10 +175,8 @@ function requireReleaseEnv() {
   }
 
   const signingIdentity = readEnv('APPLE_SIGNING_IDENTITY');
-  const appleId = readEnv('APPLE_ID');
   const appleTeamId = readEnv('APPLE_TEAM_ID');
-  // Accept the Apple-standard var name first, fall back to the legacy name.
-  const applePassword = readEnv('APPLE_APP_SPECIFIC_PASSWORD') || readEnv('APPLE_PASSWORD');
+  const keychainProfile = readEnv('APPLE_NOTARY_KEYCHAIN_PROFILE');
   const updaterKeyPath = readEnv('TAURI_SIGNING_PRIVATE_KEY_PATH')
     || join(homedir(), '.inkmarshal', 'release', 'updater.key');
 
@@ -185,14 +184,13 @@ function requireReleaseEnv() {
   if (signingIdentity && !signingIdentity.startsWith(SIGNING_IDENTITY_REQUIRED_PREFIX)) {
     fail('APPLE_SIGNING_IDENTITY must be a Developer ID Application identity, not Apple Development or ad-hoc.');
   }
-  if (!appleId || !appleId.includes('@')) {
-    fail('APPLE_ID is required and must be the Apple Account email used for notarization.');
-  }
   if (!appleTeamId) fail('APPLE_TEAM_ID is required.');
   if (signingIdentity && appleTeamId && !signingIdentity.endsWith(`(${appleTeamId})`)) {
     fail('APPLE_SIGNING_IDENTITY Team ID must match APPLE_TEAM_ID.');
   }
-  if (!applePassword) fail('APPLE_APP_SPECIFIC_PASSWORD (or APPLE_PASSWORD) must be an app-specific password.');
+  if (!keychainProfile) {
+    fail('APPLE_NOTARY_KEYCHAIN_PROFILE is required (non-secret notarytool keychain profile name).');
+  }
   if (!existsSync(updaterKeyPath)) fail(`Tauri updater signing key is missing: ${updaterKeyPath}`);
   if (existsSync(updaterKeyPath) && process.platform !== 'win32' && (statSync(updaterKeyPath).mode & 0o077) !== 0) {
     fail(`Tauri updater signing key must not be readable by group/others: ${updaterKeyPath}`);
@@ -210,7 +208,17 @@ function requireReleaseEnv() {
     process.exit(1);
   }
 
-  return { signingIdentity, appleId, appleTeamId, applePassword, updaterKeyPath };
+  return { signingIdentity, appleTeamId, keychainProfile, updaterKeyPath };
+}
+
+/**
+ * Prove the notarytool keychain profile resolves before any clean/build work.
+ * Uses `history`, which authenticates without submitting an artifact.
+ */
+function preflightNotaryKeychainProfile(keychainProfile) {
+  console.log(`[release:mac] preflighting notarytool keychain profile "${keychainProfile}"...`);
+  runCapture('xcrun', ['notarytool', 'history', '--keychain-profile', keychainProfile]);
+  console.log('[release:mac] notarytool keychain profile OK.');
 }
 
 function appBundlePath() {
@@ -401,7 +409,7 @@ function signBundleDeep(appPath, signingIdentity, expectedTeamId) {
  * and print the full notarytool log so the cause (e.g. an unsigned binary) is
  * visible without a separate manual step.
  */
-function notarizeArtifact(artifact, { appleId, applePassword, appleTeamId }) {
+function notarizeArtifact(artifact, { keychainProfile }) {
   const isDmg = artifact.toLowerCase().endsWith('.dmg');
   const submitTarget = isDmg ? artifact : (() => {
     const tmpZip = `${artifact}.notarize.zip`;
@@ -413,6 +421,7 @@ function notarizeArtifact(artifact, { appleId, applePassword, appleTeamId }) {
     return tmpZip;
   })();
   const cleanupZip = isDmg ? null : submitTarget;
+  const notaryAuth = ['--keychain-profile', keychainProfile];
 
   console.log(`[notarize] submitting ${isDmg ? 'DMG' : 'app'} to Apple (this can take several minutes)...`);
   // NOTE: `notarytool submit --wait` exits non-zero if notarization fails, in
@@ -420,11 +429,10 @@ function notarizeArtifact(artifact, { appleId, applePassword, appleTeamId }) {
   // means success. We do NOT parse the "Current status: In Progress..." progress
   // spam from --wait (an earlier naive `/status:\s*(\w+)/` regex matched the
   // "In" of "In Progress" and falsely reported failure on a real Accepted run).
+  // Auth is keychain-profile only — never plaintext Apple ID/password flags.
   const submitOutput = runCapture('xcrun', [
     'notarytool', 'submit', submitTarget,
-    '--apple-id', appleId,
-    '--password', applePassword,
-    '--team-id', appleTeamId,
+    ...notaryAuth,
     '--wait',
   ]);
   console.log(submitOutput);
@@ -447,9 +455,7 @@ function notarizeArtifact(artifact, { appleId, applePassword, appleTeamId }) {
       try {
         const log = runCapture('xcrun', [
           'notarytool', 'log', submissionId,
-          '--apple-id', appleId,
-          '--password', applePassword,
-          '--team-id', appleTeamId,
+          ...notaryAuth,
         ]);
         console.error(log);
       } catch (logError) {
@@ -687,17 +693,8 @@ function assertReleaseGrade(appPath, dmgPath, expectedTeamId, signedMachOBinarie
 }
 
 // ── main ──────────────────────────────────────────────────────────────────
-try {
-  const releaseEnv = loadAppleReleaseEnv();
-  if (releaseEnv.loaded.length > 0) {
-    console.log(`[release:mac] loaded Apple release env from ${releaseEnv.filePath}`);
-  }
-} catch (error) {
-  console.error(`FAIL: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
-}
-
-const { signingIdentity, appleId, appleTeamId, applePassword, updaterKeyPath } = requireReleaseEnv();
+const { signingIdentity, appleTeamId, keychainProfile, updaterKeyPath } = requireReleaseEnv();
+preflightNotaryKeychainProfile(keychainProfile);
 
 prepareDesktopPackagingEnvironment();
 
@@ -742,7 +739,7 @@ assertBundleArchitecture(appPath);
 // 1) Deep-sign the app (all nested Mach-O binaries + the bundle), then notarize
 //    + staple the app itself.
 const signedMachOBinaries = signBundleDeep(appPath, signingIdentity, appleTeamId);
-notarizeArtifact(appPath, { appleId, applePassword, appleTeamId });
+notarizeArtifact(appPath, { keychainProfile });
 stapleArtifact(appPath);
 
 // The updater archive must capture the final signed/stapled app. Signing an
@@ -763,7 +760,7 @@ createMacDmg({
 });
 assertMountedDmgAppSignature(producedDmgPath);
 signDmg(producedDmgPath, signingIdentity);
-notarizeArtifact(producedDmgPath, { appleId, applePassword, appleTeamId });
+notarizeArtifact(producedDmgPath, { keychainProfile });
 stapleArtifact(producedDmgPath);
 
 // 3) Release-grade gate, then publish the final DMG + sha256.

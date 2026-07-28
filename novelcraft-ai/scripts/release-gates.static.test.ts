@@ -46,7 +46,42 @@ describe('mac release target gate', () => {
     expect(source).toContain('target === nodeRuntimePath ? NODE_ENTITLEMENTS_PATH : null');
     expect(source).toContain('teamId !== expectedTeamId');
     expect(source).toContain('assertMinimalCodeSigning');
-    expect(source).toContain("sensitiveValueFlags = new Set(['--apple-id', '--password'])");
+    expect(source).toContain("sensitiveValueFlags = new Set(['--password'])");
+  });
+
+  it('requires a notarytool keychain profile and never passes plaintext Apple ID/password flags', () => {
+    const source = scriptSource('build-mac-release.mjs');
+    const docs = readFileSync(join(process.cwd(), 'docs/LAUNCH_READINESS.md'), 'utf8');
+    const envExample = readFileSync(join(process.cwd(), '.env.example'), 'utf8');
+
+    expect(source).toContain("readEnv('APPLE_NOTARY_KEYCHAIN_PROFILE')");
+    expect(source).toContain('APPLE_NOTARY_KEYCHAIN_PROFILE is required');
+    expect(source).toContain("['notarytool', 'history', '--keychain-profile', keychainProfile]");
+    expect(source).toContain("const notaryAuth = ['--keychain-profile', keychainProfile]");
+    expect(source).toMatch(
+      /preflightNotaryKeychainProfile\(keychainProfile\);\s*prepareDesktopPackagingEnvironment\(\);/,
+    );
+
+    expect(source).not.toContain('--apple-id');
+    expect(source).not.toContain("readEnv('APPLE_ID')");
+    expect(source).not.toContain("readEnv('APPLE_APP_SPECIFIC_PASSWORD')");
+    expect(source).not.toContain("readEnv('APPLE_PASSWORD')");
+    expect(source).not.toContain('loadAppleReleaseEnv');
+    expect(source).not.toContain('apple.env');
+    expect(source).not.toContain('release-env.mjs');
+
+    // Updater signer still uses --password; notarytool argv must not.
+    expect(source).toMatch(/signerArgs\.push\('--password', updaterPassword\)/);
+    expect(source).not.toMatch(/notarytool',\s*'(?:submit|log|history)'[\s\S]{0,240}'--(?:apple-id|password|team-id)'/);
+    expect(source).not.toContain("'--apple-id'");
+
+    expect(docs).toContain('APPLE_NOTARY_KEYCHAIN_PROFILE');
+    expect(docs).toContain('notarytool --keychain-profile');
+    expect(docs).not.toContain('APPLE_ID');
+    expect(docs).not.toContain('APPLE_APP_SPECIFIC_PASSWORD');
+    expect(docs).not.toContain('APPLE_PASSWORD');
+    expect(envExample).toContain('APPLE_NOTARY_KEYCHAIN_PROFILE');
+    expect(envExample).not.toMatch(/apple\.env/);
   });
 
   it('requires darwin/arm64 and builds the fixed aarch64 target', () => {

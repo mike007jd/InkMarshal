@@ -17,10 +17,6 @@ import {
   applyRelocation,
   relocationPlan,
 } from './relocate-dot-state.mjs';
-import {
-  loadAppleReleaseEnv,
-  parseEnvFile,
-} from './release-env.mjs';
 
 const cleanup = [];
 
@@ -120,36 +116,5 @@ describe('relocate-dot-state', () => {
       tracked: new Set(['novelcraft-ai/.env.example']),
     });
     expect(plan[0].action).toBe('skip-tracked');
-  });
-});
-
-describe('release-env', () => {
-  it('parses export-style Apple release env files', () => {
-    expect(parseEnvFile('export APPLE_ID="me@example.com"\nAPPLE_TEAM_ID=TEAM\n')).toEqual({
-      APPLE_ID: 'me@example.com',
-      APPLE_TEAM_ID: 'TEAM',
-    });
-  });
-
-  it('loads only missing allowlisted Apple release variables', () => {
-    const homeDir = tempRoot('release-home');
-    const filePath = path.join(homeDir, '.inkmarshal', 'release', 'apple.env');
-    mkdirSync(path.dirname(filePath), { recursive: true });
-    writeFileSync(filePath, 'APPLE_ID=from-file@example.com\nOPENAI_API_KEY=ignored\nAPPLE_TEAM_ID=TEAM\n');
-    if (process.platform !== 'win32') {
-      rmSync(filePath, { force: true });
-      writeFileSync(filePath, 'APPLE_ID=from-file@example.com\nOPENAI_API_KEY=ignored\nAPPLE_TEAM_ID=TEAM\n', {
-        mode: 0o600,
-      });
-    }
-    const env = { APPLE_ID: 'existing@example.com' };
-    const result = loadAppleReleaseEnv({ env, homeDir });
-    expect(result.loaded).toEqual(['APPLE_TEAM_ID']);
-    expect(result.skipped).toEqual(['APPLE_ID']);
-    expect(env).toMatchObject({
-      APPLE_ID: 'existing@example.com',
-      APPLE_TEAM_ID: 'TEAM',
-    });
-    expect(env.OPENAI_API_KEY).toBeUndefined();
   });
 });
