@@ -7,6 +7,7 @@ import {
 } from '@/app/actions/vault';
 import { isVaultEntryPath, parseMarkdownToEntry, VAULT_RECONCILE_BATCH } from '@/lib/vault/entry';
 import { vaultReadFile, vaultWalk } from '@/lib/vault/ipc';
+import type { VaultRootFence } from '@/lib/vault/types';
 
 const MAX_RECONCILE_FILE_SIZE = 128 * 1024;
 
@@ -18,6 +19,14 @@ export interface VaultSnapshotReconcileResult {
 
 export interface VaultSnapshotReconcileOptions {
   failOnReconcileError?: boolean;
+  /**
+   * When false, indexed paths missing from the snapshot are not treated as
+   * deletions (root bootstrap / transition). Established roots keep the
+   * default `true` missing-file-as-delete semantics.
+   */
+  allowMissingFileDeletes?: boolean;
+  /** Fixed pending root used to reject a batch read from a stale root. */
+  rootFence?: VaultRootFence;
 }
 
 export async function reconcileVaultSnapshot(
@@ -25,6 +34,7 @@ export async function reconcileVaultSnapshot(
   vaultPath: string,
   options: VaultSnapshotReconcileOptions = {},
 ): Promise<VaultSnapshotReconcileResult> {
+  const allowMissingFileDeletes = options.allowMissingFileDeletes !== false;
   const totals: VaultSnapshotReconcileResult = { updated: 0, deleted: 0, skipped: 0 };
   const files = (await vaultWalk(vaultPath)).filter(meta => isVaultEntryPath(meta.path));
   const presentPaths = new Set(files.map(meta => meta.path));
@@ -59,15 +69,19 @@ export async function reconcileVaultSnapshot(
       changes,
       totals,
       options,
-      getDeletedPathsHintForChanges(novelId, changes, missingPathById),
+      allowMissingFileDeletes
+        ? getDeletedPathsHintForChanges(novelId, changes, missingPathById)
+        : [],
     );
   }
-  const missingIndexedPaths = missingIndexedRefs.map(ref => ref.path);
-  for (let i = 0; i < missingIndexedPaths.length; i += VAULT_RECONCILE_BATCH) {
-    const changes = missingIndexedPaths
-      .slice(i, i + VAULT_RECONCILE_BATCH)
-      .map(path => ({ path, content: null }));
-    await reconcileSnapshotChanges(novelId, changes, totals, options);
+  if (allowMissingFileDeletes) {
+    const missingIndexedPaths = missingIndexedRefs.map(ref => ref.path);
+    for (let i = 0; i < missingIndexedPaths.length; i += VAULT_RECONCILE_BATCH) {
+      const changes = missingIndexedPaths
+        .slice(i, i + VAULT_RECONCILE_BATCH)
+        .map(path => ({ path, content: null }));
+      await reconcileSnapshotChanges(novelId, changes, totals, options);
+    }
   }
   return totals;
 }
@@ -116,10 +130,18 @@ async function reconcileSnapshotChanges(
 ): Promise<void> {
   if (changes.length === 0) return;
   try {
+    const allowMissingFileDeletes = options.allowMissingFileDeletes !== false;
+    const reconcileOptions = {
+      ...(deletedPathsHint.length > 0 ? { deletedPathsHint } : {}),
+      // Pending-root snapshots must let newer Markdown win by updatedAt
+      // instead of replaying durable upsert intents onto the new root.
+      ...(allowMissingFileDeletes ? {} : { allowUpsertMirrorReplay: false as const }),
+      ...(options.rootFence ? { rootFence: options.rootFence } : {}),
+    };
     const result = await reconcileVaultChangedFiles(
       novelId,
       changes,
-      deletedPathsHint.length > 0 ? { deletedPathsHint } : undefined,
+      Object.keys(reconcileOptions).length > 0 ? reconcileOptions : undefined,
     );
     if (options.failOnReconcileError && result.skipped > 0) {
       throw new Error(`Vault snapshot reconcile skipped ${result.skipped} changed file(s)`);

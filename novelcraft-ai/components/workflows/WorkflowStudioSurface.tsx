@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, Trash2, Wand2 } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
+import { joinLocalizedDisplayList } from '@/lib/i18n';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
@@ -673,7 +674,9 @@ export function WorkflowStudioSurface() {
                       {trial && (
                         <>
                           {trial.missingVars.length > 0 && (
-                            <p className="text-xs text-book-ink-muted">{copy.missingVarsNote(trial.missingVars.join(', '))}</p>
+                            <p className="text-xs text-book-ink-muted">
+                              {copy.missingVarsNote(joinLocalizedDisplayList(trial.missingVars, locale))}
+                            </p>
                           )}
                           <TrialDiffView copy={copy} defaultText={trial.defaultText} variantText={trial.variantText} />
                         </>

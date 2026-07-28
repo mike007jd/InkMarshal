@@ -57,12 +57,14 @@ export async function vaultWatchStart(
   novelId: string,
   vaultPath: string,
   watchId?: string | null,
+  watchGeneration?: number | null,
 ): Promise<void> {
   requireTauri('vaultWatchStart');
   await invokeTauri<void>(VAULT_COMMANDS.vaultWatchStart, {
     novelId,
     vaultPath,
     watchId: watchId ?? null,
+    watchGeneration: watchGeneration ?? null,
   });
 }
 
@@ -70,12 +72,14 @@ export async function vaultWatchStop(
   novelId: string,
   vaultPath?: string | null,
   watchId?: string | null,
+  watchGeneration?: number | null,
 ): Promise<void> {
   requireTauri('vaultWatchStop');
   await invokeTauri<void>(VAULT_COMMANDS.vaultWatchStop, {
     novelId,
     vaultPath: vaultPath ?? null,
     watchId: watchId ?? null,
+    watchGeneration: watchGeneration ?? null,
   });
 }
 

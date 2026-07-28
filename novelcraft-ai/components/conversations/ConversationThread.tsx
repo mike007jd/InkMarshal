@@ -163,7 +163,7 @@ export function ConversationThread({ novelId, conversationId }: ConversationThre
           <span className="text-xs text-book-ink-muted">
             {t.conversationForkedFrom}{' '}
             <code className="text-2xs bg-book-bg-card px-1 py-0.5 rounded">
-              {conversation.parentMessageId.slice(0, 8)}...
+              {conversation.parentMessageId.slice(0, 8)}…
             </code>
           </span>
         </div>

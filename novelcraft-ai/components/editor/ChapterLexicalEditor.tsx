@@ -93,6 +93,7 @@ export function ChapterLexicalEditor({
         handleEditorRef={handleEditorRef}
         readOnly={readOnly}
         manuscriptChapterLabel={t.manuscriptChapter}
+        chapterEditorLabel={t.editorChapterLabel.replace('{num}', String(chapterNumber))}
       />
     </LexicalComposer>
   );
@@ -109,6 +110,7 @@ interface BodyProps {
   handleEditorRef: (editor: LexicalEditor) => void;
   readOnly: boolean;
   manuscriptChapterLabel: string;
+  chapterEditorLabel: string;
 }
 
 function ChapterEditorBody({
@@ -122,6 +124,7 @@ function ChapterEditorBody({
   handleEditorRef,
   readOnly,
   manuscriptChapterLabel,
+  chapterEditorLabel,
 }: BodyProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Scroll to top when chapter changes so the user lands on the title.
@@ -152,7 +155,7 @@ function ChapterEditorBody({
           contentEditable={
             <ContentEditable
               className="manuscript-prose outline-none whitespace-pre-wrap font-serif text-book-ink-secondary [&_p:empty]:h-[1em]"
-              aria-label={`Chapter ${chapterNumber} editor`}
+              aria-label={chapterEditorLabel}
               spellCheck
               data-testid="chapter-lexical-editable"
               data-readonly={readOnly ? 'true' : 'false'}

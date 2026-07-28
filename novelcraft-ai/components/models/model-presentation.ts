@@ -3,9 +3,29 @@
 // testable (especially recoveryMessage's error-string classification) and the
 // panel shrinks toward view-only code.
 
-import type { StringKey, Translations } from '@/lib/i18n';
+import {
+  joinLocalizedDisplayList,
+  type Locale,
+  type StringKey,
+  type Translations,
+} from '@/lib/i18n';
 import type { CapabilityRole, CuratedModelEntry } from '@/lib/model-supply/types';
 import type { EngineFormat } from '@/lib/desktop-runtime';
+
+/** Short label for a capability role, shared by the running-engine chips so the
+ *  wording stays consistent across the Models panel and Settings. */
+export function roleChipLabel(role: CapabilityRole, t: Translations): string {
+  switch (role) {
+    case 'draft':
+      return t.modelManagerRoleDraft;
+    case 'rewrite':
+      return t.modelManagerRoleRewrite;
+    case 'planning':
+      return t.modelManagerRolePlanning;
+    case 'recall':
+      return t.modelManagerRoleRecall;
+  }
+}
 
 export function roleSummary(entry: CuratedModelEntry, t: Translations): string {
   const roles = Array.isArray(entry.role) ? entry.role : [entry.role];
@@ -31,19 +51,12 @@ export function formatLabel(format: EngineFormat, t: Translations): string {
   return format === 'mlx' ? t.modelManagerFormatMlx : t.modelManagerFormatGguf;
 }
 
-/** Short label for a capability role, shared by the running-engine chips so the
- *  wording stays consistent across the Models panel and Settings. */
-export function roleChipLabel(role: CapabilityRole, t: Translations): string {
-  switch (role) {
-    case 'draft':
-      return t.modelManagerRoleDraft;
-    case 'rewrite':
-      return t.modelManagerRoleRewrite;
-    case 'planning':
-      return t.modelManagerRolePlanning;
-    case 'recall':
-      return t.modelManagerRoleRecall;
-  }
+export function roleListSummary(
+  roles: readonly CapabilityRole[],
+  t: Translations,
+  locale: Locale,
+): string {
+  return joinLocalizedDisplayList(roles.map(role => roleChipLabel(role, t)), locale);
 }
 
 export function installDate(value: number | undefined, t: Translations): string {

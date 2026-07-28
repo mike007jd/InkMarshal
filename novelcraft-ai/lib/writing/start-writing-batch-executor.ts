@@ -149,7 +149,7 @@ export async function executeWritingChapterBatch(args: {
       type: 'progress',
       progress: progressForCompleted(completedChapters),
       message: isZhLocale(language)
-        ? `正在创作第 ${plan.chapterNumber} 章：${plan.title}...`
+        ? `正在创作第 ${plan.chapterNumber} 章：${plan.title}…`
         : `Writing Chapter ${plan.chapterNumber}: ${plan.title}...`,
     });
 
@@ -306,7 +306,7 @@ export async function executeWritingChapterBatch(args: {
       completedChapters,
       totalChapters: blueprint.chapters.length,
       message: isZhLocale(language)
-        ? `正在保存第 ${plan.chapterNumber} 章...`
+        ? `正在保存第 ${plan.chapterNumber} 章…`
         : `Saving Chapter ${plan.chapterNumber}...`,
     });
     completedChapters += 1;

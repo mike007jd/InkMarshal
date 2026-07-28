@@ -63,13 +63,16 @@ pub struct VaultReachable {
 
 /// Payload emitted via the `vault://changed` event. `kind` mirrors notify's
 /// coarse-grained categories so the TS layer can decide between a targeted
-/// reindex (modify) vs. a full walk (rename/remove).
+/// reindex (modify) vs. a full walk (rename/remove). `watch_id` lets the
+/// runtime reject stale events from a previous watcher generation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultChangedEvent {
     pub novel_id: String,
     pub paths: Vec<String>,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,8 +105,12 @@ mod tests {
         ensure_existing_dir_inside, open_new_vault_temp_file, safe_entry_rel_path, safe_rel_path,
         sha256_hex, validate_reveal_vault_root, vault_root, MAX_VAULT_ENTRY_FILE_BYTES,
     };
-    use super::watch::same_watch_generation_parts;
+    use super::watch::{
+        generation_is_stale, group_paths_by_kind, same_watch_generation_parts,
+        same_watch_identity_parts,
+    };
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -283,6 +290,23 @@ mod tests {
         assert_eq!(r.content_hash, w.content_hash);
         // Hash is the sha256 of the exact bytes.
         assert_eq!(r.content_hash, sha256_hex(body.as_bytes()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vault_read_distinguishes_missing_entry_from_unreachable_root() {
+        let tmp = unique_tmp("read-missing-kinds");
+        let vault = tmp.join("v");
+        let vault_path = vault.to_string_lossy().into_owned();
+        vault_init("n".into(), vault_path.clone()).unwrap();
+
+        let missing =
+            vault_read_file(vault_path.clone(), "characters/missing.md".into()).unwrap_err();
+        assert!(missing.starts_with("VAULT_ENTRY_NOT_FOUND:"));
+
+        fs::remove_dir_all(&vault).unwrap();
+        let unreachable = vault_read_file(vault_path, "characters/missing.md".into()).unwrap_err();
+        assert!(unreachable.starts_with("VAULT_ROOT_UNREACHABLE:"));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -684,20 +708,64 @@ mod tests {
         assert!(same_watch_generation_parts(
             Path::new("/tmp/inkmarshal-vault-a"),
             Some("watch-1"),
+            Some(41),
             Path::new("/tmp/inkmarshal-vault-a"),
             Some("watch-1"),
+            Some(41),
         ));
         assert!(!same_watch_generation_parts(
             Path::new("/tmp/inkmarshal-vault-a"),
             Some("watch-1"),
+            Some(41),
             Path::new("/tmp/inkmarshal-vault-b"),
             Some("watch-1"),
+            Some(41),
         ));
         assert!(!same_watch_generation_parts(
             Path::new("/tmp/inkmarshal-vault-a"),
             Some("watch-1"),
+            Some(41),
             Path::new("/tmp/inkmarshal-vault-a"),
             Some("watch-2"),
+            Some(41),
         ));
+        assert!(!same_watch_generation_parts(
+            Path::new("/tmp/inkmarshal-vault-a"),
+            Some("watch-1"),
+            Some(41),
+            Path::new("/tmp/inkmarshal-vault-a"),
+            Some("watch-1"),
+            Some(42),
+        ));
+        assert!(generation_is_stale(Some(42), Some(41)));
+        assert!(!generation_is_stale(Some(41), Some(42)));
+        assert!(generation_is_stale(Some(42), None));
+        // A missing/unmounted root still permits an exact stop by identity.
+        assert!(same_watch_identity_parts(
+            Some("watch-1"),
+            Some(41),
+            Some("watch-1"),
+            Some(41),
+        ));
+        assert!(!same_watch_identity_parts(
+            Some("watch-2"),
+            Some(42),
+            Some("watch-1"),
+            Some(41),
+        ));
+    }
+
+    #[test]
+    fn vault_debounce_groups_preserve_per_path_kinds() {
+        let mut path_kinds = HashMap::new();
+        path_kinds.insert("characters/a.md".into(), "modify".into());
+        path_kinds.insert("characters/b.md".into(), "remove".into());
+        assert_eq!(
+            group_paths_by_kind(&path_kinds),
+            vec![
+                ("modify".into(), vec!["characters/a.md".into()]),
+                ("remove".into(), vec!["characters/b.md".into()]),
+            ]
+        );
     }
 }

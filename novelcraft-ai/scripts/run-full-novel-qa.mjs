@@ -31,9 +31,9 @@ function initializeCurrentDatabase() {
       'CREATE TABLE _schema_version (version INTEGER NOT NULL, description TEXT NOT NULL, applied_at TEXT NOT NULL)',
     );
     db.prepare(
-      'INSERT INTO _schema_version (version, description, applied_at) VALUES (1, ?, ?)',
-    ).run('current_prelaunch_baseline', now);
-    db.pragma('user_version = 1');
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (19, ?, ?)',
+    ).run('current_epoch_v19', now);
+    db.pragma('user_version = 19');
   });
   try {
     tx();

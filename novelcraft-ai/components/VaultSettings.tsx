@@ -23,7 +23,7 @@ import {
   setNovelVaultPathAction,
   type NovelVaultStatus,
 } from '@/app/actions/vault';
-import { reconcileVaultSnapshot } from '@/lib/vault/snapshot-reconcile';
+import { requestVaultPathChanged } from '@/lib/vault/runtime-events';
 
 interface VaultSettingsProps {
   /** Optional novelId override; falls back to the URL params. */
@@ -102,15 +102,23 @@ export function VaultSettings({ novelId: novelIdProp }: VaultSettingsProps) {
     const requestNovelId = novelId;
     (async () => {
       try {
+        await Promise.resolve();
+        if (cancelled || activeNovelRef.current !== requestNovelId) return;
+        setBusy(true);
         const def = await defaultVaultPathForNovel(novelId);
         if (!def || cancelled || activeNovelRef.current !== requestNovelId) return;
         await vaultInit(novelId, def);
+        // Commit the binding first so writes never target a different root, then
+        // notify the runtime so it can stop any prior watcher generation.
         await setNovelVaultPathAction(novelId, def);
+        await requestVaultPathChanged(novelId, def);
         if (!cancelled && activeNovelRef.current === requestNovelId) await refresh();
       } catch (err) {
         if (!cancelled && activeNovelRef.current === requestNovelId) {
           setError(err instanceof Error ? err.message : String(err));
         }
+      } finally {
+        if (!cancelled && activeNovelRef.current === requestNovelId) setBusy(false);
       }
     })();
     return () => {
@@ -143,12 +151,18 @@ export function VaultSettings({ novelId: novelIdProp }: VaultSettingsProps) {
         return;
       }
       await vaultInit(novelId, picked);
-      await reconcileVaultSnapshot(novelId, picked, { failOnReconcileError: true });
+      // Commit the new binding before reconcile/writes so helpers never use the
+      // old DB path against the new directory. Notify the coordinator so the old
+      // watcher generation is stopped before the new path generation is accepted.
       await setNovelVaultPathAction(novelId, picked);
+      await requestVaultPathChanged(novelId, picked);
       if (activeNovelRef.current === requestNovelId) await refresh();
     } catch (err) {
       if (activeNovelRef.current === requestNovelId) {
-        setError(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        // Refresh so the UI shows the committed path even when reconcile failed.
+        await refresh().catch(() => undefined);
+        if (activeNovelRef.current === requestNovelId) setError(message);
       }
     } finally {
       if (activeNovelRef.current === requestNovelId) setBusy(false);

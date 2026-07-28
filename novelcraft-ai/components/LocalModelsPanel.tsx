@@ -369,8 +369,8 @@ export function LocalModelsPanel({
       }
       if (hydrationAttempt) return;
       const attempt = (async () => {
-        const ready = await hydrateAppSettings();
-        if (cancelled || !mountedRef.current || !ready) return;
+        const result = await hydrateAppSettings();
+        if (cancelled || !mountedRef.current || !result.ok) return;
         settingsHydratedRef.current = true;
         refreshBindingReadiness(true);
       })().finally(() => {
@@ -392,8 +392,9 @@ export function LocalModelsPanel({
       if (settingsHydratedRef.current) refreshBindingReadiness(true);
       else ensureHydratedReadiness();
     });
-    const onFocus = ensureHydratedReadiness;
-    window.addEventListener('focus', onFocus);
+    const retry = ensureHydratedReadiness;
+    window.addEventListener('focus', retry);
+    window.addEventListener('online', retry);
     const healthInterval = window.setInterval(
       ensureHydratedReadiness,
       CAPABILITY_HEALTH_REFRESH_MS,
@@ -401,7 +402,8 @@ export function LocalModelsPanel({
     return () => {
       cancelled = true;
       unsubscribe();
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', retry);
+      window.removeEventListener('online', retry);
       window.clearInterval(healthInterval);
     };
   }, [refresh, refreshBindingReadiness]);
@@ -1142,7 +1144,7 @@ export function LocalModelsPanel({
   if (loading && installed.length === 0 && !showAdvancedManager) {
     return (
       <section className="flex min-h-48 items-center justify-center" aria-busy="true">
-        <span className="text-sm text-book-ink-muted">{t.loading}...</span>
+        <span className="text-sm text-book-ink-muted">{t.loading}…</span>
       </section>
     );
   }

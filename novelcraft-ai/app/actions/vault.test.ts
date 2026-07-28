@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -108,11 +108,50 @@ describe('vault server actions', () => {
       ).rejects.toThrow('Vault path must be absolute');
 
       const saved = await getNovelVault(novel.id);
-      expect(saved).toEqual({
+      expect(saved).toMatchObject({
         vaultPath: '/Users/local/InkMarshal Vault',
-        vaultVersion: 1,
       });
+      // First bind allocates a pending transition token (`<= 0`) until
+      // non-destructive import + missing-only projection promote the root.
+      expect(saved!.vaultVersion).toBeLessThanOrEqual(0);
 
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('rejects a snapshot batch captured from a stale pending-root generation', async () => {
+    const { createNovel, deleteNovelCascade, getKnowledgeEntry } = await import('@/lib/db');
+    const { getNovelVault } = await import('@/lib/db/queries-vault');
+    const { reconcileVaultChangedFiles, setNovelVaultPathAction } = await import('@/app/actions/vault');
+    const novel = await createNovel({ userId: 'local-user', title: 'Vault stale fence' });
+    const entryId = randomUUID();
+    const root = path.join(tmpDir, `vault-${novel.id}`);
+    try {
+      await setNovelVaultPathAction(novel.id, root);
+      const pending = (await getNovelVault(novel.id))!;
+      const content = [
+        '---',
+        `id: ${entryId}`,
+        'type: character',
+        'title: Stale Root Entry',
+        '---',
+        'Must not cross a root transition.',
+        '',
+      ].join('\n');
+
+      await expect(reconcileVaultChangedFiles(
+        novel.id,
+        [{ path: `characters/${entryId}.md`, content }],
+        {
+          allowUpsertMirrorReplay: false,
+          rootFence: {
+            expectedRoot: root,
+            expectedToken: pending.vaultVersion - 1,
+          },
+        },
+      )).rejects.toThrow('Vault root changed during pending reconcile');
+      expect(await getKnowledgeEntry(entryId, novel.id)).toBeUndefined();
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }
@@ -290,7 +329,9 @@ describe('vault server actions', () => {
   });
 
   it('removes stale embeddings when vault files update or disappear', async () => {
-    const { createNovel, deleteNovelCascade } = await import('@/lib/db');
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T13:00:00.000Z'));
+    const { createNovel, deleteNovelCascade, getKnowledgeEntry } = await import('@/lib/db');
     const {
       getKnowledgeEmbedding,
       listKnowledgeIndexForNovel,
@@ -335,6 +376,24 @@ describe('vault server actions', () => {
       expect(await getKnowledgeEmbedding(entryId)).toBeNull();
       expect(await listKnowledgeIndexForNovel(novel.id)).toHaveLength(1);
 
+      const changedAgain = changed.replace('red harbor', 'green forest');
+      await upsertKnowledgeEmbedding({
+        id: entryId,
+        novelId: novel.id,
+        modelId: 'test-embedder',
+        dim: 2,
+        vector: Float32Array.from([0.5, 0.5]),
+        contentHash: 'stale-before-second-edit',
+        updatedAt: new Date().toISOString(),
+      });
+      expect(await getKnowledgeEmbedding(entryId)).not.toBeNull();
+
+      expect(
+        await reconcileVaultChangedFiles(novel.id, [{ path: pathName, content: changedAgain }]),
+      ).toEqual({ updated: 1, deleted: 0, skipped: 0 });
+      expect((await getKnowledgeEntry(entryId, novel.id))?.summary).toContain('green forest');
+      expect(await getKnowledgeEmbedding(entryId)).toBeNull();
+
       await upsertKnowledgeEmbedding({
         id: entryId,
         novelId: novel.id,
@@ -344,14 +403,13 @@ describe('vault server actions', () => {
         contentHash: 'stale-before-delete',
         updatedAt: new Date().toISOString(),
       });
-      expect(await getKnowledgeEmbedding(entryId)).not.toBeNull();
-
       expect(
         await reconcileVaultChangedFiles(novel.id, [{ path: pathName, content: null }]),
       ).toEqual({ updated: 0, deleted: 1, skipped: 0 });
       expect(await getKnowledgeEmbedding(entryId)).toBeNull();
       expect(await listKnowledgeIndexForNovel(novel.id)).toHaveLength(0);
     } finally {
+      vi.useRealTimers();
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });
@@ -419,7 +477,7 @@ describe('vault server actions', () => {
     }
   });
 
-  it('does not report a committed vault delete as skipped when sibling embedding cleanup fails', async () => {
+  it('rolls back a vault delete when sibling embedding invalidation fails', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntry } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
     const {
@@ -485,12 +543,12 @@ describe('vault server actions', () => {
 
       expect(
         await reconcileVaultChangedFiles(novel.id, [{ path: pathName, content: null }]),
-      ).toEqual({ updated: 0, deleted: 1, skipped: 0 });
+      ).toEqual({ updated: 0, deleted: 0, skipped: 1 });
 
-      expect(await getKnowledgeEntry(deletedId, novel.id)).toBeUndefined();
+      expect(await getKnowledgeEntry(deletedId, novel.id)).toBeDefined();
       const siblingAfter = await getKnowledgeEntry(sibling.id, novel.id);
-      expect(JSON.parse(siblingAfter!.data).characterRefs).toEqual([]);
-      expect((await getKnowledgeIndexById(sibling.id))?.data.characterRefs).toEqual([]);
+      expect(JSON.parse(siblingAfter!.data).characterRefs).toEqual([deletedId]);
+      expect((await getKnowledgeIndexById(sibling.id))?.data.characterRefs).toEqual([deletedId]);
       expect(await getKnowledgeEmbedding(sibling.id)).not.toBeNull();
     } finally {
       getDb().prepare('DROP TRIGGER IF EXISTS fail_sibling_embedding_cleanup').run();
@@ -670,7 +728,7 @@ describe('vault server actions', () => {
     }
   });
 
-  it('rolls back same-path vault id replacement when dangling ref cleanup fails', async () => {
+  it('rolls back same-path vault id replacement when sibling embedding invalidation fails', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntry } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
     const {
@@ -726,13 +784,22 @@ describe('vault server actions', () => {
         contentHash: 'old-before-failed-rewrite',
         updatedAt: new Date().toISOString(),
       });
+      await upsertKnowledgeEmbedding({
+        id: sibling.id,
+        novelId: novel.id,
+        modelId: 'test-embedder',
+        dim: 2,
+        vector: Float32Array.from([0.6, 0.4]),
+        contentHash: 'sibling-before-failed-rewrite',
+        updatedAt: new Date().toISOString(),
+      });
 
       getDb().prepare(
         `CREATE TEMP TRIGGER fail_vault_id_rewrite_ref_cleanup
-          BEFORE UPDATE OF data ON knowledge_entries
+          BEFORE DELETE ON knowledge_embeddings
           WHEN OLD.id = '${sibling.id}'
           BEGIN
-            SELECT RAISE(ABORT, 'vault rewrite cleanup failed');
+            SELECT RAISE(ABORT, 'vault rewrite embedding cleanup failed');
           END`,
       ).run();
 
@@ -745,6 +812,7 @@ describe('vault server actions', () => {
       expect((await getKnowledgeEntry(oldId, novel.id))?.title).toBe('Rollback Old Keeper');
       expect(await getKnowledgeEntry(newId, novel.id)).toBeUndefined();
       expect(await getKnowledgeEmbedding(oldId)).not.toBeNull();
+      expect(await getKnowledgeEmbedding(sibling.id)).not.toBeNull();
       expect(await listKnowledgeIndexForNovel(novel.id)).toMatchObject([
         { id: oldId, path: pathName, title: 'Rollback Old Keeper' },
         { id: sibling.id, title: 'Rollback Rewrite Event' },

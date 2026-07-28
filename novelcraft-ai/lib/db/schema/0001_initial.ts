@@ -174,14 +174,17 @@ CREATE TABLE IF NOT EXISTS knowledge_embeddings (
 );
 
 CREATE TABLE IF NOT EXISTS knowledge_vault_outbox (
-  entry_id      TEXT PRIMARY KEY,
-  novel_id      TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
-  operation     TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
-  rel_path      TEXT,
-  attempt_count INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
+  entry_id         TEXT PRIMARY KEY,
+  novel_id         TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  operation        TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  rel_path         TEXT,
+  status           TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending', 'completed', 'dead_letter')),
+  intent_revision  INTEGER NOT NULL DEFAULT 1,
+  attempt_count    INTEGER NOT NULL DEFAULT 0,
+  last_error       TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (

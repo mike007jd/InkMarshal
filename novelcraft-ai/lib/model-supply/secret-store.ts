@@ -67,11 +67,10 @@ export interface SecretStoreStatus {
  */
 export async function secretStoreActiveBackend(): Promise<SecretStoreStatus['backend']> {
   if (!isTauriRuntime()) throw new Error(DESKTOP_REQUIRED);
-  try {
-    return await keychainStatus();
-  } catch {
-    return 'encrypted_file';
-  }
+  // Rust reports the actual active backend, including its own encrypted-file
+  // fallback. An invoke/protocol failure is not evidence that the fallback is
+  // active, so propagate it and let the UI disclose an honest unknown state.
+  return keychainStatus();
 }
 
 /**

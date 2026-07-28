@@ -100,7 +100,7 @@ export function StylePicker({ novelId, selectedStyleId, onSelect }: StylePickerP
 
             {loading && (
               <DropdownMenuItem disabled className="py-3 text-xs text-book-ink-muted">
-                {t.loading}...
+                {t.loading}…
               </DropdownMenuItem>
             )}
 

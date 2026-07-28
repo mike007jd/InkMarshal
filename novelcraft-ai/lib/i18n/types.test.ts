@@ -1,3 +1,7 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import { normalizeLocale } from '@/lib/i18n/types';
@@ -48,5 +52,82 @@ describe('translation placeholders', () => {
 
     walk(getTranslations('en'), getTranslations('zh-CN'));
     walk(getTranslations('en'), getTranslations('zh-TW'));
+  });
+
+  it('keeps Chinese status copy readable and uses typographic ellipses', () => {
+    const english = getTranslations('en');
+    const simplified = getTranslations('zh-CN');
+    const traditional = getTranslations('zh-TW');
+
+    expect(simplified.statusBarUnbound.replace('{op}', 'Agent')).toBe('Agent 尚未设置');
+    expect(traditional.statusBarUnbound.replace('{op}', 'Agent')).toBe('Agent 尚未設定');
+    expect(english.editorChapterLabel.replace('{num}', '1')).toBe('Chapter 1 editor');
+    expect(simplified.editorChapterLabel.replace('{num}', '1')).toBe('第 1 章编辑器');
+    expect(traditional.editorChapterLabel.replace('{num}', '1')).toBe('第 1 章編輯器');
+
+    const assertNoAsciiEllipses = (value: unknown, path: string[] = []) => {
+      if (typeof value === 'string') {
+        expect(value, path.join('.')).not.toContain('...');
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        assertNoAsciiEllipses(child, [...path, key]);
+      }
+    };
+
+    assertNoAsciiEllipses(simplified);
+    assertNoAsciiEllipses(traditional);
+  });
+
+  it('keeps inline Chinese product copy free of ASCII ellipses', () => {
+    const sourceFiles: string[] = [];
+    const collectSourceFiles = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const entryPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          collectSourceFiles(entryPath);
+        } else if (
+          /\.(?:ts|tsx)$/.test(entry.name)
+          && !/\.(?:test|spec)\.(?:ts|tsx)$/.test(entry.name)
+          && entry.name !== 'prompt-seed.ts'
+        ) {
+          sourceFiles.push(entryPath);
+        }
+      }
+    };
+    for (const directory of ['app', 'components', 'lib']) {
+      collectSourceFiles(path.join(process.cwd(), directory));
+    }
+
+    const violations: string[] = [];
+    const containsBadChineseEllipsis = (value: string) =>
+      /\p{Script=Han}/u.test(value) && value.includes('...');
+    for (const filePath of sourceFiles) {
+      const sourceText = readFileSync(filePath, 'utf8');
+      const sourceFile = ts.createSourceFile(
+        filePath,
+        sourceText,
+        ts.ScriptTarget.Latest,
+        true,
+        filePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+      );
+      const walk = (node: ts.Node) => {
+        let value: string | undefined;
+        if (ts.isStringLiteralLike(node)) {
+          value = node.text;
+        } else if (ts.isTemplateExpression(node)) {
+          value = [node.head.text, ...node.templateSpans.map(span => span.literal.text)].join('');
+        }
+        if (value && containsBadChineseEllipsis(value)) {
+          const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+          violations.push(`${path.relative(process.cwd(), filePath)}:${line + 1}`);
+        }
+        ts.forEachChild(node, walk);
+      };
+      walk(sourceFile);
+    }
+
+    expect(violations).toEqual([]);
   });
 });

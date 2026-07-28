@@ -167,7 +167,7 @@ export async function POST(
 
       try {
         log(START_WRITING_EVENTS.unifyStart, { chapters: chapters.length });
-        send({ type: 'progress', message: isZhLocale(locale) ? '正在扫描全书一致性...' : 'Scanning full manuscript for consistency issues...' });
+        send({ type: 'progress', message: isZhLocale(locale) ? '正在扫描全书一致性…' : 'Scanning full manuscript for consistency issues...' });
 
         const chapterDumps: UnificationChapterInput[] = chapters.map(c => ({
           chapterNumber: c.chapterNumber,

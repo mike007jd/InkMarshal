@@ -40,7 +40,8 @@ describe('LocalModelsPanel removal path', () => {
     expect(source).toContain('healthyConnectionModels,');
     expect(source).toContain('refreshBindingReadiness(true)');
     expect(source).toContain('CAPABILITY_HEALTH_REFRESH_MS');
-    expect(source).toContain('const ready = await hydrateAppSettings()');
+    expect(source).toContain('const result = await hydrateAppSettings()');
+    expect(source).toContain('if (cancelled || !mountedRef.current || !result.ok) return');
     expect(source).toContain('if (!settingsHydratedRef.current) return');
     expect(source).toContain('const engines = await engineStatus().catch');
   });

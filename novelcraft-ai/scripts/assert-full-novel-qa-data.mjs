@@ -91,7 +91,7 @@ function main() {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     const schemaVersion = scalar(db, 'SELECT version FROM _schema_version ORDER BY version DESC LIMIT 1');
-    assert(schemaVersion === 1, 'Expected baseline schema v1', { schemaVersion });
+    assert(schemaVersion === 19, 'Expected current schema v19', { schemaVersion });
 
     const novel = db.prepare(
       'SELECT id, title, series_id, vault_version FROM novels WHERE id = ?',

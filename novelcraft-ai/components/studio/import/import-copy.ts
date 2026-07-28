@@ -46,6 +46,13 @@ export interface ImportWizardCopy extends ImportEditorCopy {
   runKbLabel: string;
   runKbHint: string;
   conflictWarning: (n: number) => string;
+  // merge dedupe state machine
+  dedupeChecking: string;
+  dedupeFailed: string;
+  dedupeRetry: string;
+  dedupeStale: string;
+  dedupeRecheck: string;
+  duplicateOverwriteTargets: (chapters: number[]) => string;
   // footer
   back: string;
   cancel: string;
@@ -100,6 +107,13 @@ const en: ImportWizardCopy = {
   runKbLabel: 'Extract characters, places & style into the knowledge base',
   runKbHint: 'Uses your recall model after import. Optional — runs in the background and never blocks the import.',
   conflictWarning: (n) => `${n} chapter${n === 1 ? '' : 's'} match existing chapters. Choose what to do with each below.`,
+  dedupeChecking: 'Checking for matching chapters…',
+  dedupeFailed: 'Couldn’t check for matching chapters. Nothing was imported — retry to continue.',
+  dedupeRetry: 'Retry check',
+  dedupeStale: 'The chapter list changed. Re-check matches before merging.',
+  dedupeRecheck: 'Re-check matches',
+  duplicateOverwriteTargets: (chapters) =>
+    `More than one imported chapter would overwrite existing ${chapters.length === 1 ? 'chapter' : 'chapters'} ${chapters.join(', ')}. For each target, change all but one to Skip or Append.`,
   back: 'Back',
   cancel: 'Cancel',
   confirmNew: 'Create novel & import',
@@ -150,6 +164,13 @@ const zhCN: ImportWizardCopy = {
   runKbLabel: '把角色、地点与风格提取进知识库',
   runKbHint: '导入后使用你的 recall 模型。可选——后台运行，不会阻断导入。',
   conflictWarning: (n) => `有 ${n} 章与现有章节匹配。请在下方逐章选择处理方式。`,
+  dedupeChecking: '正在检查与现有章节的匹配…',
+  dedupeFailed: '无法检查与现有章节的匹配。尚未导入任何内容——请重试以继续。',
+  dedupeRetry: '重试检查',
+  dedupeStale: '章节列表已更改，合并前请重新检查匹配。',
+  dedupeRecheck: '重新检查匹配',
+  duplicateOverwriteTargets: (chapters) =>
+    `多条导入章节将同时覆盖现有第 ${chapters.join('、')} 章。请为每个目标仅保留一条“覆盖”，其余改为“跳过”或“追加”。`,
   back: '上一步',
   cancel: '取消',
   confirmNew: '创建作品并导入',
@@ -200,6 +221,13 @@ const zhTW: ImportWizardCopy = {
   runKbLabel: '把角色、地點與風格提取進知識庫',
   runKbHint: '匯入後使用你的 recall 模型。選用——背景執行，不會阻斷匯入。',
   conflictWarning: (n) => `有 ${n} 章與現有章節對應。請在下方逐章選擇處理方式。`,
+  dedupeChecking: '正在檢查與現有章節的對應…',
+  dedupeFailed: '無法檢查與現有章節的對應。尚未匯入任何內容——請重試以繼續。',
+  dedupeRetry: '重試檢查',
+  dedupeStale: '章節列表已更改，合併前請重新檢查對應。',
+  dedupeRecheck: '重新檢查對應',
+  duplicateOverwriteTargets: (chapters) =>
+    `多個匯入章節將同時覆寫現有第 ${chapters.join('、')} 章。請為每個目標僅保留一個「覆寫」，其餘改為「略過」或「附加」。`,
   back: '上一步',
   cancel: '取消',
   confirmNew: '建立作品並匯入',

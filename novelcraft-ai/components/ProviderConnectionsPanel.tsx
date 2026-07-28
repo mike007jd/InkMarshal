@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, KeyRound, PlugZap, Plus, Trash2, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, KeyRound, PlugZap, Plus, ShieldCheck, Trash2, XCircle } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
 import { Badge } from '@/components/ui/badge';
@@ -37,6 +37,9 @@ import {
   saveConnectionWithOptionalSecret,
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
+import { isTauriRuntime } from '@/lib/desktop-runtime';
+import { categorizeHealthFailure, healthFailureMessage } from '@/lib/model-supply/health-failure';
+import { secretStoreActiveBackend } from '@/lib/model-supply/secret-store';
 import type {
   RuntimeConnection,
   RuntimeConnectionKind,
@@ -56,6 +59,9 @@ interface DraftForm {
 }
 
 type KeyPresenceState = 'present' | 'missing' | 'unavailable';
+
+/** Result of probing which secret backend the desktop runtime is using. */
+type SecretBackendState = 'keychain' | 'encrypted_file' | 'unknown' | null;
 
 function emptyDraft(): DraftForm {
   return {
@@ -91,17 +97,46 @@ export function ProviderConnectionsPanel() {
   const [removeError, setRemoveError] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
   const [keyPresence, setKeyPresence] = useState<Record<string, KeyPresenceState>>({});
+  const [secretBackend, setSecretBackend] = useState<SecretBackendState>(null);
   const mountedRef = useRef(true);
   const refreshSeqRef = useRef(0);
   const editSeqRef = useRef(0);
   const savingRef = useRef(false);
   const removeSeqRef = useRef(0);
   const removingRef = useRef(false);
+  const backendProbeSeqRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  // Desktop-only: disclose which secret backend will hold API keys entered
+  // here (system keychain vs the app's AES-256-GCM encrypted local fallback).
+  // A probe failure degrades to an honest "unknown" line — never a guess — and
+  // late responses after unmount are dropped via the seq guard.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const seq = ++backendProbeSeqRef.current;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      secretStoreActiveBackend()
+        .then(backend => {
+          if (!cancelled && mountedRef.current && backendProbeSeqRef.current === seq) {
+            setSecretBackend(backend);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && mountedRef.current && backendProbeSeqRef.current === seq) {
+            setSecretBackend('unknown');
+          }
+        });
+    });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -251,18 +286,22 @@ export function ProviderConnectionsPanel() {
       const ok = health.reachable && health.transportOk;
       setTestResult({
         ok,
-        message: ok ? t.modelManagerTestReachable : health.message || t.statusBarHealthDown,
+        // Never render the raw backend/network message — map the outcome to
+        // localized, actionable copy.
+        message: ok
+          ? t.modelManagerTestReachable
+          : healthFailureMessage(categorizeHealthFailure(health), t),
       });
-    } catch (error) {
+    } catch {
       setTestResult({
         ok: false,
-        message: error instanceof Error && error.message ? error.message : t.statusBarHealthDown,
+        message: t.runtimeHealthProbeFailed,
       });
     } finally {
       testingRef.current = false;
       if (mountedRef.current) setTesting(false);
     }
-  }, [draft, t.modelManagerKeyReadFailed, t.modelManagerTestRequiresDesktop, t.modelManagerTestReachable, t.statusBarHealthDown]);
+  }, [draft, t]);
 
   const confirmRemove = useCallback(async () => {
     if (!removeTarget || removingRef.current) return;
@@ -315,6 +354,25 @@ export function ProviderConnectionsPanel() {
         </CollapsibleTrigger>
 
         <CollapsibleContent id="provider-connections-panel" className="flex flex-col gap-3">
+          {secretBackend !== null && (
+            <p
+              className="flex items-start gap-1.5 text-xs-tight text-book-ink-muted"
+              data-testid="secret-backend-disclosure"
+            >
+              <ShieldCheck className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+              <span>
+                <span className="font-medium text-book-ink-secondary">
+                  {t.secretStorageBackendLabel}:
+                </span>{' '}
+                {secretBackend === 'keychain'
+                  ? t.secretStorageKeychain
+                  : secretBackend === 'encrypted_file'
+                    ? t.secretStorageEncryptedFile
+                    : t.secretStorageUnknown}
+              </span>
+            </p>
+          )}
+
           {connections.length === 0 ? (
             <p className="rounded-md border border-dashed border-book-border px-3 py-3 text-xs text-book-ink-muted">
               {t.modelManagerConnectionsEmpty}

@@ -25,6 +25,11 @@ export function getTranslations(locale: Locale): Translations {
   return translationMap[locale] ?? translationMap[DEFAULT_LOCALE];
 }
 
+/** Join short user-facing lists with punctuation natural to the active locale. */
+export function joinLocalizedDisplayList(items: readonly string[], locale: Locale): string {
+  return items.join(locale === 'en' ? ', ' : '、');
+}
+
 export const LOCALE_COOKIE = 'locale';
 export const LOCALE_STORAGE_KEY = 'locale';
 

@@ -36,6 +36,9 @@ download page; the Studio itself only opens inside Tauri.
 | `novels/[id]/import/**`, `backup`, `export-bundle`, `backups/restore` | Import / backup / export |
 | `novels/[id]/conversations/**`, `messages` | Chat runtime + persistence |
 | `usage`, `app-settings`, `health`, `trash/**` | Usage panel, settings, health, trash/restore |
+| Vault watcher IPC (`vault_watch_start` / `vault_watch_stop`, `vault://changed` + `watchId` / ordered generation) + `reconcileVaultChangedFiles` | `components/VaultRuntimeCoordinator` (mounted from `DesktopShellLayout`) → generation-safe live reconcile + Story Deck refresh via `inkmarshal:vault-entries-changed` |
+| Knowledge vault durable outbox (`knowledge_vault_outbox`, `drainKnowledgeVaultOutboxAction`) | Same coordinator: startup drain, bounded offline backoff + focus/online resume, path-change resume via `inkmarshal:vault-path-changed`, and post-reconcile retry of pending upsert/delete intents (CAS-matched on `intent_revision`) |
+| Vault root bootstrap (`bootstrapNovelVaultRootAction`, `vault_version = 0` pending) | Same coordinator: on first bind / root change, project canonical DB entries before missing-file-as-delete snapshot reconcile; established roots keep delete semantics |
 
 ## Backend surfaces without a UI consumer
 

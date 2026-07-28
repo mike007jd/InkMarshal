@@ -69,5 +69,5 @@
     "components/Toast.tsx"
   ],
   "ignoreDependencies": ["tailwindcss"],
-  "ignoreBinaries": ["pgrep"]
+  "ignoreBinaries": ["mkfifo", "pgrep"]
 }
