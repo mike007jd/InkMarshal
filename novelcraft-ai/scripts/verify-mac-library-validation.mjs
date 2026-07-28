@@ -3,7 +3,6 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { loadAppleReleaseEnv } from './release-env.mjs';
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', ...options });
@@ -95,7 +94,6 @@ int main(int argc, char **argv) {
       throw new Error('DYLD_INSERT_LIBRARIES injection succeeded; the probe constructor ran.');
     }
 
-    loadAppleReleaseEnv();
     const signingIdentity = (process.env.APPLE_SIGNING_IDENTITY ?? '').trim();
     if (!signingIdentity) throw new Error('APPLE_SIGNING_IDENTITY is required for the library-validation probe host.');
     run('clang', ['-o', hostPath, hostSource]);

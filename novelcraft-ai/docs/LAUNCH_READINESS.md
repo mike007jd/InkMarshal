@@ -29,16 +29,18 @@ Do not rename published assets without an updater migration covering every publi
 
 ## Toolchain and secrets
 
-Use the Node/pnpm versions declared by the package, stable Rust, Xcode command-line tools, a Developer ID Application certificate, and Apple notarization credentials.
+Use the Node/pnpm versions declared by the package, stable Rust, Xcode command-line tools, a Developer ID Application certificate, and a notarytool keychain profile.
 
-The release scripts accept:
+The release scripts require these non-secret process-environment values:
 
 - `APPLE_SIGNING_IDENTITY`
 - `APPLE_TEAM_ID`
-- `APPLE_ID`
-- `APPLE_APP_SPECIFIC_PASSWORD` (preferred) or `APPLE_PASSWORD`
+- `APPLE_NOTARY_KEYCHAIN_PROFILE`
 
-Credentials may come from the process environment or `~/.inkmarshal/release/apple.env`. That file must be mode `600`; never commit or print it.
+Notarization authenticates only via `notarytool --keychain-profile`. Create the profile once with
+`xcrun notarytool store-credentials`; `release:mac` preflights it with `notarytool history` before
+cleaning or building. Do not pass Apple ID or app-specific passwords on the release command line,
+and do not load them from `apple.env`.
 
 ## Preflight
 
