@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { NovelWorkspace } from '@/components/NovelWorkspace';
+import { NOVEL_UPDATED_EVENT, type NovelUpdatedEventDetail } from '@/lib/use-storage';
 
 const mocks = vi.hoisted(() => ({
   params: new URLSearchParams(),
@@ -14,6 +15,25 @@ const mocks = vi.hoisted(() => ({
   refreshDeck: vi.fn(),
   refreshCoverage: vi.fn(),
   downloadBundle: vi.fn(),
+  updateNovel: vi.fn(),
+  patchNovelLocal: vi.fn(),
+  toast: vi.fn(),
+  flush: vi.fn(async (): Promise<{ ok: boolean }> => ({ ok: true })),
+  manuscriptNovel: {
+    id: 'novel-a',
+    title: 'Stale Manuscript Title',
+    genre: 'Fantasy',
+    stage: 'ready_for_greenlight',
+    progress: 12,
+    settings: { creativity: 'balanced' },
+  } as {
+    id: string;
+    title: string;
+    genre: string;
+    stage: string;
+    progress: number;
+    settings: { creativity: string };
+  } | null,
 }));
 
 vi.mock('next/navigation', () => ({
@@ -24,40 +44,64 @@ vi.mock('@/components/LanguageProvider', () => ({
     t: {
       errorSubmitFailed: 'Submit failed',
       errorUpdateNovel: 'Update failed',
+      editorSaveError: 'Save failed — will retry',
       toastRetry: 'Retry',
       stageStoryReady: 'Story Ready',
       stageApproval: 'Approval',
       storyDeckReviewAction: 'Review Story Deck',
+      agentMode: 'Agent',
+      storyDeckMode: 'Story',
+      readEditMode: 'Manuscript',
+      novelModeNav: 'Modes',
+      editTitle: 'Edit title',
+      titlePlaceholder: 'Title',
+      untitledNovel: 'Untitled',
     },
   }),
 }));
 vi.mock('@/components/Toast', () => ({
-  useToast: () => ({ toast: vi.fn() }),
+  useToast: () => ({ toast: mocks.toast }),
 }));
+vi.mock('@/lib/desktop-shell-bus', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/desktop-shell-bus')>(
+    '@/lib/desktop-shell-bus',
+  );
+  return {
+    ...actual,
+    requestManuscriptFlush: mocks.flush,
+  };
+});
 vi.mock('@/app/actions/conversations', () => ({
   createConversation: vi.fn(),
 }));
-vi.mock('@/lib/use-storage', () => ({
-  useNovel: () => ({
-    novel: {
-      id: 'novel-a',
-      title: 'Novel A',
-      genre: 'Fantasy',
-      stage: 'ready_for_greenlight',
-      progress: 12,
-      settings: { creativity: 'balanced' },
-    },
-    refresh: mocks.refreshNovel,
-    update: vi.fn(),
-  }),
-}));
+vi.mock('@/lib/use-storage', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/use-storage')>(
+    '@/lib/use-storage',
+  );
+  return {
+    ...actual,
+    useNovel: () => ({
+      novel: {
+        id: 'novel-a',
+        title: 'Novel A',
+        genre: 'Fantasy',
+        stage: 'ready_for_greenlight',
+        progress: 12,
+        settings: { creativity: 'balanced' },
+      },
+      refresh: mocks.refreshNovel,
+      update: mocks.updateNovel,
+    }),
+  };
+});
 vi.mock('@/lib/use-manuscript-session', () => ({
   useManuscriptSession: () => ({
-    novel: null,
+    novel: mocks.manuscriptNovel,
     isStreaming: false,
     fetchNovel: mocks.fetchNovel,
     fetchChapters: mocks.fetchChapters,
     startWriting: mocks.startWriting,
+    patchNovelLocal: mocks.patchNovelLocal,
   }),
 }));
 vi.mock('@/components/novel-workspace/useStoryDeckCoverage', () => ({
@@ -75,14 +119,43 @@ vi.mock('@/components/novel-workspace/useNovelBundleExport', () => ({
 }));
 vi.mock('@/components/NovelTopBar', () => ({
   NovelTopBar: ({
+    novel,
     view,
     setView,
+    editingTitle,
+    titleDraft,
+    setTitleDraft,
+    setEditingTitle,
+    handleTitleSave,
   }: {
+    novel: { title?: string } | null;
     view: string;
     setView: (view: 'agent' | 'story-deck' | 'read-edit') => void;
+    editingTitle: boolean;
+    titleDraft: string;
+    setTitleDraft: (value: string) => void;
+    setEditingTitle: (value: boolean) => void;
+    handleTitleSave: () => void;
   }) => (
     <div>
       <span data-testid="active-view">{view}</span>
+      <span data-testid="live-title">{novel?.title ?? ''}</span>
+      {editingTitle ? (
+        <input
+          aria-label="Title draft"
+          value={titleDraft}
+          onChange={event => setTitleDraft(event.target.value)}
+          onBlur={() => { void handleTitleSave(); }}
+        />
+      ) : (
+        <button type="button" onClick={() => {
+          setTitleDraft(novel?.title || '');
+          setEditingTitle(true);
+        }}
+        >
+          Edit title
+        </button>
+      )}
       <button type="button" onClick={() => setView('agent')}>Agent</button>
       <button type="button" onClick={() => setView('story-deck')}>Story</button>
       <button type="button" onClick={() => setView('read-edit')}>Manuscript</button>
@@ -129,6 +202,15 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   mocks.params = new URLSearchParams();
+  mocks.manuscriptNovel = {
+    id: 'novel-a',
+    title: 'Stale Manuscript Title',
+    genre: 'Fantasy',
+    stage: 'ready_for_greenlight',
+    progress: 12,
+    settings: { creativity: 'balanced' },
+  };
+  mocks.flush.mockResolvedValue({ ok: true });
   window.history.replaceState(null, '', '/novel/novel-a');
 });
 
@@ -155,12 +237,15 @@ describe('NovelWorkspace mode orchestration', () => {
     expect(screen.getByTestId('active-view').textContent).toBe('read-edit');
   });
 
-  it('routes the manuscript outline action to the Story Deck outline tab', () => {
+  it('routes the manuscript outline action to the Story Deck outline tab after a successful flush', async () => {
     render(<NovelWorkspace novelId="novel-a" initialView="read-edit" />);
     fireEvent.click(screen.getByRole('button', { name: 'Edit outline' }));
 
-    expect(screen.getByTestId('story-pane').getAttribute('data-tab')).toBe('outline');
-    expect(screen.getByTestId('active-view').textContent).toBe('story-deck');
+    await waitFor(() => {
+      expect(mocks.flush).toHaveBeenCalledOnce();
+      expect(screen.getByTestId('story-pane').getAttribute('data-tab')).toBe('outline');
+      expect(screen.getByTestId('active-view').textContent).toBe('story-deck');
+    });
   });
 
   it('refreshes both novel copies and Story Deck ownership on focus', () => {
@@ -171,5 +256,106 @@ describe('NovelWorkspace mode orchestration', () => {
     expect(mocks.refreshNovel).toHaveBeenCalledOnce();
     expect(mocks.fetchNovel).toHaveBeenCalledOnce();
     expect(mocks.fetchChapters).toHaveBeenCalledOnce();
+  });
+
+  it('patches the manuscript novel copy after a successful title save', async () => {
+    mocks.updateNovel.mockResolvedValue({
+      id: 'novel-a',
+      title: 'Canonical Title',
+      genre: 'Fantasy',
+      targetWords: 80_000,
+      updatedAt: 42,
+    });
+    // Simulate useNovel.update's successful fan-out.
+    mocks.updateNovel.mockImplementation(async () => {
+      const updated = {
+        id: 'novel-a',
+        title: 'Canonical Title',
+        genre: 'Fantasy',
+        targetWords: 80_000,
+        updatedAt: 42,
+      };
+      window.dispatchEvent(new CustomEvent<NovelUpdatedEventDetail>(NOVEL_UPDATED_EVENT, {
+        detail: { novel: updated as never },
+      }));
+      return updated;
+    });
+
+    render(<NovelWorkspace novelId="novel-a" />);
+    expect(screen.getByTestId('live-title').textContent).toBe('Stale Manuscript Title');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title' }));
+    fireEvent.change(screen.getByLabelText('Title draft'), {
+      target: { value: 'Canonical Title' },
+    });
+    fireEvent.blur(screen.getByLabelText('Title draft'));
+
+    await waitFor(() => {
+      expect(mocks.updateNovel).toHaveBeenCalledWith({ title: 'Canonical Title' });
+      expect(mocks.patchNovelLocal).toHaveBeenCalledWith({
+        title: 'Canonical Title',
+        genre: 'Fantasy',
+        targetWords: 80_000,
+        updatedAt: 42,
+      });
+    });
+  });
+
+  it('does not patch the manuscript copy or publish when title save fails', async () => {
+    const listener = vi.fn();
+    window.addEventListener(NOVEL_UPDATED_EVENT, listener);
+    mocks.updateNovel.mockResolvedValue(null);
+
+    render(<NovelWorkspace novelId="novel-a" />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title' }));
+    fireEvent.change(screen.getByLabelText('Title draft'), {
+      target: { value: 'Lost Title' },
+    });
+    fireEvent.blur(screen.getByLabelText('Title draft'));
+
+    await waitFor(() => {
+      expect(mocks.updateNovel).toHaveBeenCalledOnce();
+      expect(mocks.toast).toHaveBeenCalled();
+    });
+    expect(mocks.patchNovelLocal).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+    window.removeEventListener(NOVEL_UPDATED_EVENT, listener);
+  });
+
+  it('awaits manuscript flush before leaving read-edit and keeps the pane on failure', async () => {
+    let resolveFlush!: (value: { ok: boolean }) => void;
+    mocks.flush.mockImplementation(() => new Promise<{ ok: boolean }>(resolve => {
+      resolveFlush = resolve;
+    }));
+
+    render(<NovelWorkspace novelId="novel-a" initialView="read-edit" />);
+    expect(screen.getByTestId('manuscript-pane')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Story' }));
+    expect(mocks.flush).toHaveBeenCalledOnce();
+    expect(screen.getByTestId('active-view').textContent).toBe('read-edit');
+    expect(screen.getByTestId('manuscript-pane')).toBeTruthy();
+
+    resolveFlush({ ok: false });
+    await waitFor(() => {
+      expect(mocks.toast).toHaveBeenCalledWith('Save failed — will retry', 'error');
+    });
+    expect(screen.getByTestId('active-view').textContent).toBe('read-edit');
+    expect(screen.queryByTestId('story-pane')).toBeNull();
+  });
+
+  it('uses the same flush barrier for native menu workspace transitions', async () => {
+    mocks.flush.mockResolvedValue({ ok: true });
+    render(<NovelWorkspace novelId="novel-a" initialView="read-edit" />);
+
+    fireEvent(window, new CustomEvent('inkmarshal://menu', {
+      detail: { view: 'agent' },
+    }));
+
+    await waitFor(() => {
+      expect(mocks.flush).toHaveBeenCalledOnce();
+      expect(screen.getByTestId('active-view').textContent).toBe('agent');
+    });
+    expect(screen.queryByTestId('manuscript-pane')).toBeNull();
   });
 });

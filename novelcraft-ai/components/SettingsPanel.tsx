@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type RefObject } from 'react';
 import { useParams } from 'next/navigation';
 import { AlignJustify, Database, Globe, Palette, RefreshCw, X } from 'lucide-react';
 import { useLanguage } from '@/components/LanguageProvider';
@@ -44,6 +44,8 @@ import {
 interface SettingsPanelProps {
   open: boolean;
   onClose: () => void;
+  fallbackFocusRef?: RefObject<HTMLElement | null>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const OPEN_SETTINGS_EVENT = 'inkmarshal:open-settings';
@@ -64,11 +66,41 @@ function isFontSize(value: string): value is AppSettings['fontSize'] {
   return value === 'sm' || value === 'md' || value === 'lg';
 }
 
+function isUsableReturnFocusTarget(target: HTMLElement | null): target is HTMLElement {
+  if (
+    !target?.isConnected ||
+    target === document.body ||
+    target === document.documentElement ||
+    target.closest('[data-slot="sheet-content"]') ||
+    target.matches(':disabled')
+  ) {
+    return false;
+  }
+
+  for (let element: HTMLElement | null = target; element; element = element.parentElement) {
+    const style = window.getComputedStyle(element);
+    if (
+      element.inert ||
+      element.getAttribute('aria-hidden') === 'true' ||
+      style.display === 'none' ||
+      style.visibility === 'hidden'
+    ) {
+      return false;
+    }
+  }
+  return target.getClientRects().length > 0;
+}
+
 function isLineSpacing(value: string): value is AppSettings['lineSpacing'] {
   return value === 'compact' || value === 'normal' || value === 'relaxed';
 }
 
-export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
+export function SettingsPanel({
+  open,
+  onClose,
+  fallbackFocusRef,
+  returnFocusRef,
+}: SettingsPanelProps) {
   const [eventOpen, setEventOpen] = useState(false);
   const [requestedSection, setRequestedSection] =
     useState<SettingsSection | null>(null);
@@ -76,12 +108,21 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = normalizeSettingsSection((e as CustomEvent<unknown>).detail);
+      const activeElement = document.activeElement;
+      if (
+        returnFocusRef &&
+        !returnFocusRef.current &&
+        activeElement instanceof HTMLElement &&
+        activeElement !== document.body
+      ) {
+        returnFocusRef.current = activeElement;
+      }
       setRequestedSection(detail);
       setEventOpen(true);
     };
     window.addEventListener(OPEN_SETTINGS_EVENT, handler);
     return () => window.removeEventListener(OPEN_SETTINGS_EVENT, handler);
-  }, []);
+  }, [returnFocusRef]);
 
   const isOpen = open || eventOpen;
 
@@ -96,6 +137,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       open={isOpen}
       onClose={handleClose}
       initialSection={requestedSection}
+      fallbackFocusRef={fallbackFocusRef}
+      returnFocusRef={returnFocusRef}
     />
   );
 }
@@ -104,10 +147,14 @@ function SettingsPanelDrawer({
   open,
   onClose,
   initialSection,
+  fallbackFocusRef,
+  returnFocusRef,
 }: {
   open: boolean;
   onClose: () => void;
   initialSection: SettingsSection | null;
+  fallbackFocusRef?: RefObject<HTMLElement | null>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const { locale, setLocale, t } = useLanguage();
   const { theme, setTheme } = useTheme();
@@ -211,6 +258,18 @@ function SettingsPanelDrawer({
       <SheetContent
         side="right"
         showCloseButton={false}
+        onCloseAutoFocus={event => {
+          const returnTarget = returnFocusRef?.current;
+          if (returnFocusRef) returnFocusRef.current = null;
+          const focusTarget = isUsableReturnFocusTarget(returnTarget ?? null)
+            ? returnTarget
+            : isUsableReturnFocusTarget(fallbackFocusRef?.current ?? null)
+              ? fallbackFocusRef?.current
+              : null;
+          if (!focusTarget) return;
+          event.preventDefault();
+          focusTarget.focus({ preventScroll: true });
+        }}
         className="w-full gap-0 overflow-hidden border-book-border bg-book-bg-primary p-0 text-book-ink-primary sm:w-[34rem] sm:max-w-none lg:w-[38rem]"
       >
         <SheetHeader className="flex-row items-center justify-between gap-4 border-b border-book-border px-5 py-4 text-left">

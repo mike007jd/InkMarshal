@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, usePathname, useRouter } from 'next/navigation';
-import { BarChart3, ChevronDown, Cpu, Layers, PanelLeft, Plus, Search, Settings, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { BarChart3, ChevronDown, Cpu, Layers, PanelLeft, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react';
 
 import { useGlobalHotkeys } from '@/hooks/useGlobalHotkeys';
 import { useMenuEvents } from '@/hooks/useMenuEvents';
@@ -40,14 +40,20 @@ import {
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
 import { restoreEnginesOnLaunch } from '@/lib/model-supply/orchestrator';
+import { checkConnectionHealth } from '@/lib/model-supply/runtime-health';
 import { hydrateAppSettings } from '@/lib/app-settings-client';
 import { subscribeLocalModelStateChanged } from '@/lib/model-supply/local-model-events';
 import {
   buildCapabilityCoverageSummary,
+  CAPABILITY_HEALTH_REFRESH_MS,
+  collectBoundNonLocalConnections,
   EMPTY_CAPABILITY_PROFILE,
 } from '@/components/models/capability-coverage';
 import { roleChipLabel } from '@/components/models/model-presentation';
-import type { CapabilityProfile, RuntimeConnection } from '@/lib/model-supply/types';
+import {
+  type CapabilityProfile,
+  type RuntimeConnection,
+} from '@/lib/model-supply/types';
 import type { Novel } from '@/lib/db-types';
 import { getSettings } from '@/lib/settings';
 import { buildNovelEntryHref } from '@/lib/novel-workspace-view';
@@ -64,6 +70,10 @@ function stageBadgeClass(novel: Novel): string {
 // are ghost buttons with the same left-aligned icon + label layout.
 const WORKSPACE_NAV_ITEM_CLASS =
   'flex h-auto w-full justify-start gap-3 px-2 py-2 text-sm font-medium text-book-ink-secondary transition-feedback hover:bg-book-bg-card hover:text-book-ink-primary';
+
+// Stable id of the off-canvas drawer so the narrow-header open button and the
+// in-drawer close button can both point at it via aria-controls.
+const NARROW_DRAWER_ID = 'inkmarshal-narrow-drawer';
 
 interface DesktopShellProps {
   children: React.ReactNode;
@@ -85,15 +95,35 @@ export function DesktopShell({ children }: DesktopShellProps) {
   const [runningEngines, setRunningEngines] = useState<EngineInfo[]>([]);
   const [connections, setConnections] = useState<RuntimeConnection[]>([]);
   const [capabilityProfile, setCapabilityProfile] = useState<CapabilityProfile>(EMPTY_CAPABILITY_PROFILE);
+  // Non-local ready only after a successful current probe. Empty until probes
+  // finish so the sidebar cannot flash 4/4 from auth/loopback shape alone.
+  const [healthyConnectionModels, setHealthyConnectionModels] = useState<
+    ReadonlyMap<string, ReadonlySet<string>>
+  >(() => new Map());
   const readinessSeqRef = useRef(0);
   const deletingNovelIdsRef = useRef<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  // Off-canvas drawer state for narrow viewports (browser/webview preview;
-  // the Tauri window enforces a 1040px minWidth so this is a safety net for
-  // any constrained desktop webview where the fixed sidebar would crush the
-  // main pane).
+  // Off-canvas drawer state for narrow viewports. The shell switches to this
+  // drawer below 1024px (the lg breakpoint); at 1024px and above the sidebar
+  // is persistent/collapsible in-flow and no scrim is rendered. The Tauri
+  // window enforces a 768px minWidth, so the <1024px drawer path is a real
+  // desktop state (768–1023px), not only a browser/webview preview.
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const mobileNavOpenButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileNavCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreMobileNavFocusRef = useRef(false);
+  const settingsReturnFocusRef = useRef<HTMLElement>(null);
   const [developerTools, setDeveloperTools] = useState(() => Boolean(getSettings().developerTools));
+  const closeMobileNavigation = useCallback(() => {
+    restoreMobileNavFocusRef.current = true;
+    setMobileNavOpen(false);
+  }, []);
+  const toggleMobileNavigation = useCallback(() => {
+    setMobileNavOpen(open => {
+      if (open) restoreMobileNavFocusRef.current = true;
+      return !open;
+    });
+  }, []);
 
   useEffect(() => {
     const refreshDeveloperTools = () => setDeveloperTools(Boolean(getSettings().developerTools));
@@ -112,17 +142,75 @@ export function DesktopShell({ children }: DesktopShellProps) {
   }
 
   useEffect(() => {
+    if (mobileNavOpen) {
+      mobileNavCloseButtonRef.current?.focus();
+      return;
+    }
+    if (!restoreMobileNavFocusRef.current) return;
+    restoreMobileNavFocusRef.current = false;
+    mobileNavOpenButtonRef.current?.focus();
+  }, [mobileNavOpen]);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMobileNavigation();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [closeMobileNavigation, mobileNavOpen]);
+
+  useEffect(() => {
     let mounted = true;
-    const refreshReadiness = () => void (async () => {
+    let readinessEnabled = false;
+    let initializationPromise: Promise<void> | null = null;
+    const refreshReadiness = (invalidateNonLocal = false) => void (async () => {
+      if (!readinessEnabled) return;
       const seq = ++readinessSeqRef.current;
       const configuredConnections = getConnections();
       const profile = getCapabilityProfile();
+      // A connection/profile mutation can reuse an id for a different endpoint,
+      // so invalidate immediately. Periodic/focus probes keep the last confirmed
+      // result until their replacement arrives to avoid a visible 60s flicker.
+      if (invalidateNonLocal) setHealthyConnectionModels(new Map());
       const engines = await engineStatus().catch(() => [] as EngineInfo[]);
       if (!mounted || readinessSeqRef.current !== seq) return;
       setConnections(configuredConnections);
       setCapabilityProfile(profile);
       setRunningEngines(engines);
+
+      const probeTargets = collectBoundNonLocalConnections(profile, configuredConnections);
+      const nextHealthy = new Map<string, ReadonlySet<string>>();
+      await Promise.all(
+        probeTargets.map(async connection => {
+          const health = await checkConnectionHealth(connection);
+          if (health.reachable && health.transportOk) {
+            nextHealthy.set(connection.id, new Set(health.models));
+          }
+        }),
+      );
+      if (!mounted || readinessSeqRef.current !== seq) return;
+      setHealthyConnectionModels(nextHealthy);
     })();
+    const initializeReadiness = (): void => {
+      if (readinessEnabled || initializationPromise) return;
+      const request = (async () => {
+        const settingsReady = await hydrateAppSettings();
+        if (!mounted || !settingsReady) return;
+        // Hydration makes connection endpoints authoritative. Restore local
+        // child processes before the first readiness paint; a restore failure
+        // still leaves provider probing safe and dead local engines truthful.
+        await restoreEnginesOnLaunch().catch(() => undefined);
+        if (!mounted) return;
+        readinessEnabled = true;
+        refreshReadiness(true);
+      })().finally(() => {
+        if (initializationPromise === request) initializationPromise = null;
+      });
+      initializationPromise = request;
+    };
     // Durable config (connections, capability bindings, engine launch plans)
     // lives in SQLite now. Hydrate it BEFORE restoreEnginesOnLaunch reads those
     // stores: after a runtime-port change the localStorage mirror is empty, and
@@ -130,19 +218,27 @@ export function DesktopShell({ children }: DesktopShellProps) {
     // Local engines die with the app process, so relaunch what was running at
     // last quit (and prune dead bindings) before the first readiness read so
     // the shell never paints a zombie "bound but dead" state on boot.
-    void (async () => {
-      await hydrateAppSettings();
-      if (!mounted) return;
-      await restoreEnginesOnLaunch();
-      if (mounted) refreshReadiness();
-    })();
-    refreshReadiness();
-    const unsubscribeConnections = subscribeConnectionsStore(refreshReadiness);
-    const unsubscribeLocalModels = subscribeLocalModelStateChanged(refreshReadiness);
+    initializeReadiness();
+    const unsubscribeConnections = subscribeConnectionsStore(() => {
+      if (readinessEnabled) refreshReadiness(true);
+      else initializeReadiness();
+    });
+    const unsubscribeLocalModels = subscribeLocalModelStateChanged(() => {
+      if (readinessEnabled) refreshReadiness();
+      else initializeReadiness();
+    });
+    const onFocus = () => {
+      if (readinessEnabled) refreshReadiness();
+      else initializeReadiness();
+    };
+    window.addEventListener('focus', onFocus);
+    const healthInterval = window.setInterval(onFocus, CAPABILITY_HEALTH_REFRESH_MS);
     return () => {
       mounted = false;
       unsubscribeConnections();
       unsubscribeLocalModels();
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(healthInterval);
     };
   }, []);
 
@@ -151,8 +247,9 @@ export function DesktopShell({ children }: DesktopShellProps) {
       profile: capabilityProfile,
       connections,
       runningEngines,
+      healthyConnectionModels,
     }),
-    [capabilityProfile, connections, runningEngines],
+    [capabilityProfile, connections, runningEngines, healthyConnectionModels],
   );
   const modelCoverageLabel = t.modelReadinessCoverage
     .replace('{ready}', String(modelCoverage.readyCount))
@@ -275,8 +372,9 @@ export function DesktopShell({ children }: DesktopShellProps) {
         setNovelView('read-edit');
         return;
       case 'inkmarshal.view.toggleLeft':
-        if (window.matchMedia('(max-width: 1279px)').matches) {
-          setMobileNavOpen(prev => !prev);
+        if (showSettings) return;
+        if (window.matchMedia('(max-width: 1023px)').matches) {
+          toggleMobileNavigation();
         } else {
           setSidebarOpen(prev => !prev);
         }
@@ -289,6 +387,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
         router.push('/desktop-studio/models');
         return;
       case 'inkmarshal.prefs':
+        if (showSettings) return;
+        settingsReturnFocusRef.current =
+          document.activeElement instanceof HTMLElement &&
+          document.activeElement !== document.body
+            ? document.activeElement
+            : null;
         setShowSettings(true);
         return;
       case 'inkmarshal.window.minimize':
@@ -329,7 +433,7 @@ export function DesktopShell({ children }: DesktopShellProps) {
       default:
         return;
     }
-  }, [openCreate, router]);
+  }, [openCreate, router, showSettings, toggleMobileNavigation]);
 
   useMenuEvents(handleMenuAction);
   useGlobalHotkeys(handleMenuAction, { enabled: isTauriRuntime() });
@@ -338,19 +442,20 @@ export function DesktopShell({ children }: DesktopShellProps) {
     <div className="flex h-screen min-h-0 w-full overflow-hidden">
       {mobileNavOpen && (
         <div
-          className="fixed inset-0 z-30 bg-book-ink-primary/30 xl:hidden"
-          onClick={() => setMobileNavOpen(false)}
+          className="fixed inset-0 z-30 bg-book-ink-primary/30 lg:hidden"
+          onClick={closeMobileNavigation}
           aria-hidden
         />
       )}
       <aside
+        id={NARROW_DRAWER_ID}
         className={cn(
-          'z-40 flex w-64 shrink-0 flex-col border-r border-book-border bg-book-bg-sidebar text-book-ink-primary',
-          'fixed inset-y-0 left-0 transform transition-layout xl:static xl:translate-x-0 xl:transition-none',
+          'z-40 flex w-64 shrink-0 flex-col border-r border-book-border bg-book-bg-sidebar text-book-ink-primary lg:shadow-none',
+          'fixed inset-y-0 left-0 transform transition-layout lg:static lg:translate-x-0 lg:transition-none',
           mobileNavOpen
             ? 'visible translate-x-0 shadow-overlay'
-            : 'invisible -translate-x-full xl:visible xl:shadow-none',
-          sidebarOpen ? 'xl:flex' : 'xl:hidden',
+            : 'invisible -translate-x-full lg:visible',
+          sidebarOpen ? 'lg:flex' : 'lg:hidden',
         )}
       >
         {/* 28px drag region at the top of the sidebar — the macOS traffic
@@ -361,13 +466,37 @@ export function DesktopShell({ children }: DesktopShellProps) {
           className="h-7 shrink-0"
           aria-hidden
         />
-        <Link
-          href="/desktop-studio"
-          className={`flex items-center gap-3 px-6 pb-6 pt-2 font-serif text-xl text-book-ink-primary hover:text-book-ink-primary ${FOCUS_RING}`}
-        >
-          <InkMarshalLogo className="h-7 w-7 text-book-gold" />
-          <span className="tracking-tight">{t.appName}</span>
-        </Link>
+        <div className="relative">
+          <Link
+            href="/desktop-studio"
+            className={`flex items-center gap-3 px-6 pb-6 pt-2 font-serif text-xl text-book-ink-primary hover:text-book-ink-primary ${FOCUS_RING}`}
+          >
+            <InkMarshalLogo className="h-7 w-7 text-book-gold" />
+            <span className="tracking-tight">{t.appName}</span>
+          </Link>
+          {/* In-drawer close control. The fixed drawer overlays the narrow
+              header's open button, so the only pointer-reachable toggle while
+              open must live inside the drawer layer itself. Rendered only
+              while the drawer is open so there is exactly one accessible
+              toggle target per state, and anchored to the right of the logo
+              row so it clears the macOS traffic-light drag region above and
+              never covers the logo/title. */}
+          {mobileNavOpen && (
+            <Button
+              ref={mobileNavCloseButtonRef}
+              variant="ghost"
+              size="icon"
+              type="button"
+              onClick={closeMobileNavigation}
+              aria-controls={NARROW_DRAWER_ID}
+              aria-expanded={true}
+              aria-label={t.toggleSidebar}
+              className="absolute right-3 top-2 text-book-ink-secondary hover:text-book-ink-primary lg:hidden"
+            >
+              <X className="h-5 w-5" />
+            </Button>
+          )}
+        </div>
         <OrnamentalDivider className="px-6" />
 
         <div className="space-y-2 p-4">
@@ -494,7 +623,10 @@ export function DesktopShell({ children }: DesktopShellProps) {
             </Button>
             <Button
               variant="ghost"
-              onClick={() => setShowSettings(true)}
+              onClick={event => {
+                settingsReturnFocusRef.current = event.currentTarget;
+                setShowSettings(true);
+              }}
               className={WORKSPACE_NAV_ITEM_CLASS}
             >
               <Settings className="h-4 w-4 text-book-ink-muted" />
@@ -546,19 +678,29 @@ export function DesktopShell({ children }: DesktopShellProps) {
           className="h-7 shrink-0 bg-book-bg-primary"
           aria-hidden
         />
-        {/* Narrow-viewport top bar with the drawer toggle. Hidden at xl+ where
-            the sidebar is always in-flow, so the desktop chrome is unchanged. */}
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-book-border bg-book-bg-primary px-3 xl:hidden">
-          <Button
-            variant="ghost"
-            size="icon"
-            type="button"
-            onClick={() => setMobileNavOpen(true)}
-            aria-label={t.toggleSidebar}
-            className="text-book-ink-secondary hover:text-book-ink-primary"
-          >
-            <PanelLeft className="h-5 w-5" />
-          </Button>
+        {/* Narrow-viewport top bar with the drawer toggle. Hidden at lg+
+            where the sidebar is in-flow, so the desktop chrome is unchanged. */}
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-book-border bg-book-bg-primary px-3 lg:hidden">
+          {/* Open control, rendered only while the drawer is closed: once the
+              fixed drawer is open it covers this header, so a toggle here
+              could never be clicked a second time. The in-drawer close
+              button takes over while open, keeping exactly one truthful
+              accessible toggle target per state. */}
+          {!mobileNavOpen && (
+            <Button
+              ref={mobileNavOpenButtonRef}
+              variant="ghost"
+              size="icon"
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              aria-controls={NARROW_DRAWER_ID}
+              aria-expanded={false}
+              aria-label={t.toggleSidebar}
+              className="text-book-ink-secondary hover:text-book-ink-primary"
+            >
+              <PanelLeft className="h-5 w-5" />
+            </Button>
+          )}
           <span className="font-hand text-lg text-book-ink-primary">{t.appName}</span>
         </div>
         <div className="flex min-h-0 flex-1 flex-col">
@@ -576,7 +718,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
        <AIActionGateCoordinator />
        <DesktopUpdateCoordinator />
        <ModelsPanel open={false} />
-      <SettingsPanel open={showSettings} onClose={() => setShowSettings(false)} />
+      <SettingsPanel
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        fallbackFocusRef={mobileNavOpenButtonRef}
+        returnFocusRef={settingsReturnFocusRef}
+      />
       <TrashPanel open={showTrash} onOpenChange={setShowTrash} onLibraryChange={() => void refresh()} />
     </div>
   );

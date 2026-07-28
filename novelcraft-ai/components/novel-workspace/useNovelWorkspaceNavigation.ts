@@ -1,8 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 
+import { useLanguage } from '@/components/LanguageProvider';
+import { useToast } from '@/components/Toast';
+import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import {
   buildNovelViewHref,
   parseViewParam,
@@ -25,19 +28,32 @@ function nonNegativeInteger(value: string | null): number | null {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function leavesReadEdit(from: NovelView, to: NovelView): boolean {
+  return from === 'read-edit' && to !== 'read-edit';
+}
+
 export function useNovelWorkspaceNavigation(
   novelId: string,
   initialView: NovelView,
 ) {
+  const { t } = useLanguage();
+  const { toast } = useToast();
   const searchParams = useSearchParams();
   const viewFromUrl = useMemo(
     () => parseViewParam(searchParams?.get('view') ?? null),
     [searchParams],
   );
   const [view, setView] = useState<NovelView>(() => viewFromUrl ?? initialView);
+  const viewRef = useRef(view);
+  const selectSeqRef = useRef(0);
 
-  const selectView = useCallback((nextView: NovelView) => {
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  const applyView = useCallback((nextView: NovelView) => {
     setView(nextView);
+    viewRef.current = nextView;
     rememberNovelWorkspaceView(novelId, nextView);
     const currentHref = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     const nextHref = buildNovelViewHref(
@@ -48,6 +64,33 @@ export function useNovelWorkspaceNavigation(
     );
     if (nextHref !== currentHref) window.history.replaceState(null, '', nextHref);
   }, [novelId]);
+
+  const selectView = useCallback((nextView: NovelView) => {
+    const seq = ++selectSeqRef.current;
+    const fromView = viewRef.current;
+    if (nextView === fromView) return;
+
+    // Entry into read-edit (and agent ↔ story) stays synchronous. Only leaving
+    // the manuscript needs an awaited flush before unmount.
+    if (!leavesReadEdit(fromView, nextView)) {
+      applyView(nextView);
+      return;
+    }
+
+    void (async () => {
+      // Flush while ManuscriptShell/editor listeners are still mounted.
+      const outcome = await requestManuscriptFlush();
+      if (selectSeqRef.current !== seq) return;
+      if (!outcome.ok) {
+        toast(t.editorSaveError, 'error');
+        return;
+      }
+      // Another selector won, or an external sync moved us already.
+      if (viewRef.current !== fromView) return;
+      if (selectSeqRef.current !== seq) return;
+      applyView(nextView);
+    })();
+  }, [applyView, t.editorSaveError, toast]);
 
   useEffect(() => {
     return rememberNovelWorkspaceViewAfterHydration(
@@ -60,12 +103,12 @@ export function useNovelWorkspaceNavigation(
     if (!viewFromUrl) return;
     let cancelled = false;
     queueMicrotask(() => {
-      if (!cancelled) setView(current => current === viewFromUrl ? current : viewFromUrl);
+      if (!cancelled) selectView(viewFromUrl);
     });
     return () => {
       cancelled = true;
     };
-  }, [viewFromUrl]);
+  }, [selectView, viewFromUrl]);
 
   useEffect(() => {
     const handler = (event: Event) => {

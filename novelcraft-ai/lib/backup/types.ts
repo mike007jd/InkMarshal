@@ -22,8 +22,12 @@ import type {
  * versions the on-disk `.inkmarshal` layout, not the database. Verify refuses a
  * package whose MAJOR differs from {@link FORMAT_VERSION} (a breaking layout
  * change); MINOR bumps stay forward/backward readable.
+ *
+ * 1.1 adds book-owned canonical history (conversations / messages /
+ * chapter-chat + volume summaries) while remaining able to verify and restore
+ * existing 1.0 packages (missing new sections decode as empty).
  */
-export const FORMAT_VERSION = '1.0';
+export const FORMAT_VERSION = '1.1';
 
 /** Canonical package file/dir names. Single source for build + verify + restore. */
 export const PACKAGE_PATHS = {
@@ -35,8 +39,18 @@ export const PACKAGE_PATHS = {
   outline: 'outline.json',
   unification: 'unification.json',
   promptTemplates: 'prompt-templates.json',
+  historyConversations: 'history/conversations.json',
+  historyMessages: 'history/messages.json',
+  historyChapterChat: 'history/chapter-chat.json',
   attachmentsDir: 'attachments/',
 } as const;
+
+/** Fixed history files introduced in format 1.1 (must be present + checksummed). */
+export const HISTORY_PACKAGE_PATHS = [
+  PACKAGE_PATHS.historyConversations,
+  PACKAGE_PATHS.historyMessages,
+  PACKAGE_PATHS.historyChapterChat,
+] as const;
 
 /** Zip path for chapter N (zero-padded, stable sort). */
 export function chapterEntryPath(chapterNumber: number): string {
@@ -49,9 +63,11 @@ export const BACKUP_EXTENSIONS = ['inkmarshal', 'zip'] as const;
 /**
  * Case-insensitive secret-key blacklist. Any settings key whose lowercased name
  * CONTAINS one of these tokens (or matches {@link SECRET_KEY_REGEX}) is stripped
- * recursively at extract time — the package never carries an API key, token, or
- * credential. Stripping at the source is safer than filtering on restore: a
- * package on disk can be inspected, copied, or shared.
+ * recursively from structured settings at extract time, so stored provider
+ * credentials are never exported. User-authored manuscript and history text is
+ * intentionally preserved verbatim and can contain sensitive content.
+ * Stripping structured settings at the source is safer than filtering on
+ * restore: a package on disk can be inspected, copied, or shared.
  */
 export const SECRET_KEYS = [
   'apikey',
@@ -88,6 +104,13 @@ export function isSecretKey(key: string): boolean {
 
 // --- Serialized package payloads (1:1 with the fixed zip layout) ---
 
+/** One volume summary stored on novels.volume_summaries (plain JSON array). */
+export interface BackupVolumeSummary {
+  start: number;
+  end: number;
+  summary: string;
+}
+
 /** novel.json — the novel record minus runtime-only / secret fields. */
 export interface BackupNovel {
   title: string;
@@ -102,6 +125,8 @@ export interface BackupNovel {
   /** Settings with all secret keys recursively removed. `backup` policy is kept
    *  (it is not a secret) so the restored copy inherits the cadence. */
   settings: NovelSettings | null;
+  /** Book-owned volume digests; absent/missing in 1.0 packages → []. */
+  volumeSummaries: BackupVolumeSummary[];
   createdAt: number;
   updatedAt: number;
 }
@@ -170,6 +195,38 @@ export interface BackupPromptTemplate {
   variablesSchema: string;
 }
 
+/** One conversation row (history/conversations.json). user_id is not exported —
+ *  restore always assigns the local user. */
+export interface BackupConversation {
+  id: string;
+  topic: string;
+  title: string;
+  parentMessageId: string | null;
+  isArchived: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One message row (history/messages.json), including nullable conversationId. */
+export interface BackupMessage {
+  id: string;
+  conversationId: string | null;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  createdAt: string;
+}
+
+/** One chapter_chat_history row (history/chapter-chat.json). */
+export interface BackupChapterChat {
+  id: string;
+  chapterNumber: number;
+  role: string;
+  content: string;
+  changes: string | null;
+  status: string;
+  createdAt: string;
+}
+
 /** One binary attachment (attachments/<name>). Forward-compat: no DB table
  *  produces these yet, so the array is empty today but the layout reserves it. */
 export interface BackupAttachment {
@@ -186,6 +243,9 @@ export interface BackupBundle {
   outline: BackupOutlineRow[];
   unificationReport: UnificationReport | null;
   promptTemplates: BackupPromptTemplate[];
+  conversations: BackupConversation[];
+  messages: BackupMessage[];
+  chapterChat: BackupChapterChat[];
   attachments: BackupAttachment[];
   /** Provenance captured at extract time; folded into the manifest by build. */
   meta: {
@@ -204,6 +264,9 @@ export interface BackupCounts {
   outline: number;
   promptTemplates: number;
   attachments: number;
+  conversations: number;
+  messages: number;
+  chapterChat: number;
 }
 
 /**
@@ -221,6 +284,6 @@ export interface InkmarshalManifest {
   counts: BackupCounts;
   /** path -> hex sha256 of that file's bytes. */
   sha256: Record<string, string>;
-  /** Always true: extract strips secrets at the source. */
+  /** Always true: extract strips secret-named keys from structured settings. */
   secretsStripped: true;
 }

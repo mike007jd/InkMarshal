@@ -1,9 +1,9 @@
 // Project-backup (W1-3) — restore a verified BackupBundle as a NEW novel.
 //
 // Always "create a copy": mint a fresh novelId and remap EVERY id (knowledge
-// entries, relations, outline chapterId links, chapters) into the new id space.
-// We never offer "overwrite the original" — that would break optimistic-lock
-// versions and foreign keys and is irreversible.
+// entries, relations, outline chapterId links, chapters, conversations,
+// messages) into the new id space. We never offer "overwrite the original" —
+// that would break optimistic-lock versions and foreign keys and is irreversible.
 //
 // Atomicity: all id remapping is pre-computed in JS (and the knowledge_index
 // rows are hashed) BEFORE opening a single synchronous better-sqlite3 write
@@ -11,6 +11,9 @@
 // transaction, or the transaction itself rolls back the whole novel — there is
 // never a half-restored book. After commit we run reorderOutlineAtomic to
 // resync the outline sort order + chapterNumber + vault mirror.
+//
+// Format 1.0 bundles arrive with empty history / volumeSummaries (verify
+// normalizes missing sections); 1.1 bundles carry the full remapped history.
 
 import { getDb } from '@/lib/db/connection';
 import { nowIso } from '@/lib/utils';
@@ -73,11 +76,17 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
   const now = nowIso();
   const newNovelId = crypto.randomUUID();
 
+  const conversations = bundle.conversations ?? [];
+  const messages = bundle.messages ?? [];
+  const chapterChat = bundle.chapterChat ?? [];
+  const volumeSummaries = bundle.novel.volumeSummaries ?? [];
+
   // --- Build id remaps (pure) -------------------------------------------------
   // entry id -> new id; chapter old-id -> new chapter (we key chapters by number
   // since the package stores chapterId only inside outline rows).
   const entryIdMap = new Map<string, string>();
   for (const e of bundle.knowledgeEntries) entryIdMap.set(e.id, crypto.randomUUID());
+  const sourceEntryById = new Map(bundle.knowledgeEntries.map(entry => [entry.id, entry]));
 
   // old chapterId -> chapterNumber, so an outline row's chapterId remaps to the
   // restored chapter's new id by looking up its number.
@@ -89,6 +98,12 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
   const chapterNumberToNewId = new Map<number, string>();
   for (const ch of bundle.chapters) chapterNumberToNewId.set(ch.chapterNumber, crypto.randomUUID());
 
+  // Conversation + message id remaps (both reference directions).
+  const conversationIdMap = new Map<string, string>();
+  for (const c of conversations) conversationIdMap.set(c.id, crypto.randomUUID());
+  const messageIdMap = new Map<string, string>();
+  for (const m of messages) messageIdMap.set(m.id, crypto.randomUUID());
+
   // Resolve an old chapterId to a new chapter id (or '' when unlinked / missing).
   const remapChapterId = (oldChapterId: string): string => {
     if (!oldChapterId) return '';
@@ -97,11 +112,25 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
     return chapterNumberToNewId.get(number) ?? '';
   };
 
-  // --- Validate relation endpoints map (fail fast, before any write) ----------
+  // --- Validate relation / history endpoints map (fail fast, before any write)
   for (const rel of bundle.knowledgeRelations) {
     if (!entryIdMap.has(rel.sourceId) || !entryIdMap.has(rel.targetId)) {
       throw new Error(
         `Restore aborted: relation ${rel.id} references an entry not present in the package (dangling).`,
+      );
+    }
+  }
+  for (const msg of messages) {
+    if (msg.conversationId != null && !conversationIdMap.has(msg.conversationId)) {
+      throw new Error(
+        `Restore aborted: message ${msg.id} references conversation ${msg.conversationId} not present in the package.`,
+      );
+    }
+  }
+  for (const conv of conversations) {
+    if (conv.parentMessageId != null && !messageIdMap.has(conv.parentMessageId)) {
+      throw new Error(
+        `Restore aborted: conversation ${conv.id} references parent message ${conv.parentMessageId} not present in the package.`,
       );
     }
   }
@@ -111,7 +140,7 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
   type PreparedEntry = {
     newId: string;
     src: BackupKnowledgeEntry;
-    /** Entry `data` JSON with chapterId remapped (outline) — stored verbatim. */
+    /** Entry `data` JSON with outline references remapped — stored verbatim. */
     dataJson: string;
     index: KnowledgeIndexInsert;
   };
@@ -122,9 +151,23 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
     const data = safeObject(e.data);
 
     if (e.type === 'outline') {
-      // Remap the chapterId link to the new chapter id space.
+      // Remap chapter linkage and hierarchy linkage into the copy's id spaces.
       const oldChapterId = typeof data.chapterId === 'string' ? data.chapterId : '';
       data.chapterId = remapChapterId(oldChapterId);
+      if (Object.hasOwn(data, 'parentId') && typeof data.parentId !== 'string') {
+        throw new Error(`Restore aborted: outline entry ${e.id} has an invalid parent id.`);
+      }
+      const oldParentId = typeof data.parentId === 'string' ? data.parentId : '';
+      if (oldParentId) {
+        const sourceParent = sourceEntryById.get(oldParentId);
+        const newParentId = entryIdMap.get(oldParentId);
+        if (sourceParent?.type !== 'outline' || !newParentId) {
+          throw new Error(
+            `Restore aborted: outline entry ${e.id} references missing outline parent ${oldParentId}.`,
+          );
+        }
+        data.parentId = newParentId;
+      }
     }
     const dataJson = JSON.stringify(data);
 
@@ -151,9 +194,10 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
        story_summary, character_summary, arc_summary,
        interview_state, interview_state_v,
        unification_report, unification_report_v,
+       volume_summaries,
        settings,
        created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertChapter = db.prepare(
     `INSERT INTO chapters (
@@ -174,6 +218,21 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
      VALUES (?, ?, ?, ?, ?, ?)`,
   );
   const upsertIndex = db.prepare(KNOWLEDGE_INDEX_UPSERT_SQL);
+  const insertConversation = db.prepare(
+    `INSERT INTO conversations
+       (id, novel_id, user_id, topic, title, parent_message_id, is_archived, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const insertMessage = db.prepare(
+    `INSERT INTO messages
+       (id, novel_id, role, content, conversation_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const insertChapterChat = db.prepare(
+    `INSERT INTO chapter_chat_history
+       (id, novel_id, chapter_number, role, content, changes, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
 
   // Prompt-template restore statements. prompt_templates is a GLOBAL table; we
   // never overwrite a live active row. For each backed-up template we keep the
@@ -196,7 +255,7 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
   );
 
   const tx = db.transaction(() => {
-    // 1. Novel.
+    // 1. Novel (incl. volume summaries — empty for 1.0 packages).
     const n = bundle.novel;
     const interviewState = n.interviewState ?? null;
     const unification = bundle.unificationReport ?? null;
@@ -215,6 +274,7 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
       interviewState === null ? null : JSON_COLUMN_VERSIONS.interview_state,
       unification === null ? null : JSON.stringify(unification),
       unification === null ? null : JSON_COLUMN_VERSIONS.unification_report,
+      volumeSummaries.length === 0 ? null : JSON.stringify(volumeSummaries),
       n.settings === null ? null : JSON.stringify(n.settings),
       n.createdAt ? new Date(n.createdAt).toISOString() : now,
       now,
@@ -283,7 +343,72 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
       );
     }
 
-    // 5. Prompt templates (global table). Never overwrite the active row.
+    // 5. Conversations — parent_message_id remapped into the new message id space.
+    //    parent_message_id has no FK, so conversations can be inserted before
+    //    messages; conversation_id on messages does have an FK the other way.
+    for (const conv of conversations) {
+      const newConvId = conversationIdMap.get(conv.id);
+      if (!newConvId) {
+        throw new Error(`Restore aborted: missing conversation id mapping for ${conv.id}.`);
+      }
+      const newParentMessageId =
+        conv.parentMessageId == null ? null : (messageIdMap.get(conv.parentMessageId) ?? null);
+      if (conv.parentMessageId != null && newParentMessageId == null) {
+        throw new Error(
+          `Restore aborted: conversation ${conv.id} parent message mapping missing.`,
+        );
+      }
+      insertConversation.run(
+        newConvId,
+        newNovelId,
+        LOCAL_USER_ID,
+        conv.topic || 'general',
+        conv.title ?? '',
+        newParentMessageId,
+        conv.isArchived ? 1 : 0,
+        conv.createdAt || now,
+        conv.updatedAt || now,
+      );
+    }
+
+    // 6. Messages — conversation_id remapped (null stays null).
+    for (const msg of messages) {
+      const newMsgId = messageIdMap.get(msg.id);
+      if (!newMsgId) {
+        throw new Error(`Restore aborted: missing message id mapping for ${msg.id}.`);
+      }
+      const newConversationId =
+        msg.conversationId == null ? null : (conversationIdMap.get(msg.conversationId) ?? null);
+      if (msg.conversationId != null && newConversationId == null) {
+        throw new Error(
+          `Restore aborted: message ${msg.id} conversation mapping missing.`,
+        );
+      }
+      insertMessage.run(
+        newMsgId,
+        newNovelId,
+        msg.role || 'user',
+        msg.content ?? '',
+        newConversationId,
+        msg.createdAt || now,
+      );
+    }
+
+    // 7. Chapter chat history — mint fresh ids (no cross-refs).
+    for (const row of chapterChat) {
+      insertChapterChat.run(
+        crypto.randomUUID(),
+        newNovelId,
+        row.chapterNumber,
+        row.role,
+        row.content ?? '',
+        row.changes ?? null,
+        row.status || 'pending',
+        row.createdAt || now,
+      );
+    }
+
+    // 8. Prompt templates (global table). Never overwrite the active row.
     for (const t of bundle.promptTemplates) {
       const active = findActiveTemplate.get(t.stage, t.role, t.locale, t.variant) as
         | { template_text: string }

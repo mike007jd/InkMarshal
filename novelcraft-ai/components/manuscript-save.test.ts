@@ -13,6 +13,7 @@ import {
   applyDraftContentToChapters,
   draftContentForActiveChapter,
   failedDraftSaveOutcome,
+  orphanDraftsForShellFlush,
   type ManuscriptChapter,
 } from '@/components/ManuscriptShell';
 
@@ -90,6 +91,50 @@ describe('manuscript save barriers', () => {
       title: 'Two',
     });
     expect(failedDraftSaveOutcome(new Map(), chapters)).toBeNull();
+  });
+
+  it('lets the active editor own the current chapter while still catching other orphans', () => {
+    const drafts = new Map([
+      [1, 'active dirty'],
+      [3, 'orphan three'],
+      [2, 'orphan two'],
+    ]);
+
+    const whileEditing = orphanDraftsForShellFlush(drafts, {
+      editing: true,
+      activeChapterNumber: 1,
+    });
+    expect([...whileEditing.keys()].sort((a, b) => a - b)).toEqual([2, 3]);
+    expect(failedDraftSaveOutcome(whileEditing, chapters)).toEqual({
+      ok: false,
+      chapterNumber: 2,
+      title: 'Two',
+    });
+
+    expect(orphanDraftsForShellFlush(drafts, {
+      editing: true,
+      activeChapterNumber: 1,
+    }).has(1)).toBe(false);
+
+    const whileReading = orphanDraftsForShellFlush(drafts, {
+      editing: false,
+      activeChapterNumber: 1,
+    });
+    expect(whileReading.has(1)).toBe(true);
+    expect(failedDraftSaveOutcome(whileReading, chapters)?.chapterNumber).toBe(1);
+  });
+
+  it('starts recovery persistence from ref-backed drafts on ManuscriptShell unmount', () => {
+    const shell = readFileSync(join(process.cwd(), 'components/ManuscriptShell.tsx'), 'utf8');
+    const pane = readFileSync(
+      join(process.cwd(), 'components/novel-workspace/ManuscriptWorkspacePane.tsx'),
+      'utf8',
+    );
+    expect(shell).toContain('void persistDraftMapNow()');
+    expect(shell).toContain('Layout cleanup runs before the next novel');
+    expect(shell).toContain('draftContentRef.current.size > 0');
+    expect(pane).toContain('<ManuscriptShell\n        key={novelId}');
+    expect(shell).not.toContain('onCloseRequested');
   });
 
   it('feeds failed-save draft text back into reading data and the active editor', () => {

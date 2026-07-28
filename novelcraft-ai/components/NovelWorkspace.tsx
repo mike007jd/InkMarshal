@@ -101,6 +101,8 @@ export function NovelWorkspace({
     }
   }, [novelId, t.errorSubmitFailed, toast]);
 
+  const patchNovelLocal = manuscript.patchNovelLocal;
+
   const handleTitleSave = async () => {
     if (titleSavingRef.current) return;
     titleSavingRef.current = true;
@@ -119,6 +121,14 @@ export function NovelWorkspace({
           });
           return;
         }
+        // liveNovel prefers the manuscript session copy; converge it immediately
+        // so Enter/blur cannot flash the stale pre-PATCH title.
+        patchNovelLocal({
+          title: updated.title,
+          genre: updated.genre,
+          targetWords: updated.targetWords,
+          updatedAt: updated.updatedAt,
+        });
       }
       setEditingTitle(false);
     } finally {

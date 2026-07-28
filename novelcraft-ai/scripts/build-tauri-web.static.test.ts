@@ -30,4 +30,11 @@ describe('desktop web build environment', () => {
 
     expect(script).toContain("'linux:x64': 'linux-x64'");
   });
+
+  it('does not store the Node runtime download cache under .next', () => {
+    const script = source();
+
+    expect(script).toContain("node_modules', '.cache', 'inkmarshal-tauri-node'");
+    expect(script).not.toContain("'.next', 'tauri-node'");
+  });
 });

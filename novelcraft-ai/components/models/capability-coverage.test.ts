@@ -84,7 +84,7 @@ describe('buildCapabilityCoverageSummary', () => {
     expect(summary.readyCount).toBe(0);
   });
 
-  it('accepts provider and loopback custom bindings when their auth shape is usable', () => {
+  it('does not count provider or loopback bindings ready from auth/loopback shape alone', () => {
     const provider = conn({
       id: 'provider',
       kind: 'provider',
@@ -109,14 +109,48 @@ describe('buildCapabilityCoverageSummary', () => {
       runningEngines: [],
     });
 
-    expect(summary.readyRoles).toEqual(['draft', 'recall']);
+    expect(summary.readyCount).toBe(0);
+    expect(summary.stoppedRoles).toEqual(['draft', 'recall']);
+    expect(summary.complete).toBe(false);
   });
 
-  it('uses a ready fallback when the primary provider has no key', () => {
-    const primary = conn({
-      id: 'provider-no-key',
+  it('counts a health-confirmed provider ready and leaves unprobed peers stopped', () => {
+    const provider = conn({
+      id: 'provider',
       kind: 'provider',
       baseUrl: 'https://api.example.com/v1',
+      secretRef: { account: 'connection:provider' },
+    });
+    const offlineLoopback = conn({
+      id: 'offline-loopback',
+      kind: 'custom',
+      baseUrl: 'http://127.0.0.1:9999/v1',
+    });
+    const profile = bind(
+      bind(emptyProfile(), 'draft', provider.id, 'hosted-model'),
+      'recall',
+      offlineLoopback.id,
+      'local-recall',
+    );
+
+    const summary = buildCapabilityCoverageSummary({
+      profile,
+      connections: [provider, offlineLoopback],
+      runningEngines: [],
+      healthyConnectionModels: new Map([[provider.id, new Set(['hosted-model'])]]),
+    });
+
+    expect(summary.readyRoles).toEqual(['draft']);
+    expect(summary.stoppedRoles).toEqual(['recall']);
+    expect(summary.roles.find(row => row.role === 'draft')?.status).toBe('ready');
+  });
+
+  it('uses a health-confirmed fallback when the primary probe is down', () => {
+    const primary = conn({
+      id: 'provider-offline',
+      kind: 'provider',
+      baseUrl: 'https://api.example.com/v1',
+      secretRef: { account: 'connection:provider-offline' },
     });
     const fallback = conn({
       id: 'loopback-fallback',
@@ -136,11 +170,56 @@ describe('buildCapabilityCoverageSummary', () => {
       profile,
       connections: [primary, fallback],
       runningEngines: [],
+      healthyConnectionModels: new Map([[fallback.id, new Set(['local-model'])]]),
     });
 
     const draft = summary.roles.find(row => row.role === 'draft');
     expect(draft?.status).toBe('ready');
     expect(draft?.source).toBe('fallback');
     expect(draft?.modelId).toBe('local-model');
+  });
+
+  it('cannot report 4/4 ready when every non-local probe is down', () => {
+    const provider = conn({
+      id: 'provider',
+      kind: 'provider',
+      baseUrl: 'https://api.example.com/v1',
+      secretRef: { account: 'connection:provider' },
+    });
+    let profile = emptyProfile();
+    for (const role of ['draft', 'rewrite', 'planning', 'recall'] as const) {
+      profile = bind(profile, role, provider.id, `${role}-model`);
+    }
+
+    const summary = buildCapabilityCoverageSummary({
+      profile,
+      connections: [provider],
+      runningEngines: [],
+      healthyConnectionModels: new Map(),
+    });
+
+    expect(summary.readyCount).toBe(0);
+    expect(summary.complete).toBe(false);
+    expect(summary.stoppedRoles).toEqual(['draft', 'rewrite', 'planning', 'recall']);
+  });
+
+  it('keeps a healthy connection stopped when its bound model is not advertised', () => {
+    const provider = conn({
+      id: 'provider',
+      kind: 'provider',
+      baseUrl: 'https://api.example.com/v1',
+      secretRef: { account: 'connection:provider' },
+    });
+    const summary = buildCapabilityCoverageSummary({
+      profile: bind(emptyProfile(), 'draft', provider.id, 'deleted-model'),
+      connections: [provider],
+      runningEngines: [],
+      healthyConnectionModels: new Map([
+        [provider.id, new Set(['different-model'])],
+      ]),
+    });
+
+    expect(summary.readyCount).toBe(0);
+    expect(summary.stoppedRoles).toEqual(['draft']);
   });
 });

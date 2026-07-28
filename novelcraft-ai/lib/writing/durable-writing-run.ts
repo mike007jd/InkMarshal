@@ -7,6 +7,7 @@ import type {
 
 export interface DurableReadToken {
   readonly novelId: string;
+  readonly scope: 'novel' | 'chapters';
   readonly generation: number;
 }
 
@@ -34,7 +35,8 @@ function timestamp(value: string | number | undefined): number {
  */
 export class DurableWritingRunController {
   private novelId: string;
-  private generation = 0;
+  private novelGeneration = 0;
+  private chapterGeneration = 0;
   private latestJobId: string | null = null;
   private readonly invalidatedJobIds = new Set<string>();
 
@@ -44,17 +46,33 @@ export class DurableWritingRunController {
 
   resetScope(novelId: string): void {
     this.novelId = novelId;
-    this.generation += 1;
+    this.novelGeneration += 1;
+    this.chapterGeneration += 1;
     this.latestJobId = null;
     this.invalidatedJobIds.clear();
   }
 
-  captureRead(): DurableReadToken {
-    return { novelId: this.novelId, generation: this.generation };
+  captureNovelRead(): DurableReadToken {
+    return {
+      novelId: this.novelId,
+      scope: 'novel',
+      generation: this.novelGeneration,
+    };
+  }
+
+  captureChapterRead(): DurableReadToken {
+    return {
+      novelId: this.novelId,
+      scope: 'chapters',
+      generation: this.chapterGeneration,
+    };
   }
 
   canCommit(token: DurableReadToken): boolean {
-    return token.novelId === this.novelId && token.generation === this.generation;
+    if (token.novelId !== this.novelId) return false;
+    return token.generation === (
+      token.scope === 'novel' ? this.novelGeneration : this.chapterGeneration
+    );
   }
 
   acceptJob(job: WritingJob | null): void {
@@ -64,11 +82,21 @@ export class DurableWritingRunController {
   invalidateForNewRun(): void {
     if (this.latestJobId) this.invalidatedJobIds.add(this.latestJobId);
     this.latestJobId = null;
-    this.generation += 1;
+    this.novelGeneration += 1;
+    this.chapterGeneration += 1;
   }
 
   invalidateReads(): void {
-    this.generation += 1;
+    this.novelGeneration += 1;
+    this.chapterGeneration += 1;
+  }
+
+  invalidateNovelReads(): void {
+    this.novelGeneration += 1;
+  }
+
+  invalidateChapterReads(): void {
+    this.chapterGeneration += 1;
   }
 
   resolve(

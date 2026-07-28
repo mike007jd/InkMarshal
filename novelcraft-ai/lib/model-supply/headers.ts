@@ -28,7 +28,7 @@
 import {
   getBindingForRole,
   getConnection,
-  getConnectionSecret,
+  getConnectionSecretForSnapshot,
 } from './connections';
 import {
   engineStatus,
@@ -176,7 +176,7 @@ async function buildHeadersForBinding(
   let secret: string | null = null;
   if (connection.secretRef) {
     try {
-      secret = await getConnectionSecret(connection.id);
+      secret = await getConnectionSecretForSnapshot(connection);
     } catch (error) {
       const detail = error instanceof Error && error.message ? ` ${error.message}` : '';
       throw new Error(`Unable to read the API key for "${connection.label}".${detail}`);

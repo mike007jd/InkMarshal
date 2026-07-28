@@ -6,6 +6,33 @@ import type { CreateNovelRequest } from '@/lib/types/novel';
 import { getExampleById } from '@/lib/examples';
 import { isExampleNovelId } from '@/lib/examples/prefix';
 
+/** Same-document fan-out after a successful novel PATCH so list subscribers converge. */
+export const NOVEL_UPDATED_EVENT = 'inkmarshal:novel-updated';
+
+export interface NovelUpdatedEventDetail {
+  novel: Novel;
+}
+
+export function notifyNovelUpdated(novel: Novel): void {
+  if (typeof window === 'undefined' || !novel?.id) return;
+  window.dispatchEvent(
+    new CustomEvent<NovelUpdatedEventDetail>(NOVEL_UPDATED_EVENT, {
+      detail: { novel },
+    }),
+  );
+}
+
+function applyNovelUpdatedToList(
+  novels: Novel[],
+  updated: Novel,
+): Novel[] {
+  const index = novels.findIndex(novel => novel.id === updated.id);
+  if (index < 0) return novels;
+  const next = novels.slice();
+  next[index] = updated;
+  return next.sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
 // No-account local-first app: every session is the single local user, and local
 // workspace storage is always available with no account-resolution delay.
 export function useStorageMode() {
@@ -16,19 +43,46 @@ export function useNovels() {
   const [novels, setNovels] = useState<Novel[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const refreshSeqRef = useRef(0);
+  const updateVersionRef = useRef(0);
+  const pendingUpdatesRef = useRef(
+    new Map<string, { novel: Novel; version: number }>(),
+  );
 
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeqRef.current;
+    const updateVersionAtStart = updateVersionRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await fetch('/api/novels');
       if (!res.ok) throw new Error(`GET /api/novels ${res.status}`);
-      setNovels(await res.json());
+      const fetched = await res.json() as Novel[];
+      if (refreshSeqRef.current !== seq) return;
+      let merged = fetched;
+      for (const pending of pendingUpdatesRef.current.values()) {
+        // Only events that arrived after this GET began can be newer than its
+        // snapshot. Earlier events are already reflected by the authoritative
+        // response and must not overwrite newer fields such as progress.
+        if (pending.version > updateVersionAtStart) {
+          merged = applyNovelUpdatedToList(merged, pending.novel);
+        }
+      }
+      setNovels(merged);
+      // A GET that began after an update event is authoritative for that
+      // update. Older GETs merge the pending update but retain it so the next
+      // post-event read also cannot roll the title back.
+      for (const [id, pending] of pendingUpdatesRef.current) {
+        if (pending.version <= updateVersionAtStart) {
+          pendingUpdatesRef.current.delete(id);
+        }
+      }
     } catch (err) {
+      if (refreshSeqRef.current !== seq) return;
       console.error('[useNovels] refresh failed:', err);
       setError(err instanceof Error ? err : new Error(String(err)));
     } finally {
-      setLoading(false);
+      if (refreshSeqRef.current === seq) setLoading(false);
     }
   }, []);
 
@@ -42,6 +96,17 @@ export function useNovels() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    const onNovelUpdated = (event: Event) => {
+      const novel = (event as CustomEvent<NovelUpdatedEventDetail>).detail?.novel;
+      if (!novel?.id) return;
+      const version = ++updateVersionRef.current;
+      pendingUpdatesRef.current.set(novel.id, { novel, version });
+      setNovels(current => applyNovelUpdatedToList(current, novel));
+    };
+    window.addEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated);
+    return () => window.removeEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated);
+  }, []);
   const create = useCallback(
     async (data: CreateNovelRequest = {}): Promise<Novel | null> => {
       try {
@@ -85,7 +150,7 @@ export function useNovel(novelId: string | undefined) {
   const [loading, setLoading] = useState(true);
   const activeNovelIdRef = useRef(novelId);
   const refreshSeqRef = useRef(0);
-  const updateSeqRef = useRef(0);
+  const updateSeqByNovelRef = useRef(new Map<string, number>());
 
   useEffect(() => {
     activeNovelIdRef.current = novelId;
@@ -133,7 +198,10 @@ export function useNovel(novelId: string | undefined) {
     async (data: Partial<Novel>): Promise<Novel | null> => {
       if (!novelId) return null;
       const requestNovelId = novelId;
-      const seq = ++updateSeqRef.current;
+      const seq = (updateSeqByNovelRef.current.get(requestNovelId) ?? 0) + 1;
+      updateSeqByNovelRef.current.set(requestNovelId, seq);
+      const isLatestForNovel = () =>
+        updateSeqByNovelRef.current.get(requestNovelId) === seq;
       try {
         const res = await fetch(`/api/novels/${requestNovelId}`, {
           method: 'PATCH',
@@ -142,12 +210,19 @@ export function useNovel(novelId: string | undefined) {
         });
         if (!res.ok) throw new Error(`PATCH /api/novels/${requestNovelId} ${res.status}`);
         const updated: Novel = await res.json();
-        if (activeNovelIdRef.current === requestNovelId && updateSeqRef.current === seq) {
+        if (activeNovelIdRef.current === requestNovelId && isLatestForNovel()) {
+          // A refresh captured before this successful mutation is stale even
+          // when it resolves afterwards. Invalidate that independent read
+          // sequence before publishing the canonical PATCH response.
+          refreshSeqRef.current += 1;
           setNovel(updated);
         }
+        // A slower superseded PATCH response must not roll list subscribers
+        // back after a newer update has already converged them.
+        if (isLatestForNovel()) notifyNovelUpdated(updated);
         return updated;
       } catch (err) {
-        if (activeNovelIdRef.current === requestNovelId && updateSeqRef.current === seq) {
+        if (activeNovelIdRef.current === requestNovelId && isLatestForNovel()) {
           console.error('[useNovel] update failed:', err);
         }
         return null;

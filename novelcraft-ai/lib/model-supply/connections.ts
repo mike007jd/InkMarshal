@@ -26,7 +26,9 @@ import { isLoopbackHttpUrl } from '@/lib/loopback-hosts';
 import {
   getStoredSetting,
   onAppSettingsHydrated,
+  rollbackStoredSettingMirrorAfterFailedDurableAttempt,
   setStoredSetting,
+  setStoredSettingDurable,
 } from '@/lib/app-settings-client';
 
 const CONNECTIONS_KEY = 'inkmarshal_connections_v1';
@@ -35,6 +37,32 @@ const MAX_CONNECTION_ID_LENGTH = 2_048;
 const MAX_CONNECTION_LABEL_LENGTH = 200;
 const MAX_CONNECTION_BASE_URL_LENGTH = 2_048;
 const MAX_MODEL_ID_LENGTH = 512;
+const CONNECTION_PERSISTENCE_FAILED = 'Failed to persist connection settings';
+const CONNECTION_PERSISTENCE_AND_COMPENSATION_FAILED =
+  'Failed to persist connection settings, and secret compensation also failed';
+const PROFILE_PERSISTENCE_FAILED = 'Failed to persist capability profile';
+
+let connectionMutationTail: Promise<void> = Promise.resolve();
+let profileMutationTail: Promise<void> = Promise.resolve();
+
+function enqueueConnectionMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = connectionMutationTail.then(mutation, mutation);
+  connectionMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+function enqueueProfileMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = profileMutationTail.then(mutation, mutation);
+  profileMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 function boundedTrim(value: unknown, maxLength: number): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -238,6 +266,48 @@ function writeConnections(list: RuntimeConnection[]): void {
   setStoredSetting(CONNECTIONS_KEY, JSON.stringify(list));
 }
 
+/**
+ * Await the authoritative connections-row write. On failure, restore the
+ * previous cache/localStorage mirror (without enqueueing another SQLite PATCH)
+ * and throw a stable persistence error. Callers must emit change notifications
+ * only after this resolves.
+ */
+async function writeConnectionsDurable(list: RuntimeConnection[]): Promise<void> {
+  if (!hasStorage()) {
+    throw new Error(CONNECTION_PERSISTENCE_FAILED);
+  }
+  const previous = getStoredSetting(CONNECTIONS_KEY);
+  const attempted = JSON.stringify(list);
+  const ok = await setStoredSettingDurable(CONNECTIONS_KEY, attempted);
+  if (ok) return;
+  rollbackStoredSettingMirrorAfterFailedDurableAttempt(CONNECTIONS_KEY, attempted, previous);
+  throw new Error(CONNECTION_PERSISTENCE_FAILED);
+}
+
+async function captureConnectionSecret(account: string): Promise<string | null> {
+  return getSecret(account);
+}
+
+async function restoreConnectionSecret(account: string, prior: string | null): Promise<void> {
+  if (prior === null) {
+    await deleteSecret(account);
+  } else {
+    await setSecret(account, prior);
+  }
+}
+
+async function compensateConnectionSecretOrThrow(
+  account: string,
+  prior: string | null,
+): Promise<never> {
+  try {
+    await restoreConnectionSecret(account, prior);
+  } catch {
+    throw new Error(CONNECTION_PERSISTENCE_AND_COMPENSATION_FAILED);
+  }
+  throw new Error(CONNECTION_PERSISTENCE_FAILED);
+}
+
 export function getConnections(): RuntimeConnection[] {
   return readConnections();
 }
@@ -350,41 +420,70 @@ export function upsertConnection(input: ConnectionUpsertInput): RuntimeConnectio
 /**
  * Insert/update a connection when endpoint-defining fields may change.
  *
- * If the previous connection had a secret and the endpoint changes, delete the
- * secret before mutating the connection row. A keychain failure must leave the
- * old row visible so the user can retry instead of orphaning `connection:<id>`.
+ * If the previous connection had a secret and the endpoint changes, capture and
+ * delete the secret before awaiting the durable connection row. A keychain
+ * failure must leave the old row visible so the user can retry instead of
+ * orphaning `connection:<id>`. A failed row write restores the captured key.
  */
-export async function upsertConnectionWithSecretCleanup(
+async function upsertConnectionWithSecretCleanupNow(
   input: ConnectionUpsertInput,
 ): Promise<RuntimeConnection> {
   const prepared = prepareConnectionUpsert(input, readConnections(), nowIso());
+  let capturedStaleSecret: string | null = null;
   if (prepared.staleSecretAccount) {
+    // Locked read/delete must leave the visible row untouched.
+    capturedStaleSecret = await captureConnectionSecret(prepared.staleSecretAccount);
     await deleteSecret(prepared.staleSecretAccount);
   }
   if (prepared.shouldWrite) {
-    writeConnections(prepared.list);
+    try {
+      await writeConnectionsDurable(prepared.list);
+    } catch (error) {
+      if (prepared.staleSecretAccount) {
+        await compensateConnectionSecretOrThrow(
+          prepared.staleSecretAccount,
+          capturedStaleSecret,
+        );
+      }
+      throw error;
+    }
     emitConnectionsChanged();
   }
   return prepared.connection;
+}
+
+export function upsertConnectionWithSecretCleanup(
+  input: ConnectionUpsertInput,
+): Promise<RuntimeConnection> {
+  return enqueueConnectionMutation(() => upsertConnectionWithSecretCleanupNow(input));
 }
 
 /**
  * Save a provider/custom connection and an optional newly-entered key as one
  * ordered operation. When a key is provided, write it before mutating the row
  * so a keychain failure cannot leave the UI pointing at a half-saved endpoint.
+ * The connections row is awaited durably; on failure the prior key is restored
+ * or the newly created key is deleted.
  */
-export async function saveConnectionWithOptionalSecret(
+async function saveConnectionWithOptionalSecretNow(
   input: ConnectionUpsertInput,
   secretValue?: string,
 ): Promise<RuntimeConnection> {
   const trimmedSecret = typeof secretValue === 'string' ? secretValue.trim() : '';
-  if (!trimmedSecret) return upsertConnectionWithSecretCleanup(input);
+  if (!trimmedSecret) return upsertConnectionWithSecretCleanupNow(input);
 
   const prepared = prepareConnectionUpsert(input, readConnections(), nowIso());
   if (!canAttachConnectionSecret(prepared.connection)) {
     throw new Error('Runtime connection API keys require HTTPS or a loopback HTTP runtime');
   }
-  await setSecret(connectionSecretAccount(prepared.connection.id), trimmedSecret);
+  const account = connectionSecretAccount(prepared.connection.id);
+  // Endpoint changes clear secretRef on the prepared row but keep the same
+  // `connection:<id>` account; capture any prior key before overwriting.
+  const priorSecret =
+    prepared.connection.secretRef || prepared.staleSecretAccount
+      ? await captureConnectionSecret(account)
+      : null;
+  await setSecret(account, trimmedSecret);
   const nextList = prepared.list.map(connection =>
     connection.id === prepared.connection.id
       ? {
@@ -394,8 +493,10 @@ export async function saveConnectionWithOptionalSecret(
         }
       : connection,
   );
-  if (prepared.shouldWrite || !prepared.connection.secretRef) {
-    writeConnections(nextList);
+  try {
+    await writeConnectionsDurable(nextList);
+  } catch {
+    await compensateConnectionSecretOrThrow(account, priorSecret);
   }
   emitConnectionsChanged();
   return {
@@ -404,15 +505,23 @@ export async function saveConnectionWithOptionalSecret(
   };
 }
 
+export function saveConnectionWithOptionalSecret(
+  input: ConnectionUpsertInput,
+  secretValue?: string,
+): Promise<RuntimeConnection> {
+  return enqueueConnectionMutation(() => saveConnectionWithOptionalSecretNow(input, secretValue));
+}
+
 /**
  * Remove a connection and delete its secret from secret-store.
  *
- * Order matters: delete the secret FIRST, then write the connections list
- * without it. A failed secret delete must leave the connection visible so the
- * user can retry removal; otherwise the keychain entry becomes orphaned with no
- * UI path to clear it. Idempotent: a missing connection row is a no-op.
+ * Order matters: delete the secret FIRST, then await the durable connections
+ * list without it. A failed secret delete must leave the connection visible so
+ * the user can retry removal; otherwise the keychain entry becomes orphaned with
+ * no UI path to clear it. A failed row write restores the captured key.
+ * Idempotent: a missing connection row is a no-op.
  */
-export async function removeConnection(id: string): Promise<void> {
+async function removeConnectionNow(id: string): Promise<void> {
   const connectionId = normalizeConnectionId(id);
   if (!connectionId) return;
   const list = readConnections();
@@ -422,18 +531,32 @@ export async function removeConnection(id: string): Promise<void> {
   // Only touch secret-store when a secret is actually bound; a keyless row
   // (local-engine, always secretRef:null) has no keychain entry and off-desktop
   // the fail-closed store would throw.
+  const account = connectionSecretAccount(connectionId);
+  let capturedSecret: string | null = null;
   if (list[idx].secretRef) {
-    await deleteSecret(connectionSecretAccount(connectionId));
+    capturedSecret = await captureConnectionSecret(account);
+    await deleteSecret(account);
   }
   const next = list.filter(c => c.id !== connectionId);
-  writeConnections(next);
+  try {
+    await writeConnectionsDurable(next);
+  } catch (error) {
+    if (list[idx].secretRef) {
+      await compensateConnectionSecretOrThrow(account, capturedSecret);
+    }
+    throw error;
+  }
   emitConnectionsChanged();
+}
+
+export function removeConnection(id: string): Promise<void> {
+  return enqueueConnectionMutation(() => removeConnectionNow(id));
 }
 
 // ── Per-connection secret (keychain on desktop, never the localStorage blob) ─
 
 /** Store a connection's API key/token in secret-store under its namespaced account. */
-export async function setConnectionSecret(id: string, value: string): Promise<void> {
+async function setConnectionSecretNow(id: string, value: string): Promise<void> {
   const connectionId = normalizeConnectionId(id);
   if (!connectionId) {
     throw new Error('Runtime connection id is invalid');
@@ -447,15 +570,31 @@ export async function setConnectionSecret(id: string, value: string): Promise<vo
     throw new Error('Runtime connection API keys require HTTPS or a loopback HTTP runtime');
   }
 
-  await setSecret(connectionSecretAccount(connectionId), value);
+  const account = connectionSecretAccount(connectionId);
+  const hadSecretRef = Boolean(list[idx].secretRef);
+  const priorSecret = hadSecretRef ? await captureConnectionSecret(account) : null;
+  await setSecret(account, value);
   // Ensure the connection record references the secret (idempotent).
-  if (!list[idx].secretRef) {
-    list[idx] = { ...list[idx], secretRef: connectionSecretRef(connectionId), updatedAt: nowIso() };
-    writeConnections(list);
+  if (!hadSecretRef) {
+    const next = list.slice();
+    next[idx] = {
+      ...list[idx],
+      secretRef: connectionSecretRef(connectionId),
+      updatedAt: nowIso(),
+    };
+    try {
+      await writeConnectionsDurable(next);
+    } catch {
+      await compensateConnectionSecretOrThrow(account, priorSecret);
+    }
   }
   // The "Key set" badge is driven by secret presence; notify subscribers so
   // sibling panels reflect it without a manual refresh.
   emitConnectionsChanged();
+}
+
+export function setConnectionSecret(id: string, value: string): Promise<void> {
+  return enqueueConnectionMutation(() => setConnectionSecretNow(id, value));
 }
 
 /**
@@ -467,7 +606,7 @@ export async function setConnectionSecret(id: string, value: string): Promise<vo
  * must distinguish "unbound" (null) from "keychain error" (catch) and surface
  * an actionable message instead of treating a rejection as "no key".
  */
-export async function getConnectionSecret(id: string): Promise<string | null> {
+async function getConnectionSecretNow(id: string): Promise<string | null> {
   const connectionId = normalizeConnectionId(id);
   if (!connectionId) return null;
   const connection = readConnections().find(c => c.id === connectionId);
@@ -478,8 +617,44 @@ export async function getConnectionSecret(id: string): Promise<string | null> {
   return getSecret(connectionSecretAccount(connectionId));
 }
 
+export function getConnectionSecret(id: string): Promise<string | null> {
+  return enqueueConnectionMutation(() => getConnectionSecretNow(id));
+}
+
+function matchesSecretEndpointSnapshot(
+  current: RuntimeConnection,
+  snapshot: RuntimeConnection,
+): boolean {
+  return (
+    current.id === snapshot.id
+    && current.kind === snapshot.kind
+    && current.transport === snapshot.transport
+    && current.baseUrl === snapshot.baseUrl
+    && (current.secretRef?.account ?? null) === (snapshot.secretRef?.account ?? null)
+  );
+}
+
+/**
+ * Resolve a secret only while the supplied endpoint snapshot is still current.
+ *
+ * The comparison and keychain read share the connection-mutation queue. An
+ * endpoint+key update therefore cannot expose its new key to a health/header
+ * request that already captured the old endpoint.
+ */
+export function getConnectionSecretForSnapshot(
+  snapshot: RuntimeConnection,
+): Promise<string | null> {
+  return enqueueConnectionMutation(async () => {
+    const current = readConnections().find(connection => connection.id === snapshot.id);
+    if (!current || !matchesSecretEndpointSnapshot(current, snapshot)) {
+      throw new Error('Runtime connection changed before secret resolution');
+    }
+    return getConnectionSecretNow(snapshot.id);
+  });
+}
+
 /** Delete only the secret for a connection, leaving the connection record. */
-export async function clearConnectionSecret(id: string): Promise<void> {
+async function clearConnectionSecretNow(id: string): Promise<void> {
   const connectionId = normalizeConnectionId(id);
   if (!connectionId) return;
   const list = readConnections();
@@ -488,10 +663,21 @@ export async function clearConnectionSecret(id: string): Promise<void> {
 
   // Nothing bound → nothing to clear (and off-desktop deleteSecret would throw).
   if (!list[idx].secretRef) return;
-  await deleteSecret(connectionSecretAccount(connectionId));
-  list[idx] = { ...list[idx], secretRef: null, updatedAt: nowIso() };
-  writeConnections(list);
+  const account = connectionSecretAccount(connectionId);
+  const priorSecret = await captureConnectionSecret(account);
+  await deleteSecret(account);
+  const next = list.slice();
+  next[idx] = { ...list[idx], secretRef: null, updatedAt: nowIso() };
+  try {
+    await writeConnectionsDurable(next);
+  } catch {
+    await compensateConnectionSecretOrThrow(account, priorSecret);
+  }
   emitConnectionsChanged();
+}
+
+export function clearConnectionSecret(id: string): Promise<void> {
+  return enqueueConnectionMutation(() => clearConnectionSecretNow(id));
 }
 
 // ── Capability profile (role → binding) ─────────────────────────────────────
@@ -560,6 +746,24 @@ function writeProfile(profile: CapabilityProfile): void {
   setStoredSetting(PROFILE_KEY, JSON.stringify(profile));
 }
 
+/**
+ * Await the authoritative capability-profile write. On failure, restore the
+ * previous cache/localStorage mirror (without enqueueing another SQLite PATCH)
+ * and throw a stable persistence error. Callers must emit change notifications
+ * only after this resolves.
+ */
+async function writeProfileDurable(profile: CapabilityProfile): Promise<void> {
+  if (!hasStorage()) {
+    throw new Error(PROFILE_PERSISTENCE_FAILED);
+  }
+  const previous = getStoredSetting(PROFILE_KEY);
+  const attempted = JSON.stringify(profile);
+  const ok = await setStoredSettingDurable(PROFILE_KEY, attempted);
+  if (ok) return;
+  rollbackStoredSettingMirrorAfterFailedDurableAttempt(PROFILE_KEY, attempted, previous);
+  throw new Error(PROFILE_PERSISTENCE_FAILED);
+}
+
 export function getCapabilityProfile(): CapabilityProfile {
   return readProfile();
 }
@@ -568,40 +772,148 @@ export function getBindingForRole(role: CapabilityRole): CapabilityBinding | nul
   return readProfile()[role] ?? null;
 }
 
-/** Bind a capability role to a connection + model (optional fallback). */
+export type CapabilityBindingMutation =
+  | {
+      role: CapabilityRole;
+      connectionId: string;
+      modelId: string;
+      fallback?: { connectionId: string; modelId: string };
+    }
+  | { role: CapabilityRole; binding: null };
+
+export interface CapabilityProfileExclusiveContext {
+  /** Re-read the latest profile while the mutation queue is exclusively held. */
+  read(): CapabilityProfile;
+  /** Persist mutations without re-entering (and deadlocking) the same queue. */
+  save(mutations: readonly CapabilityBindingMutation[]): Promise<CapabilityProfile>;
+}
+
+function applyCapabilityBindingMutations(
+  profile: CapabilityProfile,
+  mutations: readonly CapabilityBindingMutation[],
+): { profile: CapabilityProfile; changed: boolean } {
+  const next: CapabilityProfile = { ...profile };
+  const validConnectionIds = new Set(readConnections().map(connection => connection.id));
+  let changed = false;
+  for (const mutation of mutations) {
+    if ('binding' in mutation && mutation.binding === null) {
+      if (next[mutation.role] !== null) {
+        next[mutation.role] = null;
+        changed = true;
+      }
+      continue;
+    }
+    if (!('connectionId' in mutation)) continue;
+    const binding = sanitizeBinding(
+      {
+        connectionId: mutation.connectionId,
+        modelId: mutation.modelId,
+        fallback: mutation.fallback,
+      },
+      validConnectionIds,
+    );
+    if (JSON.stringify(next[mutation.role]) !== JSON.stringify(binding)) {
+      next[mutation.role] = binding;
+      changed = true;
+    }
+  }
+  return { profile: next, changed };
+}
+
+/**
+ * Bind a capability role to a connection + model (optional fallback).
+ *
+ * Synchronous mirror write retained for tests / read-only fixtures. Production
+ * UI and orchestrator mutations must use {@link saveCapabilityBindingDurable}
+ * or {@link saveCapabilityBindingsDurable}.
+ */
 export function saveCapabilityBinding(
   role: CapabilityRole,
   connectionId: string,
   modelId: string,
   fallback?: { connectionId: string; modelId: string },
 ): CapabilityProfile {
-  const profile = readProfile();
-  const validConnectionIds = new Set(readConnections().map(connection => connection.id));
-  const binding = sanitizeBinding(
-    { connectionId, modelId, fallback },
-    validConnectionIds,
-  );
-  if (!binding) {
-    profile[role] = null;
-    writeProfile(profile);
-    emitConnectionsChanged();
-    return profile;
-  }
-  const prev = profile[role];
-  if (prev && JSON.stringify(prev) === JSON.stringify(binding)) return profile;
-  profile[role] = binding;
+  const { profile, changed } = applyCapabilityBindingMutations(readProfile(), [
+    { role, connectionId, modelId, fallback },
+  ]);
+  if (!changed) return profile;
   writeProfile(profile);
   emitConnectionsChanged();
   return profile;
 }
 
-/** Clear a role's binding (set it back to unbound/null). */
+/**
+ * Clear a role's binding (set it back to unbound/null).
+ *
+ * Synchronous mirror write retained for tests / read-only fixtures. Production
+ * UI and orchestrator mutations must use {@link clearCapabilityBindingDurable}
+ * or {@link saveCapabilityBindingsDurable}.
+ */
 export function clearCapabilityBinding(role: CapabilityRole): CapabilityProfile {
-  const profile = readProfile();
-  profile[role] = null;
+  const { profile, changed } = applyCapabilityBindingMutations(readProfile(), [
+    { role, binding: null },
+  ]);
+  if (!changed) return profile;
   writeProfile(profile);
   emitConnectionsChanged();
   return profile;
+}
+
+/**
+ * Apply one or more capability-role mutations in a single durable profile write.
+ * On SQLite failure the mirror is compare-and-restored and subscribers are not
+ * notified — callers must not treat the rejection as a successful bind/clear.
+ */
+export async function saveCapabilityBindingsDurable(
+  mutations: readonly CapabilityBindingMutation[],
+): Promise<CapabilityProfile> {
+  return enqueueProfileMutation(() => saveCapabilityBindingsDurableNow(mutations));
+}
+
+async function saveCapabilityBindingsDurableNow(
+  mutations: readonly CapabilityBindingMutation[],
+): Promise<CapabilityProfile> {
+  if (mutations.length === 0) return readProfile();
+  const { profile, changed } = applyCapabilityBindingMutations(readProfile(), mutations);
+  if (!changed) return profile;
+  await writeProfileDurable(profile);
+  emitConnectionsChanged();
+  return profile;
+}
+
+/**
+ * Hold the capability-profile queue across a lifecycle decision and its
+ * associated side effects. This is reserved for engine compensation/stop
+ * paths that must compare current bindings and act before a newer bind can
+ * interleave. The callback must use the supplied `save` helper instead of
+ * calling a public durable profile mutation (which would re-enter the queue).
+ */
+export function runCapabilityProfileExclusive<T>(
+  operation: (context: CapabilityProfileExclusiveContext) => Promise<T>,
+): Promise<T> {
+  return enqueueProfileMutation(() =>
+    operation({
+      read: readProfile,
+      save: saveCapabilityBindingsDurableNow,
+    }),
+  );
+}
+
+/** Durable single-role bind. Prefer {@link saveCapabilityBindingsDurable} for batches. */
+export async function saveCapabilityBindingDurable(
+  role: CapabilityRole,
+  connectionId: string,
+  modelId: string,
+  fallback?: { connectionId: string; modelId: string },
+): Promise<CapabilityProfile> {
+  return saveCapabilityBindingsDurable([{ role, connectionId, modelId, fallback }]);
+}
+
+/** Durable single-role clear. Prefer {@link saveCapabilityBindingsDurable} for batches. */
+export async function clearCapabilityBindingDurable(
+  role: CapabilityRole,
+): Promise<CapabilityProfile> {
+  return saveCapabilityBindingsDurable([{ role, binding: null }]);
 }
 
 // After desktop boot hydration swaps the cache from the (possibly empty,

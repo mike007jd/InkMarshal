@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   isTauriRuntime: vi.fn(() => true),
   runtimeHealth: vi.fn(),
-  getConnectionSecret: vi.fn(),
+  getConnectionSecretForSnapshot: vi.fn(),
 }));
 
 vi.mock('@/lib/desktop-runtime', () => ({
@@ -12,7 +12,7 @@ vi.mock('@/lib/desktop-runtime', () => ({
 }));
 
 vi.mock('./connections', () => ({
-  getConnectionSecret: mocks.getConnectionSecret,
+  getConnectionSecretForSnapshot: mocks.getConnectionSecretForSnapshot,
 }));
 
 import { checkConnectionHealth } from './runtime-health';
@@ -39,7 +39,7 @@ describe('checkConnectionHealth', () => {
   });
 
   it('passes the stored connection secret into the desktop health probe', async () => {
-    mocks.getConnectionSecret.mockResolvedValue('sk-live');
+    mocks.getConnectionSecretForSnapshot.mockResolvedValue('sk-live');
     mocks.runtimeHealth.mockResolvedValue({
       reachable: true,
       transportOk: true,
@@ -53,7 +53,9 @@ describe('checkConnectionHealth', () => {
       models: ['model-a'],
     });
 
-    expect(mocks.getConnectionSecret).toHaveBeenCalledWith('conn-1');
+    expect(mocks.getConnectionSecretForSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'conn-1' }),
+    );
     expect(mocks.runtimeHealth).toHaveBeenCalledWith({
       connectionId: 'conn-1',
       baseUrl: 'https://api.example.com/v1',
@@ -80,7 +82,7 @@ describe('checkConnectionHealth', () => {
       }),
     );
 
-    expect(mocks.getConnectionSecret).not.toHaveBeenCalled();
+    expect(mocks.getConnectionSecretForSnapshot).not.toHaveBeenCalled();
     expect(mocks.runtimeHealth).toHaveBeenCalledWith({
       connectionId: 'conn-1',
       baseUrl: 'http://127.0.0.1:11434',
@@ -90,7 +92,7 @@ describe('checkConnectionHealth', () => {
   });
 
   it('surfaces keychain failures as degraded health instead of probing without the key', async () => {
-    mocks.getConnectionSecret.mockRejectedValue(new Error('keyring locked'));
+    mocks.getConnectionSecretForSnapshot.mockRejectedValue(new Error('keyring locked'));
 
     await expect(checkConnectionHealth(connection())).resolves.toMatchObject({
       reachable: false,
@@ -112,7 +114,7 @@ describe('checkConnectionHealth', () => {
       message: 'Runtime health checks require the desktop app',
     });
 
-    expect(mocks.getConnectionSecret).not.toHaveBeenCalled();
+    expect(mocks.getConnectionSecretForSnapshot).not.toHaveBeenCalled();
     expect(mocks.runtimeHealth).not.toHaveBeenCalled();
   });
 });

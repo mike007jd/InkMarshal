@@ -133,6 +133,7 @@ export function ManuscriptWorkspacePane({
       )}
 
       <ManuscriptShell
+        key={novelId}
         novelId={novelId}
         title={novel.title || t.untitledNovel}
         genre={novel.genre}

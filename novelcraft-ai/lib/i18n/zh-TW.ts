@@ -411,6 +411,7 @@ export const zhTW = {
   capabilityAutoBinding: '綁定中…',
   capabilityAutoBindNone: '沒有可達連線擁有推薦模型。請安裝本地模型或連接服務商。',
   capabilityAutoBindFailed: '有 {failed} 個模型未能啟動——請檢查可用記憶體、本地引擎或模型格式。',
+  capabilitySaveFailed: '無法儲存模型分配，之前的分配仍然有效。',
   capabilityNoInstalledModels: '尚未安裝任何模型，請先下載一個本地模型。',
   capabilityRoleNotOptimized: '這個模型並非為該角色最佳化，但仍可執行。',
   capabilityNoConnections: '尚未設定任何連線。請先新增本地執行環境或服務商。',

@@ -39,6 +39,7 @@ export function DiagnosticsPanel({
   const [hasValidBinding, setHasValidBinding] = useState(false);
   const [freeBytes, setFreeBytes] = useState<number | null>(null);
   const [installed, setInstalled] = useState<InstalledLocalModel[]>([]);
+  const [repairError, setRepairError] = useState<string | null>(null);
   const installedSeqRef = useRef(0);
   const freeBytesSeqRef = useRef(0);
 
@@ -113,9 +114,14 @@ export function DiagnosticsPanel({
         detail: t.diagnosticsDanglingDetail.replace('{roles}', danglingRoles.join(', ')),
         cta: {
           label: t.diagnosticsDanglingFix,
-          onClick: () => {
+          onClick: async () => {
             const knownIds = new Set(getConnections().map(c => c.id));
-            clearDanglingBindings(knownIds);
+            setRepairError(null);
+            try {
+              await clearDanglingBindings(knownIds);
+            } catch {
+              setRepairError(t.capabilitySaveFailed);
+            }
           },
         },
       });
@@ -140,6 +146,11 @@ export function DiagnosticsPanel({
         <AlertTriangle className="h-3.5 w-3.5 text-book-warning" aria-hidden="true" />
         <span>{t.diagnosticsTitle}</span>
       </header>
+      {repairError && (
+        <p role="alert" className="mb-2 text-xs text-book-danger">
+          {repairError}
+        </p>
+      )}
       <ul className="space-y-2">
         {issues.map(issue => (
           <li key={issue.id} className="flex flex-col gap-1 text-book-ink-secondary">

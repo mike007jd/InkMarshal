@@ -29,10 +29,10 @@ import {
 import { catalogForRole, MODEL_CATALOG } from '@/lib/model-supply/catalog';
 import { formatBytes } from '@/lib/model-supply/format';
 import {
-  clearCapabilityBinding,
+  clearCapabilityBindingDurable,
   getCapabilityProfile,
   getConnections,
-  saveCapabilityBinding,
+  saveCapabilityBindingDurable,
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
 import {
@@ -284,6 +284,7 @@ export function CapabilityBindingPanel({
   >({});
   const [autoBinding, setAutoBinding] = useState(false);
   const [autoMsg, setAutoMsg] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [installed, setInstalled] = useState<InstalledLocalModel[]>([]);
   const [engines, setEngines] = useState<EngineInfo[]>([]);
   const [budget, setBudget] = useState<EngineBudget | null>(null);
@@ -390,19 +391,28 @@ export function CapabilityBindingPanel({
 
   const setBinding = useCallback(
     (role: CapabilityRole, next: CapabilityBinding | null) => {
-      if (next == null || !next.connectionId || !next.modelId) {
-        clearCapabilityBinding(role);
-      } else {
-        saveCapabilityBinding(
-          role,
-          next.connectionId,
-          next.modelId,
-          next.fallback,
-        );
-      }
-      setProfile(getCapabilityProfile());
+      void (async () => {
+        try {
+          if (next == null || !next.connectionId || !next.modelId) {
+            await clearCapabilityBindingDurable(role);
+          } else {
+            await saveCapabilityBindingDurable(
+              role,
+              next.connectionId,
+              next.modelId,
+              next.fallback,
+            );
+          }
+          setSaveError(null);
+        } catch {
+          // Durable write failed — mirror was rolled back; do not keep a
+          // success UI that disagrees with the restored profile.
+          setSaveError(t.capabilitySaveFailed);
+        }
+        setProfile(getCapabilityProfile());
+      })();
     },
-    [],
+    [t.capabilitySaveFailed],
   );
 
   const modelOptionsFor = useCallback(
@@ -630,23 +640,35 @@ export function CapabilityBindingPanel({
         const c = step.candidate;
         if (c.source === 'engine' && c.connectionId) {
           // Direct bind to an already-running engine — no engine start needed.
-          saveCapabilityBinding(step.role, c.connectionId, c.modelId);
-          reused += 1;
-          bound += 1;
+          try {
+            await saveCapabilityBindingDurable(step.role, c.connectionId, c.modelId);
+            reused += 1;
+            bound += 1;
+          } catch {
+            failed += 1;
+          }
           continue;
         }
         if (c.source === 'remote' && c.connectionId) {
-          saveCapabilityBinding(step.role, c.connectionId, c.modelId);
-          bound += 1;
+          try {
+            await saveCapabilityBindingDurable(step.role, c.connectionId, c.modelId);
+            bound += 1;
+          } catch {
+            failed += 1;
+          }
           continue;
         }
         if (c.source === 'installed' && c.installed) {
           const path = c.installed.modelPath;
           const existing = launchedPaths.get(path);
           if (existing) {
-            saveCapabilityBinding(step.role, existing, c.modelId);
-            reused += 1;
-            bound += 1;
+            try {
+              await saveCapabilityBindingDurable(step.role, existing, c.modelId);
+              reused += 1;
+              bound += 1;
+            } catch {
+              failed += 1;
+            }
             continue;
           }
           try {
@@ -857,6 +879,15 @@ export function CapabilityBindingPanel({
         {autoMsg && (
           <p className="rounded-md border border-book-border bg-book-bg-secondary px-3 py-2 text-xs-tight text-book-ink-secondary">
             {autoMsg}
+          </p>
+        )}
+
+        {saveError && (
+          <p
+            role="alert"
+            className="rounded-md border border-book-danger/40 bg-book-danger/10 px-3 py-2 text-xs-tight text-book-danger"
+          >
+            {saveError}
           </p>
         )}
 
