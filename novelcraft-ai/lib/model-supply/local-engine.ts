@@ -1,12 +1,15 @@
 'use client';
 
 import type { EngineInfo } from '@/lib/desktop-runtime';
-import { engineStart } from '@/lib/desktop-runtime';
-import { upsertConnection } from './connections';
+import { engineStart, engineStop } from '@/lib/desktop-runtime';
+import { upsertConnectionWithSecretCleanup } from './connections';
 import type { RuntimeConnection } from './types';
 
 const LOCAL_ENGINE_LABEL_PREFIX = 'Local engine';
 const LOCAL_ENGINE_CONNECTION_PREFIX = 'local-engine:';
+const LOCAL_ENGINE_REGISTRATION_FAILED = 'Failed to register local engine connection';
+const LOCAL_ENGINE_REGISTRATION_AND_STOP_FAILED =
+  'Failed to register local engine connection and stop the spawned engine';
 
 /**
  * Build the connection id for one running engine. Each engine instance gets
@@ -43,6 +46,10 @@ export function localEngineConnectionInput(info: EngineInfo, modelLabel: string)
  * openai-compatible connection so the broker can resolve it. Returns the
  * upserted connection + the model id + engine metadata. One call here = one
  * engine process + one connection row.
+ *
+ * The connection row is awaited durably before success. If registration fails
+ * after a new process was spawned, that exact engine is stopped and a stable
+ * registration error is surfaced — callers must not treat the engine as usable.
  */
 export async function startAndRegisterLocalEngine(
   modelPath: string,
@@ -63,12 +70,26 @@ export async function startAndRegisterLocalEngine(
   });
   const base = localEngineConnectionInput(info, modelLabel);
   const connectionId = localEngineConnectionId(info.engineId);
-  const connection = upsertConnection({ id: connectionId, ...base });
-  return {
-    connection,
-    modelId: modelLabel,
-    engineId: info.engineId,
-    footprintBytes: info.footprintBytes ?? 0,
-    info,
-  };
+  try {
+    const connection = await upsertConnectionWithSecretCleanup({
+      id: connectionId,
+      ...base,
+    });
+    return {
+      connection,
+      modelId: modelLabel,
+      engineId: info.engineId,
+      footprintBytes: info.footprintBytes ?? 0,
+      info,
+    };
+  } catch {
+    try {
+      await engineStop(info.engineId);
+    } catch {
+      // The process is live but has no durable connection row. Surface this
+      // stronger state instead of pretending cleanup succeeded.
+      throw new Error(LOCAL_ENGINE_REGISTRATION_AND_STOP_FAILED);
+    }
+    throw new Error(LOCAL_ENGINE_REGISTRATION_FAILED);
+  }
 }

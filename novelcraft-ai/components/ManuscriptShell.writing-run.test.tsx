@@ -23,9 +23,26 @@ const readingProbe = vi.hoisted(() => ({
   },
 }));
 
+const editingProbe = vi.hoisted(() => ({
+  props: null as null | {
+    novelId: string;
+    draftContent?: string;
+    onDraftContentChange: (
+      chapterNumber: number,
+      content: string,
+      dirty: boolean,
+      version?: number,
+    ) => void;
+  },
+}));
+
 const recoveryProbe = vi.hoisted(() => ({
   raw: null as string | null,
   remove: vi.fn(async (_key: string) => true),
+  set: vi.fn(async (_key: string, value: string) => {
+    recoveryProbe.raw = value;
+    return true;
+  }),
 }));
 
 vi.mock('@/components/ManuscriptReadingView', async () => {
@@ -41,7 +58,12 @@ vi.mock('@/components/ManuscriptReadingView', async () => {
 vi.mock('@/components/ManuscriptEditingView', async () => {
   const ReactModule = await import('react');
   return {
-    ManuscriptEditingView: () => ReactModule.createElement('div', { 'data-testid': 'editing-view' }),
+    ManuscriptEditingView: ReactModule.forwardRef(
+      (props: NonNullable<typeof editingProbe.props>) => {
+        editingProbe.props = props;
+        return ReactModule.createElement('div', { 'data-testid': 'editing-view' });
+      },
+    ),
   };
 });
 
@@ -63,7 +85,7 @@ vi.mock('@/lib/app-settings-client', () => ({
   getStoredSetting: () => recoveryProbe.raw,
   setStoredSetting: () => {},
   removeStoredSetting: () => {},
-  setStoredSettingDurable: vi.fn(async () => true),
+  setStoredSettingDurable: recoveryProbe.set,
   removeStoredSettingDurable: (key: string) => {
     recoveryProbe.raw = null;
     return recoveryProbe.remove(key);
@@ -163,7 +185,9 @@ function liveRun(overrides: Partial<WritingRunState> = {}): WritingRunState {
 }
 
 function renderShell(props: {
+  novelId?: string;
   mode?: 'writing-live' | 'reading-review';
+  startInEditing?: boolean;
   writingRunState?: WritingRunState | null;
   writingRunControls?: { onPause?: () => void; onResume?: () => void; onRetry?: () => void };
   chapters?: ManuscriptChapter[];
@@ -171,11 +195,13 @@ function renderShell(props: {
   return render(
     <LocaleProvider>
       <ManuscriptShell
-        novelId="nv-shell"
+        key={props.novelId ?? 'nv-shell'}
+        novelId={props.novelId ?? 'nv-shell'}
         title="Demo Novel"
         genre="Fantasy"
         progress={40}
         mode={props.mode ?? 'writing-live'}
+        startInEditing={props.startInEditing}
         chapters={props.chapters ?? shellChapters}
         liveChapter={null}
         writingRunState={props.writingRunState ?? null}
@@ -188,8 +214,10 @@ function renderShell(props: {
 describe('ManuscriptShell compact writing-run status', () => {
   beforeEach(() => {
     readingProbe.props = null;
+    editingProbe.props = null;
     recoveryProbe.raw = null;
     recoveryProbe.remove.mockClear();
+    recoveryProbe.set.mockClear();
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
       configurable: true,
       value: vi.fn(),
@@ -324,13 +352,62 @@ describe('ManuscriptShell compact writing-run status', () => {
       expect(screen.queryByRole('alert')).toBeNull();
     });
   });
+
+  it('persists the departing novel draft before an A to B rerender resets refs', async () => {
+    const rendered = renderShell({
+      novelId: 'novel-a',
+      mode: 'reading-review',
+      startInEditing: true,
+    });
+    await screen.findByTestId('editing-view');
+    expect(editingProbe.props).not.toBeNull();
+
+    act(() => {
+      editingProbe.props!.onDraftContentChange(
+        1,
+        'Latest sub-debounce draft for A',
+        true,
+        7,
+      );
+    });
+    rendered.rerender(
+      <LocaleProvider>
+        <ManuscriptShell
+          key="novel-b"
+          novelId="novel-b"
+          title="Novel B"
+          genre="Fantasy"
+          progress={0}
+          mode="reading-review"
+          startInEditing
+          chapters={shellChapters}
+          liveChapter={null}
+        />
+      </LocaleProvider>,
+    );
+
+    await waitFor(() => expect(recoveryProbe.set).toHaveBeenCalled());
+    const envelope = JSON.parse(recoveryProbe.raw ?? '{}') as Record<
+      string,
+      Record<string, { content: string; version: number }>
+    >;
+    expect(envelope['novel-a']?.['1']).toEqual(expect.objectContaining({
+      content: 'Latest sub-debounce draft for A',
+      version: 7,
+    }));
+    expect(envelope['novel-b']).toBeUndefined();
+    expect(editingProbe.props?.novelId).toBe('novel-b');
+    expect(editingProbe.props?.draftContent).toBeUndefined();
+  });
 });
 
 describe('ManuscriptShell chapter-selection routing', () => {
   beforeEach(() => {
     readingProbe.props = null;
+    editingProbe.props = null;
     recoveryProbe.raw = null;
     recoveryProbe.remove.mockClear();
+    recoveryProbe.set.mockClear();
     vi.stubGlobal('matchMedia', vi.fn(() => ({
       matches: false,
       media: '',

@@ -29,6 +29,22 @@ describe('LocalModelsPanel removal path', () => {
     expect(source).toContain('removingModelPathsRef.current.delete(model.modelPath)');
   });
 
+  it('uses current provider health and exact advertised models for role coverage', () => {
+    const source = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
+
+    expect(source).toContain("import { checkConnectionHealth } from '@/lib/model-supply/runtime-health'");
+    expect(source).toContain('collectBoundNonLocalConnections(profile, configuredConnections)');
+    expect(source).toContain('const seq = ++bindingReadinessSeqRef.current');
+    expect(source).toContain('bindingReadinessSeqRef.current !== seq');
+    expect(source).toContain('new Set(health.models)');
+    expect(source).toContain('healthyConnectionModels,');
+    expect(source).toContain('refreshBindingReadiness(true)');
+    expect(source).toContain('CAPABILITY_HEALTH_REFRESH_MS');
+    expect(source).toContain('const ready = await hydrateAppSettings()');
+    expect(source).toContain('if (!settingsHydratedRef.current) return');
+    expect(source).toContain('const engines = await engineStatus().catch');
+  });
+
   it('exposes a user-changeable model folder instead of a raw read-only path', () => {
     const panel = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
     const runtime = readFileSync(join(process.cwd(), 'lib/desktop-runtime.ts'), 'utf8');

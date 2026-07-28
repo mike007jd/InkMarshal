@@ -152,6 +152,26 @@ export function failedDraftSaveOutcome(
   };
 }
 
+/**
+ * Drafts the shell-level flush listener may block on. In editing mode the
+ * active editor owns the current chapter, so that chapter is excluded to avoid
+ * double-reporting; other orphan dirty chapters still block export/flush.
+ */
+export function orphanDraftsForShellFlush(
+  draftContentByChapter: ReadonlyMap<number, string>,
+  options: {
+    editing: boolean;
+    activeChapterNumber?: number | null;
+  },
+): Map<number, string> {
+  if (!options.editing) return new Map(draftContentByChapter);
+  const active = options.activeChapterNumber;
+  if (active == null) return new Map(draftContentByChapter);
+  const next = new Map(draftContentByChapter);
+  next.delete(active);
+  return next;
+}
+
 export function applyDraftContentToChapters(
   chapters: readonly ManuscriptChapter[],
   draftContentByChapter: ReadonlyMap<number, string>,
@@ -296,41 +316,23 @@ export function ManuscriptShell({
   // main blueprint description and never restates the wait time.
   useEffect(() => {
     const saveNow = (event: Event) => {
-      if (effectiveViewMode === 'editing' || draftContentByChapter.size === 0) return;
-      // A dirty draft survived editor unmount, which means the last flush
-      // failed. Do not let export/snapshot flows silently read stale DB
-      // text. Surface the lowest-numbered orphaned chapter so the export
-      // error can point the user at the specific tab to revisit.
-      const outcome = failedDraftSaveOutcome(draftContentByChapter, chapters);
+      const orphanDrafts = orphanDraftsForShellFlush(draftContentByChapter, {
+        editing: effectiveViewMode === 'editing',
+        activeChapterNumber: effectiveActiveChapter,
+      });
+      if (orphanDrafts.size === 0) return;
+      // A dirty draft survived editor unmount (or belongs to a non-active
+      // chapter while editing). Do not let export/snapshot/mode-switch flows
+      // silently read stale DB text. Surface the lowest-numbered orphaned
+      // chapter so callers can name the tab to revisit.
+      const outcome = failedDraftSaveOutcome(orphanDrafts, chapters);
       if (outcome) {
         (event as CustomEvent<ManuscriptFlushEventDetail>).detail?.waitUntil?.(Promise.resolve(outcome));
       }
     };
     window.addEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
     return () => window.removeEventListener(MANUSCRIPT_FLUSH_EVENT, saveNow);
-  }, [draftContentByChapter, effectiveViewMode, chapters]);
-
-  useLayoutEffect(() => {
-    let cancelled = false;
-    activeNovelRef.current = novelId;
-    appliedRequestedChapterKeyRef.current = null;
-    appliedRequestedSearchKeyRef.current = null;
-    searchJumpSeqRef.current += 1;
-    editingViewRef.current = null;
-    draftVersionsRef.current = new Map();
-    draftContentRef.current = new Map();
-    queueMicrotask(() => {
-      if (cancelled) return;
-      setActiveChapterSync(null);
-      setSaveState('idle');
-      setLastSavedAt(null);
-      setDraftContentByChapter(new Map());
-      setDraftRestoreTarget(draftRecoveryDisabledRef.current ? null : novelId);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [novelId]);
+  }, [chapters, draftContentByChapter, effectiveActiveChapter, effectiveViewMode]);
 
   const combinedChapters = useMemo(() => {
     if (!liveChapter) return chapters;
@@ -395,6 +397,45 @@ export function ManuscriptShell({
       Date.now(),
     ));
   }, [persistDraftPayload]);
+
+  const draftTeardownEnabledRef = useRef(
+    draftStoreReady && !draftRecoveryDisabled && !readOnly,
+  );
+  useLayoutEffect(() => {
+    draftTeardownEnabledRef.current =
+      draftStoreReady && !draftRecoveryDisabled && !readOnly;
+  }, [draftRecoveryDisabled, draftStoreReady, readOnly]);
+
+  // Layout cleanup runs before the next novel's layout setup. Persist the
+  // departing novel's ref-backed payload while activeNovelRef and draft refs
+  // still belong to it; a passive cleanup is too late on A → B transitions.
+  useLayoutEffect(() => {
+    let cancelled = false;
+    activeNovelRef.current = novelId;
+    appliedRequestedChapterKeyRef.current = null;
+    appliedRequestedSearchKeyRef.current = null;
+    searchJumpSeqRef.current += 1;
+    editingViewRef.current = null;
+    draftVersionsRef.current = new Map();
+    draftContentRef.current = new Map();
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setActiveChapterSync(null);
+      setSaveState('idle');
+      setLastSavedAt(null);
+      setDraftContentByChapter(new Map());
+      setDraftRestoreTarget(draftRecoveryDisabledRef.current ? null : novelId);
+    });
+    return () => {
+      cancelled = true;
+      if (
+        draftTeardownEnabledRef.current
+        && draftContentRef.current.size > 0
+      ) {
+        void persistDraftMapNow();
+      }
+    };
+  }, [novelId, persistDraftMapNow]);
 
   // draftContentByChapter is deliberately a dependency: every edit must
   // reset the debounce timer (that IS the debounce).

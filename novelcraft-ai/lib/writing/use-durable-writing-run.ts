@@ -48,7 +48,7 @@ export function useDurableWritingRun(novelId: string): DurableWritingRun {
 
   const fetchNovel = useCallback(async () => {
     const controller = controllerRef.current;
-    const token = controller.captureRead();
+    const token = controller.captureNovelRead();
     const response = await fetch(`/api/novels/${novelId}`);
     if (!response.ok) throw new Error(`Failed to fetch novel (HTTP ${response.status})`);
     const data = await response.json() as Novel & { writingJob?: WritingJob | null };
@@ -63,7 +63,7 @@ export function useDurableWritingRun(novelId: string): DurableWritingRun {
 
   const fetchChapters = useCallback(async () => {
     const controller = controllerRef.current;
-    const token = controller.captureRead();
+    const token = controller.captureChapterRead();
     const response = await fetch(`/api/novels/${novelId}/chapters`);
     if (!response.ok) throw new Error('Failed to fetch chapters');
     const data = await response.json() as Chapter[];
@@ -81,15 +81,19 @@ export function useDurableWritingRun(novelId: string): DurableWritingRun {
   }, []);
 
   const patchNovel = useCallback((patch: Partial<Novel>) => {
+    // Local canonical mutations (for example a successful title PATCH) own a
+    // newer state than any GET already in flight.
+    controllerRef.current.invalidateNovelReads();
     setNovel(current => current ? { ...current, ...patch } : current);
   }, []);
 
   const replaceNovel = useCallback((next: Novel) => {
+    controllerRef.current.invalidateNovelReads();
     setNovel(next);
   }, []);
 
   const upsertChapter = useCallback((chapter: Chapter) => {
-    controllerRef.current.invalidateReads();
+    controllerRef.current.invalidateChapterReads();
     setChapters(current => {
       const withoutChapter = current.filter(
         existing => existing.chapterNumber !== chapter.chapterNumber,

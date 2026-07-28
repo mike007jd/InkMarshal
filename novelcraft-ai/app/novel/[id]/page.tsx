@@ -11,5 +11,5 @@ import { NovelWorkspace } from '@/components/NovelWorkspace';
 export default function NovelPage() {
   const params = useParams();
   const novelId = params.id as string;
-  return <NovelWorkspace novelId={novelId} initialView="agent" />;
+  return <NovelWorkspace key={novelId} novelId={novelId} initialView="agent" />;
 }

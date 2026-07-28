@@ -70,12 +70,17 @@ import {
   type EngineFormat,
   type EngineInfo,
 } from '@/lib/desktop-runtime';
-import { removeStoredSetting, setStoredSetting } from '@/lib/app-settings-client';
+import {
+  hydrateAppSettings,
+  removeStoredSetting,
+  setStoredSetting,
+} from '@/lib/app-settings-client';
 import {
   getCapabilityProfile,
   getConnections,
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
+import { checkConnectionHealth } from '@/lib/model-supply/runtime-health';
 import { ggufDownloadTaskId, snapshotDownloadTaskId } from '@/lib/model-supply/download-task';
 import { formatBytes } from '@/lib/model-supply/format';
 import { formatLabel, installDate, recoveryMessage, roleChipLabel, roleSummary } from '@/components/models/model-presentation';
@@ -101,6 +106,8 @@ import { StudioFirstRunWizard } from '@/components/StudioFirstRunWizard';
 import { useClientMacPlatform } from '@/components/hooks/useClientMacPlatform';
 import {
   buildCapabilityCoverageSummary,
+  CAPABILITY_HEALTH_REFRESH_MS,
+  collectBoundNonLocalConnections,
   EMPTY_CAPABILITY_PROFILE,
   type CapabilityCoverageRole,
 } from '@/components/models/capability-coverage';
@@ -177,6 +184,9 @@ export function LocalModelsPanel({
   const [runningEngines, setRunningEngines] = useState<EngineInfo[]>([]);
   const [connections, setConnections] = useState<RuntimeConnection[]>([]);
   const [capabilityProfile, setCapabilityProfile] = useState<CapabilityProfile>(EMPTY_CAPABILITY_PROFILE);
+  const [healthyConnectionModels, setHealthyConnectionModels] = useState<
+    ReadonlyMap<string, ReadonlySet<string>>
+  >(() => new Map());
   const [format, setFormat] = useState<EngineFormat>('gguf');
 
   const [progress, setProgress] = useState<Record<string, ModelProgress>>({});
@@ -208,6 +218,8 @@ export function LocalModelsPanel({
   const activeDownloadTasksRef = useRef<Set<string>>(new Set());
   const removingModelPathsRef = useRef<Set<string>>(new Set());
   const refreshSeqRef = useRef(0);
+  const bindingReadinessSeqRef = useRef(0);
+  const settingsHydratedRef = useRef(false);
   // Anchor for the coverage CTA to scroll the user to the Recommended shelf
   // when there is no primary starter entry to install directly.
   const recommendedShelfRef = useRef<HTMLDivElement>(null);
@@ -315,32 +327,84 @@ export function LocalModelsPanel({
     }
   }, []);
 
+  const refreshBindingReadiness = useCallback(
+    (invalidateNonLocal = false) => void (async () => {
+      if (!settingsHydratedRef.current) return;
+      const seq = ++bindingReadinessSeqRef.current;
+      const configuredConnections = getConnections();
+      const profile = getCapabilityProfile();
+      if (!mountedRef.current) return;
+      setRoleBindings(listRoleEngineBindings());
+      setConnections(configuredConnections);
+      setCapabilityProfile(profile);
+      if (invalidateNonLocal) setHealthyConnectionModels(new Map());
+
+      const engines = await engineStatus().catch(() => [] as EngineInfo[]);
+      if (!mountedRef.current || bindingReadinessSeqRef.current !== seq) return;
+      setRunningEngines(engines);
+
+      const probeTargets = collectBoundNonLocalConnections(profile, configuredConnections);
+      const nextHealthy = new Map<string, ReadonlySet<string>>();
+      await Promise.all(
+        probeTargets.map(async connection => {
+          const health = await checkConnectionHealth(connection);
+          if (health.reachable && health.transportOk) {
+            nextHealthy.set(connection.id, new Set(health.models));
+          }
+        }),
+      );
+      if (!mountedRef.current || bindingReadinessSeqRef.current !== seq) return;
+      setHealthyConnectionModels(nextHealthy);
+    })(),
+    [],
+  );
+
   useEffect(() => {
     let cancelled = false;
+    let hydrationAttempt: Promise<void> | null = null;
+    const ensureHydratedReadiness = (): void => {
+      if (settingsHydratedRef.current) {
+        refreshBindingReadiness();
+        return;
+      }
+      if (hydrationAttempt) return;
+      const attempt = (async () => {
+        const ready = await hydrateAppSettings();
+        if (cancelled || !mountedRef.current || !ready) return;
+        settingsHydratedRef.current = true;
+        refreshBindingReadiness(true);
+      })().finally(() => {
+        if (hydrationAttempt === attempt) hydrationAttempt = null;
+      });
+      hydrationAttempt = attempt;
+    };
     queueMicrotask(() => {
-      if (!cancelled) void refresh();
+      if (!cancelled) {
+        void refresh();
+        ensureHydratedReadiness();
+      }
     });
     // Wave 4 commit C: keep `roleBindings` synced through the same store sub
     // — a bind/unbind in CapabilityBindingPanel must update the chips here
     // without waiting for an explicit `refresh()` call.
-    const readBindings = () => {
-      if (!mountedRef.current) return;
-      setRoleBindings(listRoleEngineBindings());
-      setConnections(getConnections());
-      setCapabilityProfile(getCapabilityProfile());
-    };
-    queueMicrotask(() => {
-      if (!cancelled) readBindings();
-    });
     const unsubscribe = subscribeConnectionsStore(() => {
       void refresh();
-      readBindings();
+      if (settingsHydratedRef.current) refreshBindingReadiness(true);
+      else ensureHydratedReadiness();
     });
+    const onFocus = ensureHydratedReadiness;
+    window.addEventListener('focus', onFocus);
+    const healthInterval = window.setInterval(
+      ensureHydratedReadiness,
+      CAPABILITY_HEALTH_REFRESH_MS,
+    );
     return () => {
       cancelled = true;
       unsubscribe();
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(healthInterval);
     };
-  }, [refresh]);
+  }, [refresh, refreshBindingReadiness]);
 
   const platform = isMac ? 'macos' : 'windows';
   const recommended = useMemo(() => {
@@ -369,8 +433,9 @@ export function LocalModelsPanel({
       profile: capabilityProfile,
       connections,
       runningEngines,
+      healthyConnectionModels,
     });
-  }, [capabilityProfile, connections, runningEngines]);
+  }, [capabilityProfile, connections, healthyConnectionModels, runningEngines]);
 
   const hardwareLabel = useMemo(() => {
     return localModelHardwareLabel({

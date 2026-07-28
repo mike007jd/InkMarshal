@@ -1,28 +1,6 @@
-// S1 regression: extractBackupBundle must read the whole novel inside ONE
-// synchronous better-sqlite3 transaction so the bundle is an internally
-// consistent point-in-time snapshot, and must ABORT (not silently skip) when a
-// chapter present in the number list has no body row by the time it is fetched.
-//
-// Before the fix the header claimed a single read transaction but the body had
-// none, and a mid-snapshot chapter deletion was swallowed by `if (!ch) continue`,
-// shipping a truncated bundle whose chapter set silently disagreed with the
-// live novel (verify() only runs on RESTORE, so the loss was undetected).
-//
-// Testing notes:
-// - The happy path + self-consistency are covered below against real SQLite.
-// - The abort branch guards genuine cross-CONNECTION concurrency (a second
-//   writer deleting a chapter between the number list and the body fetch). Now
-//   that the whole snapshot runs in one synchronous transaction there is no
-//   await gap, so a same-process test cannot make the list and body disagree.
-//   We exercise the throw deterministically by deleting a chapter row on a
-//   second connection AFTER the snapshot's number list is read — which requires
-//   the snapshot to yield, so instead we lock the throw via a direct table
-//   mutation that creates a list/body divergence within one transaction: we
-//   insert a ghost number into a side table is not how the code reads. The
-//   faithful, deterministic repro is therefore done by making the body SELECT
-//   return undefined for a number the list returned, achieved by deleting the
-//   row mid-transaction through a second connection that the snapshot's own
-//   BEGIN does not block in WAL mode — see the abort test below.
+// Extraction reads one novel in a single synchronous SQLite transaction so
+// chapters and book-owned history share one snapshot. Missing novels fail
+// explicitly; chapters deleted before extraction are absent.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -74,6 +52,45 @@ describe('extractBackupBundle — S1 snapshot consistency', () => {
     expect(bundle.chapters[1].content).toBe('Chapter two body content.');
     expect(bundle.chapters).toHaveLength(3);
     expect(bundle.meta.sourceNovelId).toBe(novelId);
+    // History sections are always present (empty when the novel has none).
+    expect(bundle.novel.volumeSummaries).toEqual([]);
+    expect(bundle.conversations).toEqual([]);
+    expect(bundle.messages).toEqual([]);
+    expect(bundle.chapterChat).toEqual([]);
+  });
+
+  it('captures book-owned history rows inside the same snapshot transaction', async () => {
+    const { db, extract } = await mods();
+    const novelId = await seedNovelWithChapters();
+    const now = new Date().toISOString();
+
+    await db.appendVolumeSummary(novelId, { start: 1, end: 3, summary: 'Full span.' });
+    const conv = await db.createConversation({
+      id: crypto.randomUUID(),
+      novelId,
+      userId: LOCAL_USER_ID,
+      topic: 'general',
+      title: 'Snapshot thread',
+      parentMessageId: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.addMessage(novelId, 'user', 'Hello from snapshot', conv.id);
+    await db.addMessage(novelId, 'system', 'Orphan note', null);
+    await db.addChatMessage(novelId, 2, {
+      role: 'user',
+      content: 'Chat note',
+      status: 'pending',
+    });
+
+    const bundle = await extract.extractBackupBundle(novelId);
+    expect(bundle.novel.volumeSummaries).toEqual([{ start: 1, end: 3, summary: 'Full span.' }]);
+    expect(bundle.conversations).toHaveLength(1);
+    expect(bundle.conversations[0].title).toBe('Snapshot thread');
+    expect(bundle.messages).toHaveLength(2);
+    expect(bundle.messages.some(m => m.conversationId == null)).toBe(true);
+    expect(bundle.chapterChat).toHaveLength(1);
+    expect(bundle.chapterChat[0].chapterNumber).toBe(2);
   });
 
   it('never silently drops chapters — a deleted chapter is simply absent from the list (no phantom, no truncation)', async () => {

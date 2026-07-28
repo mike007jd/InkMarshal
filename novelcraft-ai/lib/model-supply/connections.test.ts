@@ -52,12 +52,15 @@ vi.mock('@/lib/desktop-runtime', () => ({
 let savedWindow: PropertyDescriptor | undefined;
 let savedLocalStorage: PropertyDescriptor | undefined;
 let memory: MemoryStorage;
+let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   vi.resetModules();
   keychain.clear();
   mockIsTauriRuntime.mockReturnValue(true);
   memory = new MemoryStorage();
+  fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+  vi.stubGlobal('fetch', fetchMock);
   savedWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   savedLocalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   Object.defineProperty(globalThis, 'window', {
@@ -78,8 +81,14 @@ afterEach(() => {
   if (savedLocalStorage)
     Object.defineProperty(globalThis, 'localStorage', savedLocalStorage);
   else delete (globalThis as Record<string, unknown>).localStorage;
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
+
+async function flushConnectionsNotifications(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
 
 async function loadModule() {
   return import('./connections');
@@ -504,6 +513,482 @@ describe('connections CRUD', () => {
         baseUrl: `http://127.0.0.1:8000/${'v'.repeat(2_048)}`,
       }),
     ).toThrow(/base URL/);
+  });
+});
+
+describe('durable connection row writes + keychain compensation', () => {
+  it('rejects save when the connections row write fails, restores the prior row, and deletes the new key', async () => {
+    const mod = await loadModule();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(
+      mod.saveConnectionWithOptionalSecret(
+        {
+          label: 'OpenAI',
+          kind: 'provider',
+          transport: 'openai-compatible',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+        'sk-new-should-not-stick',
+      ),
+    ).rejects.toThrow('Failed to persist connection settings');
+
+    expect(mod.getConnections()).toEqual([]);
+    expect(keychain.size).toBe(0);
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+    expect(JSON.stringify(memory.__entries())).not.toContain('sk-new-should-not-stick');
+
+    fetchMock.mockResolvedValue({ ok: true });
+    const saved = await mod.saveConnectionWithOptionalSecret(
+      {
+        label: 'OpenAI',
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      'sk-retry-ok',
+    );
+    expect(mod.getConnection(saved.id)?.secretRef).toEqual({
+      account: `connection:${saved.id}`,
+    });
+    expect(keychain.get(`connection:${saved.id}`)).toBe('sk-retry-ok');
+    await flushConnectionsNotifications();
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it('restores the prior key when a secret-bearing row write fails after overwrite', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-prior');
+    const priorRow = memory.getItem('inkmarshal_connections_v1');
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(
+      mod.saveConnectionWithOptionalSecret(
+        {
+          ...mod.getConnection(conn.id)!,
+          label: 'Provider renamed',
+        },
+        'sk-replacement',
+      ),
+    ).rejects.toThrow('Failed to persist connection settings');
+
+    expect(mod.getConnection(conn.id)?.label).toBe('Provider');
+    expect(memory.getItem('inkmarshal_connections_v1')).toBe(priorRow);
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-prior');
+    expect(JSON.stringify(mod.getConnections())).not.toContain('sk-replacement');
+    expect(JSON.stringify(memory.__entries())).not.toContain('sk-replacement');
+  });
+
+  it('restores a deleted key when removeConnection row persistence fails', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'DeepSeek',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.deepseek.com/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-keep');
+    await flushConnectionsNotifications();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(mod.removeConnection(conn.id)).rejects.toThrow(
+      'Failed to persist connection settings',
+    );
+    expect(mod.getConnection(conn.id)).toBeDefined();
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-keep');
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+
+    await mod.removeConnection(conn.id);
+    expect(mod.getConnection(conn.id)).toBeUndefined();
+    expect(keychain.has(`connection:${conn.id}`)).toBe(false);
+    await flushConnectionsNotifications();
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it('restores the prior key when clearConnectionSecret row persistence fails', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Anthropic',
+      kind: 'provider',
+      transport: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-ant-prior');
+    await flushConnectionsNotifications();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(mod.clearConnectionSecret(conn.id)).rejects.toThrow(
+      'Failed to persist connection settings',
+    );
+    expect(mod.getConnection(conn.id)?.secretRef).toEqual({
+      account: `connection:${conn.id}`,
+    });
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-ant-prior');
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('restores the captured key when endpoint cleanup row persistence fails', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-endpoint-prior');
+    await flushConnectionsNotifications();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(
+      mod.upsertConnectionWithSecretCleanup({
+        ...mod.getConnection(conn.id)!,
+        baseUrl: 'https://api.other-provider.test/v1',
+      }),
+    ).rejects.toThrow('Failed to persist connection settings');
+
+    expect(mod.getConnection(conn.id)?.baseUrl).toBe('https://api.provider.test/v1');
+    expect(mod.getConnection(conn.id)?.secretRef).toEqual({
+      account: `connection:${conn.id}`,
+    });
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-endpoint-prior');
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('leaves the row untouched when stale-secret delete is locked before endpoint cleanup', async () => {
+    const mod = await loadModule();
+    const dr = await import('@/lib/desktop-runtime');
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-locked-stale');
+
+    (dr.keychainGet as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('keychain locked'),
+    );
+    await expect(
+      mod.upsertConnectionWithSecretCleanup({
+        ...mod.getConnection(conn.id)!,
+        baseUrl: 'https://api.other-provider.test/v1',
+      }),
+    ).rejects.toThrow('keychain locked');
+    expect(mod.getConnection(conn.id)?.baseUrl).toBe('https://api.provider.test/v1');
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-locked-stale');
+  });
+
+  it('surfaces persistence-and-compensation failure without secret values', async () => {
+    const mod = await loadModule();
+    const dr = await import('@/lib/desktop-runtime');
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-compensate-me');
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    (dr.keychainSet as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('keychain locked'),
+    );
+    let message = '';
+    try {
+      await mod.removeConnection(conn.id);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe(
+      'Failed to persist connection settings, and secret compensation also failed',
+    );
+    expect(message).not.toContain('sk-compensate-me');
+    expect(mod.getConnection(conn.id)).toBeDefined();
+  });
+
+  it('awaits durable upsert on the no-new-secret save path and rejects before notifying', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await flushConnectionsNotifications();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(
+      mod.saveConnectionWithOptionalSecret({
+        ...mod.getConnection(conn.id)!,
+        label: 'Provider renamed',
+      }),
+    ).rejects.toThrow('Failed to persist connection settings');
+    expect(mod.getConnection(conn.id)?.label).toBe('Provider');
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+
+    const renamed = await mod.saveConnectionWithOptionalSecret({
+      ...mod.getConnection(conn.id)!,
+      label: 'Provider renamed',
+    });
+    expect(renamed.label).toBe('Provider renamed');
+    await flushConnectionsNotifications();
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it('deletes a newly set key when setConnectionSecret cannot persist secretRef', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await flushConnectionsNotifications();
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(mod.setConnectionSecret(conn.id, 'sk-orphan-guard')).rejects.toThrow(
+      'Failed to persist connection settings',
+    );
+    expect(mod.getConnection(conn.id)?.secretRef).toBeNull();
+    expect(keychain.has(`connection:${conn.id}`)).toBe(false);
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+    expect(JSON.stringify(memory.__entries())).not.toContain('sk-orphan-guard');
+  });
+
+  it('serializes overlapping mutations so two failed writes restore the last durable row', async () => {
+    const mod = await loadModule();
+    fetchMock
+      .mockResolvedValueOnce({ ok: false })
+      .mockResolvedValueOnce({ ok: false });
+
+    const first = mod.saveConnectionWithOptionalSecret({
+      label: 'First failed connection',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://first.invalid/v1',
+    });
+    const second = mod.saveConnectionWithOptionalSecret({
+      label: 'Second failed connection',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://second.invalid/v1',
+    });
+
+    await expect(first).rejects.toThrow('Failed to persist connection settings');
+    await expect(second).rejects.toThrow('Failed to persist connection settings');
+    expect(mod.getConnections()).toEqual([]);
+    expect(memory.getItem('inkmarshal_connections_v1')).toBeNull();
+  });
+
+  it('never resolves a newly saved key for an endpoint snapshot captured before the update', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://old.provider.test/v1',
+    });
+    await mod.setConnectionSecret(conn.id, 'sk-old-endpoint');
+    const oldSnapshot = mod.getConnection(conn.id)!;
+
+    let resolvePatch!: (value: { ok: boolean; json(): Promise<object> }) => void;
+    fetchMock.mockImplementationOnce(() => new Promise(resolve => {
+      resolvePatch = resolve;
+    }));
+    const update = mod.saveConnectionWithOptionalSecret(
+      {
+        ...oldSnapshot,
+        baseUrl: 'https://new.provider.test/v1',
+      },
+      'sk-new-endpoint',
+    );
+    await vi.waitFor(() => expect(resolvePatch).toBeTypeOf('function'));
+    expect(keychain.get(`connection:${conn.id}`)).toBe('sk-new-endpoint');
+
+    let secretReadSettled = false;
+    const secretRead = mod.getConnectionSecretForSnapshot(oldSnapshot);
+    void secretRead.then(
+      () => { secretReadSettled = true; },
+      () => { secretReadSettled = true; },
+    );
+    await Promise.resolve();
+    expect(secretReadSettled).toBe(false);
+
+    resolvePatch({ ok: true, json: async () => ({}) });
+    await update;
+    await expect(secretRead).rejects.toThrow(
+      'Runtime connection changed before secret resolution',
+    );
+  });
+});
+
+describe('durable capability profile writes', () => {
+  it('batches role mutations in one durable write and rejects before notifying on SQLite failure', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Local Ollama',
+      kind: 'local',
+      transport: 'ollama-native',
+      baseUrl: 'http://127.0.0.1:11434',
+    });
+    await mod.saveCapabilityBindingDurable('rewrite', conn.id, 'keep-me');
+    await flushConnectionsNotifications();
+    const priorProfile = memory.getItem('inkmarshal_capability_profile_v1');
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(
+      mod.saveCapabilityBindingsDurable([
+        { role: 'draft', connectionId: conn.id, modelId: 'draft-model' },
+        { role: 'planning', connectionId: conn.id, modelId: 'planning-model' },
+      ]),
+    ).rejects.toThrow('Failed to persist capability profile');
+
+    expect(mod.getBindingForRole('draft')).toBeNull();
+    expect(mod.getBindingForRole('planning')).toBeNull();
+    expect(mod.getBindingForRole('rewrite')).toEqual({
+      connectionId: conn.id,
+      modelId: 'keep-me',
+    });
+    expect(memory.getItem('inkmarshal_capability_profile_v1')).toBe(priorProfile);
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+
+    const profile = await mod.saveCapabilityBindingsDurable([
+      { role: 'draft', connectionId: conn.id, modelId: 'draft-model' },
+      { role: 'planning', connectionId: conn.id, modelId: 'planning-model' },
+    ]);
+    expect(profile.draft).toEqual({ connectionId: conn.id, modelId: 'draft-model' });
+    expect(profile.planning).toEqual({ connectionId: conn.id, modelId: 'planning-model' });
+    expect(profile.rewrite).toEqual({ connectionId: conn.id, modelId: 'keep-me' });
+    await flushConnectionsNotifications();
+    expect(listener).toHaveBeenCalled();
+  });
+
+  it('rolls back the profile mirror after a failed durable clear and skips success notifications', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    await mod.saveCapabilityBindingDurable('draft', conn.id, 'draft-model');
+    await flushConnectionsNotifications();
+    const priorProfile = memory.getItem('inkmarshal_capability_profile_v1');
+    const listener = vi.fn();
+    mod.subscribeConnectionsStore(listener);
+
+    fetchMock.mockResolvedValueOnce({ ok: false });
+    await expect(mod.clearCapabilityBindingDurable('draft')).rejects.toThrow(
+      'Failed to persist capability profile',
+    );
+    expect(mod.getBindingForRole('draft')).toEqual({
+      connectionId: conn.id,
+      modelId: 'draft-model',
+    });
+    expect(memory.getItem('inkmarshal_capability_profile_v1')).toBe(priorProfile);
+    await flushConnectionsNotifications();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('serializes overlapping profile writes so chained failures cannot restore an uncommitted attempt', async () => {
+    const mod = await loadModule();
+    const conn = mod.upsertConnection({
+      label: 'Provider',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://api.provider.test/v1',
+    });
+    fetchMock
+      .mockResolvedValueOnce({ ok: false })
+      .mockResolvedValueOnce({ ok: false });
+
+    const first = mod.saveCapabilityBindingDurable('draft', conn.id, 'draft-model');
+    const second = mod.saveCapabilityBindingDurable('planning', conn.id, 'planning-model');
+
+    await expect(first).rejects.toThrow('Failed to persist capability profile');
+    await expect(second).rejects.toThrow('Failed to persist capability profile');
+    expect(mod.getCapabilityProfile()).toEqual({
+      draft: null,
+      rewrite: null,
+      planning: null,
+      recall: null,
+    });
+    expect(memory.getItem('inkmarshal_capability_profile_v1')).toBeNull();
+  });
+
+  it('compares compensation state inside the profile queue after newer queued binds', async () => {
+    const mod = await loadModule();
+    const launched = mod.upsertConnection({
+      label: 'Launched engine',
+      kind: 'local',
+      transport: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:5001/v1',
+    });
+    const userChoice = mod.upsertConnection({
+      label: 'Newer user choice',
+      kind: 'provider',
+      transport: 'openai-compatible',
+      baseUrl: 'https://provider.test/v1',
+    });
+
+    let resolveLaunchWrite!: (value: { ok: boolean; json(): Promise<object> }) => void;
+    fetchMock.mockImplementationOnce(() => new Promise(resolve => {
+      resolveLaunchWrite = resolve;
+    }));
+    const launchBind = mod.saveCapabilityBindingDurable(
+      'draft',
+      launched.id,
+      'launch-model',
+    );
+    const newerBind = mod.saveCapabilityBindingDurable(
+      'draft',
+      userChoice.id,
+      'user-model',
+    );
+    const compensation = mod.runCapabilityProfileExclusive(async context => {
+      const current = context.read();
+      if (
+        current.draft?.connectionId === launched.id
+        && current.draft.modelId === 'launch-model'
+      ) {
+        await context.save([{ role: 'draft', binding: null }]);
+      }
+    });
+
+    await vi.waitFor(() => expect(resolveLaunchWrite).toBeTypeOf('function'));
+    resolveLaunchWrite({ ok: true, json: async () => ({}) });
+    await Promise.all([launchBind, newerBind, compensation]);
+    expect(mod.getBindingForRole('draft')).toEqual({
+      connectionId: userChoice.id,
+      modelId: 'user-model',
+    });
   });
 });
 

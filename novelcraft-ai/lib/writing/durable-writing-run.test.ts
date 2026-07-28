@@ -45,17 +45,17 @@ describe('DurableWritingRunController read ownership', () => {
   it('rejects a read captured before a newer run starts', () => {
     const controller = new DurableWritingRunController('novel-1');
     controller.acceptJob(job());
-    const stale = controller.captureRead();
+    const stale = controller.captureNovelRead();
 
     controller.invalidateForNewRun();
 
     expect(controller.canCommit(stale)).toBe(false);
-    expect(controller.canCommit(controller.captureRead())).toBe(true);
+    expect(controller.canCommit(controller.captureNovelRead())).toBe(true);
   });
 
   it('rejects reads from the previously opened novel', () => {
     const controller = new DurableWritingRunController('novel-1');
-    const stale = controller.captureRead();
+    const stale = controller.captureChapterRead();
 
     controller.resetScope('novel-2');
 

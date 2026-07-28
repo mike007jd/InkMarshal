@@ -411,6 +411,7 @@ export const en = {
   capabilityAutoBinding: 'Binding…',
   capabilityAutoBindNone: 'No reachable connection has a recommended model. Install a local model or connect a provider.',
   capabilityAutoBindFailed: '{failed} model(s) couldn\'t start — check available RAM, the local engine, or the model format.',
+  capabilitySaveFailed: 'Couldn\'t save the model assignment. Your previous assignment is still active.',
   capabilityNoInstalledModels: 'No installed models yet. Download a local model first.',
   capabilityRoleNotOptimized: 'This model isn\'t tuned for this role, but it will still run.',
   capabilityNoConnections: 'No connections configured. Add a local runtime or provider first.',

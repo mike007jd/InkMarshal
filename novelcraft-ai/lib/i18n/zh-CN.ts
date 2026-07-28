@@ -411,6 +411,7 @@ export const zhCN = {
   capabilityAutoBinding: '绑定中…',
   capabilityAutoBindNone: '没有可达连接拥有推荐模型。请安装本地模型或连接服务商。',
   capabilityAutoBindFailed: '有 {failed} 个模型未能启动——请检查可用内存、本地引擎或模型格式。',
+  capabilitySaveFailed: '无法保存模型分配，之前的分配仍然有效。',
   capabilityNoInstalledModels: '尚未安装任何模型，请先下载一个本地模型。',
   capabilityRoleNotOptimized: '这个模型并非为该角色优化，但仍可运行。',
   capabilityNoConnections: '尚未配置任何连接。请先添加本地运行时或服务商。',

@@ -12,10 +12,24 @@ describe('useNovel active-scope guards', () => {
 
     expect(storage).toContain('const activeNovelIdRef = useRef(novelId)');
     expect(storage).toContain('const refreshSeqRef = useRef(0)');
-    expect(storage).toContain('const updateSeqRef = useRef(0)');
+    expect(storage).toContain('const updateSeqByNovelRef = useRef(new Map<string, number>())');
     expect(storage).toContain('activeNovelIdRef.current === requestNovelId');
     expect(storage).toContain('refreshSeqRef.current === seq');
-    expect(storage).toContain('updateSeqRef.current === seq');
+    expect(storage).toContain('isLatestForNovel()');
+  });
+
+  it('fans out successful novel updates to same-document list subscribers', () => {
+    const storage = source('lib/use-storage.ts');
+
+    expect(storage).toContain("export const NOVEL_UPDATED_EVENT = 'inkmarshal:novel-updated'");
+    expect(storage).toContain('notifyNovelUpdated(updated)');
+    expect(storage).toContain('applyNovelUpdatedToList');
+    expect(storage).toContain('window.addEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated)');
+    expect(storage).toContain('const refreshSeqRef = useRef(0)');
+    expect(storage).toContain('const pendingUpdatesRef = useRef(');
+    expect(storage).toContain('refreshSeqRef.current !== seq');
+    expect(storage).toContain('pendingUpdatesRef.current.set(novel.id');
+    expect(storage).toContain('right.updatedAt - left.updatedAt');
   });
 
   it('keeps project loading failures distinct from a genuinely empty desk', () => {

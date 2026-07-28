@@ -126,6 +126,16 @@ function nodeRuntimeTarget() {
   return archByPlatform[`${process.platform}:${process.arch}`] ?? null;
 }
 
+/**
+ * Durable Node runtime download/extract cache. Must stay outside `.next`:
+ * Next and `clean:desktop-build` treat `.next` as a disposable build tree, so
+ * caching archives there races with directory disappearance (ENOENT on write)
+ * and cannot reuse verified downloads across clean packaging runs.
+ */
+export function nodeRuntimeCacheDir(projectRoot = root) {
+  return path.join(projectRoot, 'node_modules', '.cache', 'inkmarshal-tauri-node');
+}
+
 async function bundleNodeRuntime() {
   if (process.env.INKMARSHAL_SKIP_NODE_BUNDLE === '1') {
     return;
@@ -143,7 +153,7 @@ async function bundleNodeRuntime() {
   const distBaseUrl = `https://nodejs.org/dist/v${version}`;
   const archiveUrl = `${distBaseUrl}/${archiveFile}`;
   const shasumsUrl = `${distBaseUrl}/SHASUMS256.txt`;
-  const cacheDir = path.join(root, '.next', 'tauri-node');
+  const cacheDir = nodeRuntimeCacheDir(root);
   const archivePath = path.join(cacheDir, archiveFile);
   const extractDir = path.join(cacheDir, distName);
   const nodeResourceDir = path.join(root, 'src-tauri', 'resources', 'node');
@@ -177,6 +187,9 @@ async function bundleNodeRuntime() {
     if (!response.ok) {
       throw new Error(`Cannot download Node runtime ${archiveUrl}: ${response.status}`);
     }
+    // Re-ensure after the async download gap: parents under a durable cache
+    // should remain, but never assume a prior mkdir survived unrelated cleanup.
+    mkdirSync(cacheDir, { recursive: true });
     writeFileSync(archivePath, Buffer.from(await response.arrayBuffer()));
     const downloadedSha = sha256File(archivePath);
     if (downloadedSha !== expectedSha256) {
@@ -244,80 +257,86 @@ function topLevelPackageTargets(nodeModulesDir) {
   return targets;
 }
 
-await bundleNodeRuntime();
-run('pnpm', ['build']);
+async function main() {
+  await bundleNodeRuntime();
+  run('pnpm', ['build']);
 
-const standaloneDir = path.join(root, '.next', 'standalone');
-if (!existsSync(standaloneDir)) {
-  throw new Error('Next standalone output was not generated.');
-}
+  const standaloneDir = path.join(root, '.next', 'standalone');
+  if (!existsSync(standaloneDir)) {
+    throw new Error('Next standalone output was not generated.');
+  }
 
-const standaloneServerDir = path.join(standaloneDir, path.basename(root));
+  const standaloneServerDir = path.join(standaloneDir, path.basename(root));
 
-const staticSource = path.join(root, '.next', 'static');
-const staticTarget = path.join(standaloneDir, '.next', 'static');
-rmSync(staticTarget, { recursive: true, force: true });
-cpSync(staticSource, staticTarget, { recursive: true });
-const serverStaticTarget = path.join(standaloneServerDir, '.next', 'static');
-rmSync(serverStaticTarget, { recursive: true, force: true });
-cpSync(staticSource, serverStaticTarget, { recursive: true });
+  const staticSource = path.join(root, '.next', 'static');
+  const staticTarget = path.join(standaloneDir, '.next', 'static');
+  rmSync(staticTarget, { recursive: true, force: true });
+  cpSync(staticSource, staticTarget, { recursive: true });
+  const serverStaticTarget = path.join(standaloneServerDir, '.next', 'static');
+  rmSync(serverStaticTarget, { recursive: true, force: true });
+  cpSync(staticSource, serverStaticTarget, { recursive: true });
 
-const publicSource = path.join(root, 'public');
-const publicTarget = path.join(standaloneDir, 'public');
-if (existsSync(publicSource)) {
-  rmSync(publicTarget, { recursive: true, force: true });
-  cpSync(publicSource, publicTarget, { recursive: true });
-  const serverPublicTarget = path.join(standaloneServerDir, 'public');
-  rmSync(serverPublicTarget, { recursive: true, force: true });
-  cpSync(publicSource, serverPublicTarget, { recursive: true });
-}
+  const publicSource = path.join(root, 'public');
+  const publicTarget = path.join(standaloneDir, 'public');
+  if (existsSync(publicSource)) {
+    rmSync(publicTarget, { recursive: true, force: true });
+    cpSync(publicSource, publicTarget, { recursive: true });
+    const serverPublicTarget = path.join(standaloneServerDir, 'public');
+    rmSync(serverPublicTarget, { recursive: true, force: true });
+    cpSync(publicSource, serverPublicTarget, { recursive: true });
+  }
 
-const tauriServerDir = path.join(root, 'src-tauri', 'resources', 'next-server');
-mkdirSync(tauriServerDir, { recursive: true });
-for (const entry of readdirSync(tauriServerDir)) {
-  if (entry === '.gitignore' || entry === '.gitkeep') continue;
-  rmSync(path.join(tauriServerDir, entry), { recursive: true, force: true });
-}
-copyDereferenced(standaloneDir, tauriServerDir, { projectRoot: root });
+  const tauriServerDir = path.join(root, 'src-tauri', 'resources', 'next-server');
+  mkdirSync(tauriServerDir, { recursive: true });
+  for (const entry of readdirSync(tauriServerDir)) {
+    if (entry === '.gitignore' || entry === '.gitkeep') continue;
+    rmSync(path.join(tauriServerDir, entry), { recursive: true, force: true });
+  }
+  copyDereferenced(standaloneDir, tauriServerDir, { projectRoot: root });
 
-const serverNodeModules = path.join(tauriServerDir, 'novelcraft-ai', 'node_modules');
-const hydratedServerPackages = new Set();
-for (const target of topLevelPackageTargets(serverNodeModules)) {
-  const identity = readPackageIdentity(target);
-  const key = `${identity.name}@${identity.version}`;
-  if (hydratedServerPackages.has(key)) continue;
-  const source = rehydratePackage({
-    projectRoot: root,
-    packageName: identity.name,
-    targetPath: target,
-  });
-  hydratedServerPackages.add(key);
-  rehydrateDependencyClosure({
-    projectRoot: root,
-    parentSource: source,
-    dependencyNames: Object.keys(identity.manifest.dependencies ?? {}),
-    targetNodeModules: serverNodeModules,
-    seen: hydratedServerPackages,
-  });
-}
-
-const nextNodeModules = path.join(tauriServerDir, 'novelcraft-ai', '.next', 'node_modules');
-// Turbopack relocates serverExternal packages to hashed shadow directories.
-// Rehydrate each shadow from its exact traced version, then co-locate the native
-// runtime dependency closure that Node resolves beside the shadow package.
-for (const target of topLevelPackageTargets(nextNodeModules)) {
-  const identity = readPackageIdentity(target);
-  const source = rehydratePackage({
-    projectRoot: root,
-    packageName: identity.name,
-    targetPath: target,
-  });
-  if (identity.name === 'better-sqlite3') {
+  const serverNodeModules = path.join(tauriServerDir, 'novelcraft-ai', 'node_modules');
+  const hydratedServerPackages = new Set();
+  for (const target of topLevelPackageTargets(serverNodeModules)) {
+    const identity = readPackageIdentity(target);
+    const key = `${identity.name}@${identity.version}`;
+    if (hydratedServerPackages.has(key)) continue;
+    const source = rehydratePackage({
+      projectRoot: root,
+      packageName: identity.name,
+      targetPath: target,
+    });
+    hydratedServerPackages.add(key);
     rehydrateDependencyClosure({
       projectRoot: root,
       parentSource: source,
-      dependencyNames: ['bindings'],
-      targetNodeModules: nextNodeModules,
+      dependencyNames: Object.keys(identity.manifest.dependencies ?? {}),
+      targetNodeModules: serverNodeModules,
+      seen: hydratedServerPackages,
     });
   }
+
+  const nextNodeModules = path.join(tauriServerDir, 'novelcraft-ai', '.next', 'node_modules');
+  // Turbopack relocates serverExternal packages to hashed shadow directories.
+  // Rehydrate each shadow from its exact traced version, then co-locate the native
+  // runtime dependency closure that Node resolves beside the shadow package.
+  for (const target of topLevelPackageTargets(nextNodeModules)) {
+    const identity = readPackageIdentity(target);
+    const source = rehydratePackage({
+      projectRoot: root,
+      packageName: identity.name,
+      targetPath: target,
+    });
+    if (identity.name === 'better-sqlite3') {
+      rehydrateDependencyClosure({
+        projectRoot: root,
+        parentSource: source,
+        dependencyNames: ['bindings'],
+        targetNodeModules: nextNodeModules,
+      });
+    }
+  }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  await main();
 }

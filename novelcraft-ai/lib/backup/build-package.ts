@@ -2,13 +2,16 @@
 //
 // Fixed layout (see PACKAGE_PATHS):
 //   manifest.json                (top level — integrity + provenance)
-//   novel.json                   (secret-stripped)
+//   novel.json                   (secret-stripped + volumeSummaries)
 //   chapters/NNNN.json           (one file per chapter, zero-padded)
 //   knowledge/entries.json
 //   knowledge/relations.json
 //   outline.json
 //   unification.json
 //   prompt-templates.json
+//   history/conversations.json   (1.1+)
+//   history/messages.json        (1.1+)
+//   history/chapter-chat.json    (1.1+)
 //   attachments/<original name>  (binary, optional)
 //
 // Every file except the manifest is hashed (SHA-256, Web Crypto subtle.digest)
@@ -56,6 +59,9 @@ function countsOf(bundle: BackupBundle): BackupCounts {
     outline: bundle.outline.length,
     promptTemplates: bundle.promptTemplates.length,
     attachments: bundle.attachments.length,
+    conversations: bundle.conversations.length,
+    messages: bundle.messages.length,
+    chapterChat: bundle.chapterChat.length,
   };
 }
 
@@ -78,6 +84,9 @@ function buildFileBytes(bundle: BackupBundle): Map<string, Uint8Array> {
   files.set(PACKAGE_PATHS.outline, jsonBytes(bundle.outline));
   files.set(PACKAGE_PATHS.unification, jsonBytes(bundle.unificationReport));
   files.set(PACKAGE_PATHS.promptTemplates, jsonBytes(bundle.promptTemplates));
+  files.set(PACKAGE_PATHS.historyConversations, jsonBytes(bundle.conversations));
+  files.set(PACKAGE_PATHS.historyMessages, jsonBytes(bundle.messages));
+  files.set(PACKAGE_PATHS.historyChapterChat, jsonBytes(bundle.chapterChat));
 
   for (const attachment of bundle.attachments) {
     // Decode base64 → bytes. The attachment name is the leaf; it is placed under

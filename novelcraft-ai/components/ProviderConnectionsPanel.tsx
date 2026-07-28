@@ -29,8 +29,10 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
+  getConnection,
   getConnections,
   getConnectionSecret,
+  getConnectionSecretForSnapshot,
   removeConnection,
   saveConnectionWithOptionalSecret,
   subscribeConnectionsStore,
@@ -222,8 +224,19 @@ export function ProviderConnectionsPanel() {
       // secret when editing an existing connection without re-entering it.
       let secret: string | null = draft.apiKey.trim() || null;
       if (!secret && draft.id && draft.hadKey) {
+        const stored = getConnection(draft.id);
+        const endpointUnchanged = Boolean(
+          stored
+          && stored.kind === draft.kind
+          && stored.transport === draft.transport
+          && stored.baseUrl === draft.baseUrl.trim(),
+        );
+        if (!stored || !endpointUnchanged) {
+          setTestResult({ ok: false, message: t.modelManagerKeyReadFailed });
+          return;
+        }
         try {
-          secret = await getConnectionSecret(draft.id);
+          secret = await getConnectionSecretForSnapshot(stored);
         } catch {
           setTestResult({ ok: false, message: t.modelManagerKeyReadFailed });
           return;

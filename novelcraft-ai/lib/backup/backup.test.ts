@@ -37,7 +37,25 @@ async function mods() {
     verify: await import('@/lib/backup/verify'),
     restore: await import('@/lib/backup/restore'),
     knowledge: await import('@/lib/knowledge/index-sync'),
+    connection: await import('@/lib/db/connection'),
   };
+}
+
+async function replacePackagedJson(
+  bytes: Uint8Array,
+  packagePath: string,
+  value: unknown,
+): Promise<Uint8Array> {
+  const entries = unzipSync(bytes);
+  entries[packagePath] = new TextEncoder().encode(JSON.stringify(value));
+  const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+    sha256: Record<string, string>;
+  };
+  const { sha256Hex } = await import('@/lib/backup/build-package');
+  manifest.sha256[packagePath] = await sha256Hex(entries[packagePath]);
+  entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+  const { zipSync } = await import('fflate');
+  return zipSync(entries, { level: 6 });
 }
 
 /**
@@ -143,6 +161,60 @@ async function buildRichNovel(): Promise<{ novelId: string; entryIds: string[] }
     'Unification done.',
   );
 
+  // Volume summaries (book-owned canonical history on novels.volume_summaries).
+  await db.appendVolumeSummary(novelId, {
+    start: 1,
+    end: 2,
+    summary: 'Opening arc wraps chapters 1-2.',
+  });
+
+  // Conversations + nested parent-message fork + a null-conversation message.
+  const rootConv = await db.createConversation({
+    id: crypto.randomUUID(),
+    novelId,
+    userId: LOCAL_USER_ID,
+    topic: 'plot',
+    title: 'Root thread',
+    parentMessageId: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const rootUserMsg = await db.addMessage(novelId, 'user', 'What happens next?', rootConv.id);
+  const rootAssistantMsg = await db.addMessage(
+    novelId,
+    'assistant',
+    'The hero leaves the city.',
+    rootConv.id,
+  );
+  const forkConv = await db.createConversation({
+    id: crypto.randomUUID(),
+    novelId,
+    userId: LOCAL_USER_ID,
+    topic: 'characters',
+    title: 'Fork about the hero',
+    parentMessageId: rootAssistantMsg.id,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.addMessage(novelId, 'user', 'Tell me more about the hero.', forkConv.id);
+  // Novel-scoped message with null conversation_id (still book-owned history).
+  await db.addMessage(novelId, 'system', 'Null-conversation system note.', null);
+  // Keep a stable handle so restore tests can assert the fork remap.
+  void rootUserMsg;
+
+  // Chapter chat history (status + changes preserved).
+  await db.addChatMessage(novelId, 1, {
+    role: 'user',
+    content: 'Tighten the opening line.',
+    status: 'pending',
+  });
+  await db.addChatMessage(novelId, 1, {
+    role: 'assistant',
+    content: 'Opening line revised.',
+    changes: JSON.stringify([{ from: 'Once', to: 'Long ago' }]),
+    status: 'applied',
+  });
+
   return { novelId, entryIds: [e1Id, e2Id] };
 }
 
@@ -166,13 +238,30 @@ describe('export → package layout', () => {
     expect(names).toContain('outline.json');
     expect(names).toContain('unification.json');
     expect(names).toContain('prompt-templates.json');
+    expect(names).toContain('history/conversations.json');
+    expect(names).toContain('history/messages.json');
+    expect(names).toContain('history/chapter-chat.json');
 
+    expect(manifest.formatVersion).toBe('1.1');
     expect(manifest.counts.chapters).toBe(2);
     expect(manifest.counts.outline).toBe(2);
     expect(manifest.counts.knowledgeRelations).toBe(1);
     // Entries include the 2 explicit ones + 2 outline rows (outline entries).
     expect(manifest.counts.knowledgeEntries).toBe(4);
+    expect(manifest.counts.conversations).toBeGreaterThanOrEqual(2);
+    expect(manifest.counts.messages).toBeGreaterThanOrEqual(4);
+    expect(manifest.counts.chapterChat).toBe(2);
+    expect(manifest.sha256['history/conversations.json']).toBeTruthy();
+    expect(manifest.sha256['history/messages.json']).toBeTruthy();
+    expect(manifest.sha256['history/chapter-chat.json']).toBeTruthy();
     expect(manifest.secretsStripped).toBe(true);
+
+    const novelJson = JSON.parse(strFromU8(entries['novel.json'])) as {
+      volumeSummaries: { start: number; end: number; summary: string }[];
+    };
+    expect(novelJson.volumeSummaries).toEqual([
+      { start: 1, end: 2, summary: 'Opening arc wraps chapters 1-2.' },
+    ]);
   });
 });
 
@@ -300,6 +389,190 @@ describe('verify — integrity', () => {
     expect(report.formatCompatible).toBe(false);
     expect(report.ok).toBe(false);
   });
+
+  it('rejects missing or partially malformed volume summaries in format 1.1', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    bundle.novel.volumeSummaries = [{ start: 1, end: 2, summary: 'Keep this.' }];
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const cleanNovel = JSON.parse(strFromU8(unzipSync(bytes)['novel.json'])) as Record<string, unknown>;
+
+    for (const novelJson of [
+      Object.fromEntries(Object.entries(cleanNovel).filter(([key]) => key !== 'volumeSummaries')),
+      {
+        ...cleanNovel,
+        volumeSummaries: [
+          { start: 1, end: 2, summary: 'Valid' },
+          { start: 3, end: 4 },
+        ],
+      },
+    ]) {
+      const report = await verify.verifyBackupPackage(
+        await replacePackagedJson(bytes, 'novel.json', novelJson),
+      );
+      expect(report.ok).toBe(false);
+      expect(report.bundle).toBeNull();
+      expect(report.errors).toContainEqual(expect.objectContaining({
+        code: 'corrupt_section',
+        ref: 'novel.json',
+      }));
+    }
+  });
+
+  it('returns controlled corrupt_section reports for malformed fixed array sections', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const { bytes } = await build.buildBackupPackage(bundle);
+
+    for (const packagePath of [
+      'knowledge/entries.json',
+      'knowledge/relations.json',
+      'outline.json',
+      'prompt-templates.json',
+    ]) {
+      const malformed = await replacePackagedJson(bytes, packagePath, {});
+      await expect(verify.verifyBackupPackage(malformed)).resolves.toEqual(
+        expect.objectContaining({
+          ok: false,
+          bundle: null,
+          errors: expect.arrayContaining([
+            expect.objectContaining({ code: 'corrupt_section', ref: packagePath }),
+          ]),
+        }),
+      );
+    }
+  });
+
+  it('rejects duplicate restore identities before SQLite remapping', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const { bytes } = await build.buildBackupPackage(bundle);
+
+    for (const packagePath of [
+      'knowledge/entries.json',
+      'knowledge/relations.json',
+      'history/conversations.json',
+      'history/messages.json',
+      'history/chapter-chat.json',
+    ]) {
+      const entries = unzipSync(bytes);
+      const rows = JSON.parse(strFromU8(entries[packagePath])) as unknown[];
+      expect(rows.length, packagePath).toBeGreaterThan(0);
+      const duplicated = await replacePackagedJson(bytes, packagePath, [
+        ...rows,
+        rows[0],
+      ]);
+      const report = await verify.verifyBackupPackage(duplicated);
+      expect(report.ok, packagePath).toBe(false);
+      expect(report.bundle, packagePath).toBeNull();
+      expect(report.errors, packagePath).toContainEqual(expect.objectContaining({
+        code: 'duplicate_identity',
+      }));
+    }
+
+    const entries = unzipSync(bytes);
+    const chapterPath = Object.keys(entries).find(
+      path => path.startsWith('chapters/') && path.endsWith('.json'),
+    );
+    expect(chapterPath).toBeTruthy();
+    const duplicatePath = 'chapters/9999.json';
+    entries[duplicatePath] = entries[chapterPath!];
+    const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+      counts: { chapters: number };
+      sha256: Record<string, string>;
+    };
+    const { sha256Hex } = await import('@/lib/backup/build-package');
+    manifest.counts.chapters += 1;
+    manifest.sha256[duplicatePath] = await sha256Hex(entries[duplicatePath]);
+    entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+    const { zipSync } = await import('fflate');
+    const report = await verify.verifyBackupPackage(zipSync(entries, { level: 6 }));
+    expect(report.ok).toBe(false);
+    expect(report.bundle).toBeNull();
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'duplicate_identity',
+      detail: expect.stringContaining('chapter number'),
+    }));
+  });
+
+  it('rejects outline.json rows that drift from their canonical knowledge entries', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    bundle.outline[0] = {
+      ...bundle.outline[0],
+      chapterNumber: bundle.outline[0].chapterNumber + 10,
+    };
+
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const report = await verify.verifyBackupPackage(bytes);
+
+    expect(report.ok).toBe(false);
+    expect(report.bundle).toBeNull();
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'conflicting_outline_projection',
+      ref: bundle.outline[0].entryId,
+    }));
+  });
+
+  it('rejects one old chapter id mapped to different outline chapter numbers', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const sharedChapterId = bundle.outline[0].chapterId;
+    expect(sharedChapterId).not.toBe('');
+    bundle.outline[1] = {
+      ...bundle.outline[1],
+      chapterId: sharedChapterId,
+    };
+    const secondEntry = bundle.knowledgeEntries.find(
+      entry => entry.id === bundle.outline[1].entryId,
+    );
+    expect(secondEntry).toBeDefined();
+    secondEntry!.data = JSON.stringify({
+      ...JSON.parse(secondEntry!.data) as Record<string, unknown>,
+      chapterId: sharedChapterId,
+    });
+
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const report = await verify.verifyBackupPackage(bytes);
+
+    expect(report.ok).toBe(false);
+    expect(report.bundle).toBeNull();
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'conflicting_outline_projection',
+      ref: sharedChapterId,
+    }));
+  });
+
+  it('rejects outline parents that are missing or are not outline entries', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId, entryIds } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const child = bundle.knowledgeEntries.find(
+      entry => entry.id === bundle.outline[1].entryId,
+    );
+    expect(child).toBeDefined();
+
+    for (const parentId of ['missing-outline-parent', entryIds[0]]) {
+      child!.data = JSON.stringify({
+        ...JSON.parse(child!.data) as Record<string, unknown>,
+        parentId,
+      });
+      const { bytes } = await build.buildBackupPackage(bundle);
+      const report = await verify.verifyBackupPackage(bytes);
+
+      expect(report.ok, parentId).toBe(false);
+      expect(report.bundle, parentId).toBeNull();
+      expect(report.errors, parentId).toContainEqual(expect.objectContaining({
+        code: 'conflicting_outline_projection',
+        ref: child!.id,
+      }));
+    }
+  });
 });
 
 describe('restore — create a copy', () => {
@@ -370,6 +643,40 @@ describe('restore — create a copy', () => {
     expect((await db.getKnowledgeEntriesByNovel(novelId)).length).toBe(originalEntriesBefore.length);
   });
 
+  it('remaps outline parentId links into the restored entry id space', async () => {
+    const { db, extract, build, verify, restore } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const sourceParentId = bundle.outline[0].entryId;
+    const sourceChildId = bundle.outline[1].entryId;
+    const sourceParent = bundle.knowledgeEntries.find(entry => entry.id === sourceParentId);
+    const sourceChild = bundle.knowledgeEntries.find(entry => entry.id === sourceChildId);
+    expect(sourceParent).toBeDefined();
+    expect(sourceChild).toBeDefined();
+    sourceChild!.data = JSON.stringify({
+      ...JSON.parse(sourceChild!.data) as Record<string, unknown>,
+      parentId: sourceParentId,
+    });
+
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(true);
+    const result = await restore.restoreBundleAsCopy(report.bundle!);
+    const restoredEntries = await db.getKnowledgeEntriesByNovel(result.novelId);
+    const restoredParent = restoredEntries.find(
+      entry => entry.type === 'outline' && entry.title === sourceParent!.title,
+    );
+    const restoredChild = restoredEntries.find(
+      entry => entry.type === 'outline' && entry.title === sourceChild!.title,
+    );
+    expect(restoredParent).toBeDefined();
+    expect(restoredChild).toBeDefined();
+    const restoredChildData = JSON.parse(restoredChild!.data) as { parentId?: string };
+
+    expect(restoredParent!.id).not.toBe(sourceParentId);
+    expect(restoredChildData.parentId).toBe(restoredParent!.id);
+  });
+
   it('restores into a clean DB-like state: copy is independent of source deletion', async () => {
     const { db, extract, build, verify, restore } = await mods();
     const { novelId } = await buildRichNovel();
@@ -420,4 +727,319 @@ describe('restore — create a copy', () => {
       spy.mockRestore();
     }
   });
+
+  it('preserves volume summaries, nested conversation refs, null-conversation messages, and chapter chat with remapped ids', async () => {
+    const { db, extract, build, verify, restore, connection } = await mods();
+    const { novelId } = await buildRichNovel();
+
+    const sourceBundle = await extract.extractBackupBundle(novelId);
+    expect(sourceBundle.novel.volumeSummaries).toEqual([
+      { start: 1, end: 2, summary: 'Opening arc wraps chapters 1-2.' },
+    ]);
+    expect(sourceBundle.conversations.length).toBeGreaterThanOrEqual(2);
+    expect(sourceBundle.messages.some(m => m.conversationId == null)).toBe(true);
+    expect(sourceBundle.messages.some(m => m.conversationId != null)).toBe(true);
+    expect(sourceBundle.chapterChat).toHaveLength(2);
+
+    const fork = sourceBundle.conversations.find(c => c.parentMessageId != null);
+    expect(fork).toBeDefined();
+    expect(sourceBundle.messages.some(m => m.id === fork!.parentMessageId)).toBe(true);
+
+    const { bytes } = await build.buildBackupPackage(sourceBundle);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(true);
+    expect(report.errors).toHaveLength(0);
+
+    const result = await restore.restoreBundleAsCopy(report.bundle!);
+    expect(result.novelId).not.toBe(novelId);
+
+    const volumes = await db.getVolumeSummaries(result.novelId);
+    expect(volumes).toEqual([
+      { start: 1, end: 2, summary: 'Opening arc wraps chapters 1-2.' },
+    ]);
+
+    const gdb = connection.getDb();
+    const copyConvs = gdb
+      .prepare('SELECT * FROM conversations WHERE novel_id = ? ORDER BY created_at ASC, id ASC')
+      .all(result.novelId) as {
+        id: string;
+        parent_message_id: string | null;
+        topic: string;
+        title: string;
+        is_archived: number;
+      }[];
+    const copyMsgs = gdb
+      .prepare('SELECT * FROM messages WHERE novel_id = ? ORDER BY created_at ASC, id ASC')
+      .all(result.novelId) as {
+        id: string;
+        conversation_id: string | null;
+        role: string;
+        content: string;
+      }[];
+    const copyChat = gdb
+      .prepare('SELECT * FROM chapter_chat_history WHERE novel_id = ? ORDER BY created_at ASC, id ASC')
+      .all(result.novelId) as {
+        id: string;
+        chapter_number: number;
+        role: string;
+        content: string;
+        changes: string | null;
+        status: string;
+      }[];
+
+    expect(copyConvs.length).toBe(sourceBundle.conversations.length);
+    expect(copyMsgs.length).toBe(sourceBundle.messages.length);
+    expect(copyChat).toHaveLength(2);
+
+    // All conversation / message ids were reminted.
+    const sourceConvIds = new Set(sourceBundle.conversations.map(c => c.id));
+    const sourceMsgIds = new Set(sourceBundle.messages.map(m => m.id));
+    const sourceChatIds = new Set(sourceBundle.chapterChat.map(c => c.id));
+    for (const c of copyConvs) expect(sourceConvIds.has(c.id)).toBe(false);
+    for (const m of copyMsgs) expect(sourceMsgIds.has(m.id)).toBe(false);
+    for (const c of copyChat) expect(sourceChatIds.has(c.id)).toBe(false);
+
+    // Nested parent-message reference remapped completely into the copy.
+    const copyFork = copyConvs.find(c => c.parent_message_id != null);
+    expect(copyFork).toBeDefined();
+    expect(copyMsgs.some(m => m.id === copyFork!.parent_message_id)).toBe(true);
+    expect(sourceMsgIds.has(copyFork!.parent_message_id!)).toBe(false);
+
+    // Null-conversation message survived with null conversation_id.
+    expect(copyMsgs.some(m => m.conversation_id == null && m.content.includes('Null-conversation'))).toBe(true);
+
+    // Non-null conversation refs point only at copy conversation ids.
+    const copyConvIds = new Set(copyConvs.map(c => c.id));
+    for (const m of copyMsgs) {
+      if (m.conversation_id != null) expect(copyConvIds.has(m.conversation_id)).toBe(true);
+    }
+
+    // Chapter chat preserves content/status/changes with fresh ids.
+    const applied = copyChat.find(c => c.status === 'applied');
+    expect(applied).toBeDefined();
+    expect(applied!.chapter_number).toBe(1);
+    expect(applied!.changes).toContain('Long ago');
+    expect(copyChat.some(c => c.role === 'user' && c.content.includes('Tighten'))).toBe(true);
+  });
 });
+
+describe('format 1.0 backward compatibility', () => {
+  it('verifies and restores a v1.0 package without history files / volumeSummaries as empty history', async () => {
+    const { db, extract, build, verify, restore, connection } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    // Strip 1.1-only payload so the rebuilt bytes look like a legacy 1.0 package.
+    bundle.conversations = [];
+    bundle.messages = [];
+    bundle.chapterChat = [];
+    bundle.novel.volumeSummaries = [];
+    const { bytes } = await build.buildBackupPackage(bundle);
+
+    const entries = unzipSync(bytes);
+    delete entries['history/conversations.json'];
+    delete entries['history/messages.json'];
+    delete entries['history/chapter-chat.json'];
+    const novel = JSON.parse(strFromU8(entries['novel.json'])) as Record<string, unknown>;
+    delete novel.volumeSummaries;
+    entries['novel.json'] = new TextEncoder().encode(JSON.stringify(novel, null, 2));
+
+    const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+      formatVersion: string;
+      counts: Record<string, number>;
+      sha256: Record<string, string>;
+    };
+    manifest.formatVersion = '1.0';
+    delete manifest.counts.conversations;
+    delete manifest.counts.messages;
+    delete manifest.counts.chapterChat;
+    delete manifest.sha256['history/conversations.json'];
+    delete manifest.sha256['history/messages.json'];
+    delete manifest.sha256['history/chapter-chat.json'];
+    // Re-hash novel.json after volumeSummaries removal.
+    const { sha256Hex } = await import('@/lib/backup/build-package');
+    manifest.sha256['novel.json'] = await sha256Hex(entries['novel.json']);
+    entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
+    const { zipSync } = await import('fflate');
+    const v10Bytes = zipSync(entries, { level: 6 });
+
+    const report = await verify.verifyBackupPackage(v10Bytes);
+    expect(report.formatCompatible).toBe(true);
+    expect(report.ok).toBe(true);
+    expect(report.errors).toHaveLength(0);
+    expect(report.warnings.filter(w => w.code === 'count_mismatch')).toHaveLength(0);
+    expect(report.bundle!.conversations).toEqual([]);
+    expect(report.bundle!.messages).toEqual([]);
+    expect(report.bundle!.chapterChat).toEqual([]);
+    expect(report.bundle!.novel.volumeSummaries).toEqual([]);
+
+    const result = await restore.restoreBundleAsCopy(report.bundle!);
+    expect(await db.getVolumeSummaries(result.novelId)).toEqual([]);
+    const gdb = connection.getDb();
+    expect(
+      (gdb.prepare('SELECT COUNT(*) AS n FROM conversations WHERE novel_id = ?').get(result.novelId) as { n: number }).n,
+    ).toBe(0);
+    expect(
+      (gdb.prepare('SELECT COUNT(*) AS n FROM messages WHERE novel_id = ?').get(result.novelId) as { n: number }).n,
+    ).toBe(0);
+    expect(
+      (gdb.prepare('SELECT COUNT(*) AS n FROM chapter_chat_history WHERE novel_id = ?').get(result.novelId) as { n: number }).n,
+    ).toBe(0);
+    expect((await db.getNovel(result.novelId))?.title).toBe('Backup Source');
+  });
+});
+
+describe('verify — ZIP resource guard', () => {
+  it('rejects archives that exceed the entry-count hard limit', async () => {
+    const { verify } = await mods();
+    const files: Record<string, Uint8Array> = {};
+    const payload = new TextEncoder().encode('x');
+    for (let i = 0; i < 4097; i++) {
+      files[`e${String(i).padStart(5, '0')}.txt`] = payload;
+    }
+    const { zipSync } = await import('fflate');
+    const report = await verify.verifyBackupPackage(zipSync(files, { level: 0 }));
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({ code: 'zip_too_many_entries' }));
+    expect(report.bundle).toBeNull();
+  });
+
+  it('rejects an oversized deflate entry before attempting its invalid compressed stream', async () => {
+    const { verify } = await mods();
+    const bytes = craftStoredZip([{
+      name: 'huge.bin',
+      // Deliberately invalid DEFLATE. A post-decompression size check would
+      // first hit this bad stream and return not_a_zip; the metadata filter
+      // must refuse it as too large before inflate is attempted.
+      data: new Uint8Array([0xff]),
+      declaredUncompressedSize: 64 * 1024 * 1024 + 1,
+      method: 8,
+    }]);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'zip_entry_too_large',
+      ref: 'huge.bin',
+    }));
+  });
+
+  it('rejects archives whose total declared uncompressed size exceeds 256 MiB', async () => {
+    const { verify } = await mods();
+    const perEntry = 64 * 1024 * 1024;
+    const bytes = craftStoredZip([
+      { name: 'a.bin', data: new Uint8Array([1]), declaredUncompressedSize: perEntry },
+      { name: 'b.bin', data: new Uint8Array([2]), declaredUncompressedSize: perEntry },
+      { name: 'c.bin', data: new Uint8Array([3]), declaredUncompressedSize: perEntry },
+      { name: 'd.bin', data: new Uint8Array([4]), declaredUncompressedSize: perEntry },
+      { name: 'e.bin', data: new Uint8Array([5]), declaredUncompressedSize: 1 },
+    ]);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({ code: 'zip_total_too_large' }));
+  });
+
+  it('rejects duplicate entry names when constructible', async () => {
+    const { verify } = await mods();
+    const bytes = craftStoredZip([
+      { name: 'dup.txt', data: new TextEncoder().encode('one') },
+      { name: 'dup.txt', data: new TextEncoder().encode('two') },
+    ]);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'zip_duplicate_name',
+      ref: 'dup.txt',
+    }));
+  });
+
+  it('rejects unsafe archive entry names', async () => {
+    const { verify } = await mods();
+    const { zipSync } = await import('fflate');
+    const cases: Array<{ name: string; label: string }> = [
+      { name: '/abs.json', label: 'absolute' },
+      { name: 'foo\\bar.json', label: 'backslash' },
+      { name: 'evil\0.json', label: 'nul' },
+      { name: 'a/../b.json', label: 'dot-dot' },
+      { name: 'a/./b.json', label: 'dot' },
+    ];
+    for (const c of cases) {
+      const report = await verify.verifyBackupPackage(
+        zipSync({ [c.name]: new TextEncoder().encode('{}') }, { level: 0 }),
+      );
+      expect(report.ok, c.label).toBe(false);
+      expect(report.errors, c.label).toContainEqual(expect.objectContaining({
+        code: 'zip_unsafe_path',
+        ref: c.name,
+      }));
+    }
+  });
+});
+
+/** Minimal ZIP so central-directory sizes/methods can be controlled precisely. */
+function craftStoredZip(
+  files: Array<{
+    name: string;
+    data: Uint8Array;
+    declaredUncompressedSize?: number;
+    method?: 0 | 8;
+  }>,
+): Uint8Array {
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBytes = new TextEncoder().encode(file.name);
+    const data = file.data;
+    const declared = file.declaredUncompressedSize ?? data.length;
+    const method = file.method ?? 0;
+
+    const local = new Uint8Array(30 + nameBytes.length + data.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(8, method, true);
+    lv.setUint32(18, data.length, true); // compressed size
+    lv.setUint32(22, declared, true); // uncompressed size (may be lied)
+    lv.setUint16(26, nameBytes.length, true);
+    local.set(nameBytes, 30);
+    local.set(data, 30 + nameBytes.length);
+    localParts.push(local);
+
+    const central = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(central.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(10, method, true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, declared, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);
+    central.set(nameBytes, 46);
+    centralParts.push(central);
+
+    offset += local.length;
+  }
+
+  const centralOffset = offset;
+  let centralSize = 0;
+  for (const part of centralParts) centralSize += part.length;
+
+  const end = new Uint8Array(22);
+  const ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, files.length, true);
+  ev.setUint16(10, files.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, centralOffset, true);
+
+  const out = new Uint8Array(offset + centralSize + end.length);
+  let o = 0;
+  for (const part of localParts) {
+    out.set(part, o);
+    o += part.length;
+  }
+  for (const part of centralParts) {
+    out.set(part, o);
+    o += part.length;
+  }
+  out.set(end, o);
+  return out;
+}

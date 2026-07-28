@@ -1,14 +1,15 @@
 'use client';
 
 import {
-  clearCapabilityBinding,
   getBindingForRole,
   getCapabilityProfile,
   getConnection,
   getConnections,
   removeConnection,
-  saveCapabilityBinding,
-  upsertConnection,
+  runCapabilityProfileExclusive,
+  saveCapabilityBindingsDurable,
+  upsertConnectionWithSecretCleanup,
+  type CapabilityBindingMutation,
 } from '@/lib/model-supply/connections';
 import {
   isLocalEngineConnectionId,
@@ -17,13 +18,15 @@ import {
 } from '@/lib/model-supply/local-engine';
 import {
   CAPABILITY_ROLES,
+  type CapabilityBinding,
   type CapabilityRole,
   type RuntimeConnection,
 } from '@/lib/model-supply/types';
 import {
   getStoredSetting,
-  removeStoredSetting,
-  setStoredSetting,
+  removeStoredSettingDurable,
+  rollbackStoredSettingMirrorAfterFailedDurableAttempt,
+  setStoredSettingDurable,
 } from '@/lib/app-settings-client';
 import {
   engineEstimateFootprint,
@@ -44,6 +47,36 @@ import {
 // only touches the roles in its `plan.roles` list, never the others. This is
 // the key behavior change from the wave-3 single-engine "one-shot bind 4
 // roles" world: an explicit launch for `draft` MUST NOT unbind `rewrite`.
+
+const ENGINE_LAUNCH_PLAN_PERSISTENCE_FAILED = 'Failed to persist engine launch plan';
+const ENGINE_LAUNCH_STOP_COMPENSATION_FAILED =
+  'Engine launch failed and the spawned engine could not be stopped';
+const ENGINE_LAUNCH_ROW_COMPENSATION_FAILED =
+  'Engine launch failed and the stopped engine connection could not be removed';
+const ENGINE_LAUNCH_BINDING_COMPENSATION_FAILED =
+  'Engine launch failed and prior capability bindings could not be restored';
+const ENGINE_STOP_PLAN_COMPENSATION_FAILED =
+  'Failed to stop the engine and restore its relaunch plan';
+let engineLaunchPlanMutationTail: Promise<void> = Promise.resolve();
+let engineLifecycleMutationTail: Promise<void> = Promise.resolve();
+
+function enqueueEngineLaunchPlanMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = engineLaunchPlanMutationTail.then(mutation, mutation);
+  engineLaunchPlanMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+function enqueueEngineLifecycleMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = engineLifecycleMutationTail.then(mutation, mutation);
+  engineLifecycleMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
 
 /** Plan for starting (or reusing) one engine and binding the supplied roles. */
 export interface EngineStartPlan {
@@ -134,13 +167,164 @@ function parseEngineBudgetExceeded(err: unknown): EngineBudgetExceeded | null {
   }
 }
 
+function snapshotRoleBindingsFromProfile(
+  profile: ReturnType<typeof getCapabilityProfile>,
+  roles: readonly CapabilityRole[],
+): Map<CapabilityRole, CapabilityBinding | null> {
+  const out = new Map<CapabilityRole, CapabilityBinding | null>();
+  for (const role of roles) {
+    const binding = profile[role];
+    out.set(role, binding ? { ...binding, fallback: binding.fallback ? { ...binding.fallback } : undefined } : null);
+  }
+  return out;
+}
+
+function bindingReferencesConnection(
+  binding: CapabilityBinding | null | undefined,
+  connectionId: string,
+): boolean {
+  return (
+    binding?.connectionId === connectionId
+    || binding?.fallback?.connectionId === connectionId
+  );
+}
+
+function removeConnectionFromBinding(
+  role: CapabilityRole,
+  binding: CapabilityBinding | null | undefined,
+  connectionId: string,
+): CapabilityBindingMutation | null {
+  if (!binding) return null;
+  if (binding.connectionId === connectionId) {
+    if (
+      binding.fallback
+      && binding.fallback.connectionId !== connectionId
+    ) {
+      return {
+        role,
+        connectionId: binding.fallback.connectionId,
+        modelId: binding.fallback.modelId,
+      };
+    }
+    return { role, binding: null };
+  }
+  if (binding.fallback?.connectionId === connectionId) {
+    return {
+      role,
+      connectionId: binding.connectionId,
+      modelId: binding.modelId,
+    };
+  }
+  return null;
+}
+
+async function restoreRoleBindings(
+  previous: Map<CapabilityRole, CapabilityBinding | null>,
+  expectedLaunchBinding: { connectionId: string; modelId: string },
+): Promise<void> {
+  await runCapabilityProfileExclusive(async context => {
+    const mutations = roleBindingRestoreMutations(
+      context.read(),
+      previous,
+      expectedLaunchBinding,
+    );
+    if (mutations.length > 0) await context.save(mutations);
+  });
+}
+
+function roleBindingRestoreMutations(
+  current: ReturnType<typeof getCapabilityProfile>,
+  previous: Map<CapabilityRole, CapabilityBinding | null>,
+  expectedLaunchBinding: { connectionId: string; modelId: string },
+): CapabilityBindingMutation[] {
+  const mutations: CapabilityBindingMutation[] = [];
+  for (const [role, binding] of previous) {
+    const currentBinding = current[role];
+    if (
+      currentBinding?.connectionId !== expectedLaunchBinding.connectionId
+      || currentBinding.modelId !== expectedLaunchBinding.modelId
+      || currentBinding.fallback !== undefined
+    ) {
+      // A newer user action already owns this role. Compensation must not
+      // overwrite it with the pre-launch snapshot.
+      continue;
+    }
+    mutations.push(
+      binding === null
+        ? { role, binding: null }
+        : {
+            role,
+            connectionId: binding.connectionId,
+            modelId: binding.modelId,
+            fallback: binding.fallback,
+          },
+    );
+  }
+  return mutations;
+}
+
+async function compensateFailedNewEngine(
+  started: Awaited<ReturnType<typeof startAndRegisterLocalEngine>>,
+  previousBindings: Map<CapabilityRole, CapabilityBinding | null>,
+  boundModelId: string,
+  originalError: unknown,
+): Promise<never> {
+  return runCapabilityProfileExclusive(async context => {
+    let profile;
+    try {
+      const mutations = roleBindingRestoreMutations(
+        context.read(),
+        previousBindings,
+        {
+          connectionId: started.connection.id,
+          modelId: boundModelId,
+        },
+      );
+      profile = mutations.length > 0 ? await context.save(mutations) : context.read();
+    } catch {
+      // Keep the process and row visible when we cannot durably reconcile its
+      // bindings; destroying them would make recovery harder.
+      throw new Error(ENGINE_LAUNCH_BINDING_COMPENSATION_FAILED);
+    }
+
+    if (CAPABILITY_ROLES.some(
+      role => bindingReferencesConnection(profile[role], started.connection.id),
+    )) {
+      // A newer user action adopted this engine on any role (including roles
+      // outside the failed launch plan, and as either primary or fallback).
+      // Preserve its process and row.
+      throw originalError;
+    }
+
+    try {
+      await engineStop(started.engineId);
+    } catch {
+      // Preserve the durable connection row so the still-running process remains
+      // visible and stoppable instead of becoming an orphan.
+      throw new Error(ENGINE_LAUNCH_STOP_COMPENSATION_FAILED);
+    }
+
+    try {
+      await removeConnection(started.connection.id);
+    } catch {
+      throw new Error(ENGINE_LAUNCH_ROW_COMPENSATION_FAILED);
+    }
+    throw originalError;
+  });
+}
+
 /**
  * Start (or reuse) one engine for a model and bind the requested roles to it.
  * Crucially this does NOT clear bindings outside `plan.roles` — calling it for
  * a focused subset (e.g. just `['draft']`) leaves `rewrite`/`planning`/`recall`
  * pointing wherever they were.
+ *
+ * Success is reported only after the connection row, requested bindings, and
+ * launch plan are all durable. Failures after a newly spawned process was
+ * registered compensate by restoring prior requested-role bindings, stopping
+ * that exact engine, and removing its connection row.
  */
-export async function startEngineForRoles(
+async function startEngineForRolesNow(
   plan: EngineStartPlan,
 ): Promise<EngineStartResult> {
   const policy = plan.onConflict ?? 'cancel';
@@ -168,17 +352,38 @@ export async function startEngineForRoles(
 
   if (alreadyRunning) {
     // Reuse path: bind the requested roles to the existing connection row.
-    const connection = ensureLocalEngineConnection(alreadyRunning, plan.modelLabel);
-    const boundRoles = bindRolesToConnection(plan.roles, connection.id, plan.modelLabel);
-    persistEngineLaunchPlan(plan, alreadyRunning.engineId);
-    return {
-      connection,
-      modelId: plan.modelLabel,
-      engineId: alreadyRunning.engineId,
-      footprintBytes: alreadyRunning.footprintBytes ?? 0,
-      boundRoles,
-      reused: true,
-    };
+    let bindingResult: BoundRolesResult | null = null;
+    try {
+      const connection = await ensureLocalEngineConnection(alreadyRunning, plan.modelLabel);
+      bindingResult = await bindRolesToConnection(
+        plan.roles,
+        connection.id,
+        plan.modelLabel,
+      );
+      await persistEngineLaunchPlan(plan, alreadyRunning.engineId);
+      return {
+        connection,
+        modelId: plan.modelLabel,
+        engineId: alreadyRunning.engineId,
+        footprintBytes: alreadyRunning.footprintBytes ?? 0,
+        boundRoles: bindingResult.boundRoles,
+        reused: true,
+      };
+    } catch (err) {
+      // Reused engines stay running; only roll back requested-role bindings if
+      // a later durable step failed after they were mutated.
+      if (bindingResult) {
+        try {
+          await restoreRoleBindings(bindingResult.previousBindings, {
+            connectionId: localEngineConnectionId(alreadyRunning.engineId),
+            modelId: plan.modelLabel,
+          });
+        } catch {
+          throw new Error(ENGINE_LAUNCH_BINDING_COMPENSATION_FAILED);
+        }
+      }
+      throw err;
+    }
   }
 
   // 3. Budget admission — only run when there is no already-running instance
@@ -196,7 +401,7 @@ export async function startEngineForRoles(
       // The Rust side canonicalizes the path before matching; do not rely on
       // this layer's raw string comparison to decide whether a replacement exists.
       const stopped = await stopOthersForPath(plan.modelPath);
-      await pruneStaleLocalEngineRows();
+      await pruneStaleLocalEngineRowsNow();
       replaced = stopped > 0;
     }
     if (!replaced) {
@@ -254,16 +459,30 @@ export async function startEngineForRoles(
       plan.modelLabel,
       { engineLabel: plan.engineLabel },
     );
-    const boundRoles = bindRolesToConnection(plan.roles, started.connection.id, plan.modelLabel);
-    persistEngineLaunchPlan(plan, started.engineId);
-    return {
-      connection: started.connection,
-      modelId: started.modelId,
-      engineId: started.engineId,
-      footprintBytes: started.footprintBytes,
-      boundRoles,
-      reused: false,
-    };
+    let bindingResult: BoundRolesResult | null = null;
+    try {
+      bindingResult = await bindRolesToConnection(
+        plan.roles,
+        started.connection.id,
+        plan.modelLabel,
+      );
+      await persistEngineLaunchPlan(plan, started.engineId);
+      return {
+        connection: started.connection,
+        modelId: started.modelId,
+        engineId: started.engineId,
+        footprintBytes: started.footprintBytes,
+        boundRoles: bindingResult.boundRoles,
+        reused: false,
+      };
+    } catch (err) {
+      return compensateFailedNewEngine(
+        started,
+        bindingResult?.previousBindings ?? new Map(),
+        plan.modelLabel,
+        err,
+      );
+    }
   } catch (err) {
     const exceeded = parseEngineBudgetExceeded(err);
     if (!exceeded) throw err;
@@ -281,32 +500,49 @@ export async function startEngineForRoles(
   }
 }
 
+export function startEngineForRoles(
+  plan: EngineStartPlan,
+): Promise<EngineStartResult> {
+  return enqueueEngineLifecycleMutation(() => startEngineForRolesNow(plan));
+}
+
 /**
  * Stop one running engine and clear every capability binding that pointed at
- * it. Other engines (and the bindings they own) are untouched.
+ * it. Other engines (and the bindings they own) are untouched. Provider
+ * bindings are never deleted.
  */
-export async function stopEngineAndUnbind(engineId: string): Promise<void> {
+async function stopEngineAndUnbindNow(engineId: string): Promise<void> {
   const connectionId = localEngineConnectionId(engineId);
   // An explicit stop is a user decision — drop the launch plan so the next
   // app boot doesn't resurrect an engine the user shut down on purpose.
-  removeEngineLaunchPlanByEngineId(engineId);
-  try {
-    await engineStop(engineId);
-  } catch {
-    // engine_stop is idempotent on the Rust side; a stop-after-stop is fine.
-  }
-  // Clear bindings that pointed at this connection (independent of role).
-  const profile = getCapabilityProfile();
-  for (const role of CAPABILITY_ROLES) {
-    const binding = profile[role];
-    if (binding?.connectionId === connectionId) {
-      clearCapabilityBinding(role);
+  const removedPlans = await removeEngineLaunchPlanByEngineId(engineId);
+  await runCapabilityProfileExclusive(async context => {
+    try {
+      await engineStop(engineId);
+    } catch (error) {
+      try {
+        await restoreRemovedEngineLaunchPlans(removedPlans);
+      } catch {
+        throw new Error(ENGINE_STOP_PLAN_COMPENSATION_FAILED);
+      }
+      throw error;
     }
-  }
-  // Remove the now-stale connection row so health probes don't keep hammering
-  // a dead localhost port. removeConnection is async because it deletes the
-  // (non-existent) secret too — await so the UI re-render sees the gone row.
-  await removeConnection(connectionId);
+    // Clear bindings that pointed at this connection (independent of role).
+    const profile = context.read();
+    const mutations: CapabilityBindingMutation[] = [];
+    for (const role of CAPABILITY_ROLES) {
+      const mutation = removeConnectionFromBinding(role, profile[role], connectionId);
+      if (mutation) mutations.push(mutation);
+    }
+    if (mutations.length > 0) await context.save(mutations);
+    // Keep the profile lock until the stale row is gone so a concurrent bind
+    // cannot adopt a process after it has been stopped.
+    await removeConnection(connectionId);
+  });
+}
+
+export function stopEngineAndUnbind(engineId: string): Promise<void> {
+  return enqueueEngineLifecycleMutation(() => stopEngineAndUnbindNow(engineId));
 }
 
 /**
@@ -367,15 +603,20 @@ export async function startAndBindLocalEngine(
  * {@link localEngineConnectionId}, plus the legacy single-row id). Provider
  * and custom-endpoint bindings survive.
  */
-export function clearLocalEngineBindings(
+export async function clearLocalEngineBindings(
   roles: readonly CapabilityRole[] = CAPABILITY_ROLES,
-): void {
-  for (const role of roles) {
-    const binding = getBindingForRole(role);
-    if (binding && isLocalEngineConnectionId(binding.connectionId)) {
-      clearCapabilityBinding(role);
+): Promise<void> {
+  await runCapabilityProfileExclusive(async context => {
+    const profile = context.read();
+    const mutations: CapabilityBindingMutation[] = [];
+    for (const role of roles) {
+      const binding = profile[role];
+      if (binding && isLocalEngineConnectionId(binding.connectionId)) {
+        mutations.push({ role, binding: null });
+      }
     }
-  }
+    if (mutations.length > 0) await context.save(mutations);
+  });
 }
 
 /**
@@ -398,13 +639,21 @@ export function findDanglingBindings(
   return dangling;
 }
 
-export function clearDanglingBindings(
+export async function clearDanglingBindings(
   knownConnectionIds: ReadonlySet<string>,
   roles: readonly CapabilityRole[] = CAPABILITY_ROLES,
-): CapabilityRole[] {
-  const dangling = findDanglingBindings(knownConnectionIds, roles);
-  for (const role of dangling) clearCapabilityBinding(role);
-  return dangling;
+): Promise<CapabilityRole[]> {
+  return runCapabilityProfileExclusive(async context => {
+    const profile = context.read();
+    const dangling = roles.filter(role => {
+      const binding = profile[role];
+      return Boolean(binding && !knownConnectionIds.has(binding.connectionId));
+    });
+    if (dangling.length > 0) {
+      await context.save(dangling.map(role => ({ role, binding: null })));
+    }
+    return dangling;
+  });
 }
 
 // ── Engine relaunch on app boot ─────────────────────────────────────────────
@@ -450,32 +699,82 @@ function readEngineLaunchPlans(): PersistedEnginePlan[] {
   }
 }
 
-function writeEngineLaunchPlans(plans: PersistedEnginePlan[]): void {
-  if (typeof window === 'undefined') return;
-  if (plans.length === 0) removeStoredSetting(ENGINE_LAUNCH_PLANS_KEY);
-  else setStoredSetting(ENGINE_LAUNCH_PLANS_KEY, JSON.stringify(plans));
-}
-
-function persistEngineLaunchPlan(plan: EngineStartPlan, engineId: string): void {
-  const key = planKey(plan.modelPath, plan.engineLabel);
-  const plans = readEngineLaunchPlans().filter(
-    p => planKey(p.modelPath, p.engineLabel) !== key,
+async function writeEngineLaunchPlansDurable(plans: PersistedEnginePlan[]): Promise<void> {
+  if (typeof window === 'undefined') {
+    // SSR / non-browser unit harness: nothing authoritative to persist.
+    return;
+  }
+  const previous = getStoredSetting(ENGINE_LAUNCH_PLANS_KEY);
+  if (plans.length === 0) {
+    const ok = await removeStoredSettingDurable(ENGINE_LAUNCH_PLANS_KEY);
+    if (ok) return;
+    rollbackStoredSettingMirrorAfterFailedDurableAttempt(
+      ENGINE_LAUNCH_PLANS_KEY,
+      null,
+      previous,
+    );
+    throw new Error(ENGINE_LAUNCH_PLAN_PERSISTENCE_FAILED);
+  }
+  const attempted = JSON.stringify(plans);
+  const ok = await setStoredSettingDurable(ENGINE_LAUNCH_PLANS_KEY, attempted);
+  if (ok) return;
+  rollbackStoredSettingMirrorAfterFailedDurableAttempt(
+    ENGINE_LAUNCH_PLANS_KEY,
+    attempted,
+    previous,
   );
-  plans.push({
-    modelPath: plan.modelPath,
-    format: plan.format,
-    modelLabel: plan.modelLabel,
-    roles: [...plan.roles],
-    engineLabel: plan.engineLabel,
-    engineId,
-  });
-  writeEngineLaunchPlans(plans);
+  throw new Error(ENGINE_LAUNCH_PLAN_PERSISTENCE_FAILED);
 }
 
-function removeEngineLaunchPlanByEngineId(engineId: string): void {
-  const plans = readEngineLaunchPlans();
-  const next = plans.filter(p => p.engineId !== engineId);
-  if (next.length !== plans.length) writeEngineLaunchPlans(next);
+async function persistEngineLaunchPlan(plan: EngineStartPlan, engineId: string): Promise<void> {
+  return enqueueEngineLaunchPlanMutation(async () => {
+    const key = planKey(plan.modelPath, plan.engineLabel);
+    const plans = readEngineLaunchPlans().filter(
+      p => planKey(p.modelPath, p.engineLabel) !== key,
+    );
+    plans.push({
+      modelPath: plan.modelPath,
+      format: plan.format,
+      modelLabel: plan.modelLabel,
+      roles: [...plan.roles],
+      engineLabel: plan.engineLabel,
+      engineId,
+    });
+    await writeEngineLaunchPlansDurable(plans);
+  });
+}
+
+async function removeEngineLaunchPlanByEngineId(
+  engineId: string,
+): Promise<PersistedEnginePlan[]> {
+  return enqueueEngineLaunchPlanMutation(async () => {
+    const plans = readEngineLaunchPlans();
+    const removed = plans.filter(p => p.engineId === engineId);
+    const next = plans.filter(p => p.engineId !== engineId);
+    if (next.length !== plans.length) {
+      await writeEngineLaunchPlansDurable(next);
+    }
+    return removed;
+  });
+}
+
+async function restoreRemovedEngineLaunchPlans(
+  removed: readonly PersistedEnginePlan[],
+): Promise<void> {
+  if (removed.length === 0) return;
+  await enqueueEngineLaunchPlanMutation(async () => {
+    const current = readEngineLaunchPlans();
+    const next = [...current];
+    for (const plan of removed) {
+      const key = planKey(plan.modelPath, plan.engineLabel);
+      if (!next.some(candidate => planKey(candidate.modelPath, candidate.engineLabel) === key)) {
+        next.push(plan);
+      }
+    }
+    if (next.length !== current.length) {
+      await writeEngineLaunchPlansDurable(next);
+    }
+  });
 }
 
 let restoreEnginesPromise: Promise<void> | null = null;
@@ -492,7 +791,7 @@ export function restoreEnginesOnLaunch(): Promise<void> {
   restoreEnginesPromise ??= (async () => {
     const plans = readEngineLaunchPlans();
     if (plans.length === 0) {
-      await pruneStaleLocalEngineRows();
+      await enqueueEngineLifecycleMutation(pruneStaleLocalEngineRowsNow);
       return;
     }
     let running: EngineInfo[];
@@ -514,7 +813,11 @@ export function restoreEnginesOnLaunch(): Promise<void> {
       if (runningIds.has(plan.engineId)) continue;
       if (installedPaths && !installedPaths.has(normalizeModelPathForCompare(plan.modelPath))) {
         // Model file is gone — never retry this plan again.
-        removeEngineLaunchPlanByEngineId(plan.engineId);
+        try {
+          await removeEngineLaunchPlanByEngineId(plan.engineId);
+        } catch {
+          // Best-effort plan cleanup during restore.
+        }
         continue;
       }
       // Only re-bind roles still routed through a local engine; a role the
@@ -524,7 +827,11 @@ export function restoreEnginesOnLaunch(): Promise<void> {
         return binding != null && isLocalEngineConnectionId(binding.connectionId);
       });
       if (roles.length === 0) {
-        removeEngineLaunchPlanByEngineId(plan.engineId);
+        try {
+          await removeEngineLaunchPlanByEngineId(plan.engineId);
+        } catch {
+          // Best-effort plan cleanup during restore.
+        }
         continue;
       }
       try {
@@ -541,7 +848,7 @@ export function restoreEnginesOnLaunch(): Promise<void> {
         // it); the prune below clears the dead binding so the UI is truthful.
       }
     }
-    await pruneStaleLocalEngineRows();
+    await enqueueEngineLifecycleMutation(pruneStaleLocalEngineRowsNow);
   })().catch(() => {
     // Restoration is best-effort; failures degrade to the manual launch flow.
     // Reset the cached promise so a later call (e.g. after the runtime
@@ -585,19 +892,19 @@ export function normalizeModelPathForCompare(path: string): string {
   return value;
 }
 
-function ensureLocalEngineConnection(
+async function ensureLocalEngineConnection(
   engine: EngineInfo,
   modelLabel: string,
-): RuntimeConnection {
+): Promise<RuntimeConnection> {
   const id = localEngineConnectionId(engine.engineId);
   const existing = getConnection(id);
   if (existing) return existing;
   // The engine is already running (otherwise we wouldn't be reusing) but its
-  // connection row was somehow missing — recreate it inline rather than re-
-  // upserting through local-engine (which would re-engineStart and bypass
+  // connection row was somehow missing — recreate it durably rather than
+  // re-upserting through local-engine (which would re-engineStart and bypass
   // budget).
   const labelSuffix = engine.engineLabel ? ` · ${engine.engineLabel}` : '';
-  return upsertConnection({
+  return upsertConnectionWithSecretCleanup({
     id,
     label: `Local engine · ${modelLabel}${labelSuffix}`,
     kind: 'local',
@@ -607,26 +914,37 @@ function ensureLocalEngineConnection(
   });
 }
 
-function bindRolesToConnection(
+interface BoundRolesResult {
+  boundRoles: CapabilityRole[];
+  previousBindings: Map<CapabilityRole, CapabilityBinding | null>;
+}
+
+async function bindRolesToConnection(
   roles: readonly CapabilityRole[],
   connectionId: string,
   modelId: string,
-): CapabilityRole[] {
-  const bound: CapabilityRole[] = [];
-  for (const role of roles) {
-    saveCapabilityBinding(role, connectionId, modelId);
-    bound.push(role);
+): Promise<BoundRolesResult> {
+  if (roles.length === 0) {
+    return { boundRoles: [], previousBindings: new Map() };
   }
-  return bound;
+  return runCapabilityProfileExclusive(async context => {
+    // Capture the direct predecessor and install the launch binding while the
+    // profile queue is held. A user bind that lands during a slow engine start
+    // therefore becomes the compensation target instead of being overwritten
+    // by a stale pre-start snapshot.
+    const previousBindings = snapshotRoleBindingsFromProfile(context.read(), roles);
+    await context.save(roles.map(role => ({ role, connectionId, modelId })));
+    return { boundRoles: [...roles], previousBindings };
+  });
 }
 
 /**
  * Remove local-engine connection rows whose engineId is no longer in the
  * registry. Safe to call any time — only acts on rows whose id starts with
  * `local-engine:`. Used after `stop_others_for_path` so the rows for the
- * stopped engines don't linger.
+ * stopped engines don't linger. Never deletes provider bindings.
  */
-async function pruneStaleLocalEngineRows(): Promise<void> {
+async function pruneStaleLocalEngineRowsNow(): Promise<void> {
   const connections = getConnections();
   const localConnIds = connections
     .map(c => c.id)
@@ -643,13 +961,23 @@ async function pruneStaleLocalEngineRows(): Promise<void> {
   for (const id of localConnIds) {
     if (!runningIds.has(id)) {
       try {
-        const profile = getCapabilityProfile();
-        for (const role of CAPABILITY_ROLES) {
-          if (profile[role]?.connectionId === id) {
-            clearCapabilityBinding(role);
+        await runCapabilityProfileExclusive(async context => {
+          // The initial registry snapshot may be stale. Re-check while holding
+          // the profile lock; the outer engine lifecycle queue prevents a new
+          // start from racing this decision.
+          const freshRunning = await engineStatus();
+          if (freshRunning.some(engine => localEngineConnectionId(engine.engineId) === id)) {
+            return;
           }
-        }
-        await removeConnection(id);
+          const profile = context.read();
+          const mutations: CapabilityBindingMutation[] = [];
+          for (const role of CAPABILITY_ROLES) {
+            const mutation = removeConnectionFromBinding(role, profile[role], id);
+            if (mutation) mutations.push(mutation);
+          }
+          if (mutations.length > 0) await context.save(mutations);
+          await removeConnection(id);
+        });
       } catch {
         // Best-effort: a stale connection row is harmless once the binding
         // is also gone (clearDanglingBindings will follow up).

@@ -10,7 +10,7 @@
 // surfaces it as "Runtime health checks require the desktop app".
 
 import { isTauriRuntime, runtimeHealth } from '@/lib/desktop-runtime';
-import { getConnectionSecret } from './connections';
+import { getConnectionSecretForSnapshot } from './connections';
 import type { ConnectionHealth, RuntimeConnection } from './types';
 
 function webDegradedHealth(): ConnectionHealth {
@@ -35,7 +35,7 @@ export async function checkConnectionHealth(
   if (!isTauriRuntime()) return webDegradedHealth();
   try {
     const secret = connection.secretRef
-      ? await getConnectionSecret(connection.id)
+      ? await getConnectionSecretForSnapshot(connection)
       : null;
     return await runtimeHealth({
       connectionId: connection.id,
