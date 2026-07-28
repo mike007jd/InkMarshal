@@ -1,44 +1,49 @@
-# Release Smoke Checklist（macOS 真机人工冒烟）
+# macOS Release Smoke Checklist
 
-每次发布候选 DMG 必须在真机过完这份清单并留存记录。
+Run this checklist on the exact final DMG after automated release gates pass. Keep the completed copy with the release evidence.
 
-已有自动化包装层：`pnpm release:mac` 会挂载**最终** DMG、从该挂载点只启动一个进程、并检查桌面 runtime health，通过后才保留 release 资产。另有桌面 boot smoke（`e2e/desktop-smoke`）覆盖无 GUI 的启动不变量。这些自动化是包装/启动 oracle，**不能替代**本清单中的真机人工路径（真实模型下载/Use、BYOK、物理断网、GUI 操作、导出与强杀恢复等）。
+## Record
 
-自动化门禁前置：`pnpm verify`（含 lint、typecheck、Knip、全量 Vitest、隔离 80 章 full-novel QA、production build）+ `pnpm verify:security` + `pnpm verify:desktop`，以及需要时的 `CHECK_LOCAL_MAC_BUNDLE=1 pnpm verify:release-desktop`。
+- Date and operator:
+- Commit and version:
+- DMG path:
+- DMG SHA-256:
+- macOS version and hardware:
+- Mounted app executable path:
 
-## 记录头
+## Install and first launch
 
-- 日期 / 执行人:
-- DMG: `dist/release/InkMarshal-mac-aarch64.dmg` 的 sha256:
-- macOS 版本 / 机型:
+- [ ] Gatekeeper accepts the app with no damaged/unverified warning.
+- [ ] The first-run flow reaches the Studio.
+- [ ] Quit and relaunch preserves the session and local database.
+- [ ] Only one InkMarshal process runs, and it belongs to the current package.
 
-## 安装与首启
+## Model path
 
-- [ ] 从 DMG 拖入 /Applications，首次打开无 Gatekeeper 拦截（无「已损坏」「无法验证开发者」弹窗）
-- [ ] 首启向导完整走通，落地到工作台主界面
-- [ ] 退出后二次启动直接进入工作台（会话/数据库状态保留）
+- [ ] The curated starter shelf loads and a real model download completes, including pause/resume.
+- [ ] Use starts the engine; a new novel generates one complete chapter.
+- [ ] A real BYOK connection generates successfully and becomes unavailable after its key is removed.
+- [ ] With physical network access disabled, local generation works and remote paths fail clearly.
+- [ ] Stop a chat response mid-stream; the partial response persists once and retry/continue remains coherent.
 
-## 模型链路（核心路径）
+## Writing and data
 
-- [ ] 模型管理器列出 starter shelf；下载一个真实模型到完成（进度、暂停/恢复正常）
-- [ ] 下载完成后 Use → 引擎启动 → 新建小说 → 生成一个完整章节
-- [ ] BYOK：配置一个真实云端 key，生成成功；删除 key 后不再可用
-- [ ] 物理断网：本地模型生成仍工作；BYOK 路径给出明确错误而非挂死
-- [ ] 小说 chat：发送一条消息，中途 Stop，确认半截回复只落库一次；随后重新发送/重试，线程继续正常
+- [ ] Edit and save a chapter; content survives restart.
+- [ ] Export a Chinese manuscript to EPUB, TXT, DOCX, PDF, and ZIP; every file opens and CJK glyphs render correctly.
+- [ ] Backup and restore preserves manuscript, structure, and knowledge data.
+- [ ] Force-quit and relaunch causes no data loss or migration error.
 
-## 创作与数据
+## System integration
 
-- [ ] 章节编辑、保存、重启后内容完好
-- [ ] 中文小说导出 EPUB / TXT / DOCX / PDF / 导出 ZIP 各一次，打开确认中文渲染正常（PDF 不出现豆腐块）
-- [ ] 强杀 app（活动监视器）后重启，无数据丢失、无迁移报错
+- [ ] External links open only allowed destinations.
+- [ ] Minimum window size and light/dark appearance remain usable.
+- [ ] Removing the application leaves `~/.inkmarshal/app/` intact.
+- [ ] Update/relaunch flushes manuscript state and returns to a healthy Studio.
 
-## 系统集成
+## Result
 
-- [ ] 「报告问题」等外链只打开 GitHub 允许列表内地址
-- [ ] 窗口缩放到最小尺寸布局不破；深/浅色外观切换正常
-- [ ] 卸载验证：删除 app 后 `~/.inkmarshal/app` 数据目录仍在（local-first 数据不随 app 删除）
+- [ ] Every item passed.
+- Evidence location:
+- Failures and rerun reference:
 
-## 结果
-
-- [ ] 全部通过 → 在发布记录中附本文件副本与 verify 输出
-- 任一失败 → 阻断发布，回归修复后整单重跑
+Any failed item blocks the release until fixed and the complete checklist is rerun.

@@ -1,9 +1,8 @@
-# Live Surface Matrix — InkMarshal
+# Live Surface Matrix
 
-> Maintained from the current route and import graph. This is the authoritative
-> map of user-visible surfaces and their real owners. Regenerate it
-> from `app/**/page.tsx`, `app/api/**/route.ts`, and the top-level component each
-> page mounts whenever surfaces change.
+This compact navigation aid is maintained from `app/**/page.tsx`,
+`app/api/**/route.ts`, and each page's top-level owner. Source wins if this table
+drifts.
 
 ## Page routes
 

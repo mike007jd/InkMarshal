@@ -33,6 +33,9 @@ Timelines may change for complex or upstream vulnerabilities. We will communicat
 
 ## Scope
 
-Useful reports include vulnerabilities in the desktop runtime boundary, local API authorization, secret handling, update signature verification, model/download integrity, manuscript access, import/export parsing, and dependency supply chain.
+Useful reports include vulnerabilities in the desktop runtime boundary, local
+API authorization, secret handling, update signature verification,
+model/download integrity, manuscript access, import/export parsing, and the
+dependency supply chain.
 
 Unsupported reports include social engineering, denial of service requiring sustained traffic against infrastructure the project does not operate, and findings that only affect obsolete or modified builds.

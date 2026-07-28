@@ -1,57 +1,30 @@
-# ADR 0001 — Mutation goes through a server action; client-fetch reads use an API route
+# ADR 0001: Transport Does Not Own Domain Writes
 
-- Status: Accepted
-- Date: 2026-06-05
+- Status: Amended
+- Original decision: 2026-06-05
+- Amended: 2026-07-28
 
 ## Context
 
-InkMarshal is a local-first desktop app (Tauri + Next standalone
-Node runtime). It has two server-side write surfaces:
+The original rule made server actions the default mutation transport to stop
+knowledge writes from diverging across UI paths. The application now
+legitimately uses both server actions and route handlers for CRUD, streaming,
+abortable work, binary exports, backup/restore, and non-React callers.
 
-1. **Server Actions** (`app/actions/*`, `'use server'`) — invoked directly from
-   client components, no hand-rolled fetch.
-2. **API Route Handlers** (`app/api/**/route.ts`) — invoked via `fetch` from the
-   client, or hit by streaming/SSE consumers.
-
-The boundary between them had been drawn ad hoc per feature. The
-clearest symptom: the **knowledge** feature **reads through an API route but
-writes through a server action**, and the same form both `fetch`es and calls an
-action — a split-brain that forced two mental models for one feature and let a
-fourth, hand-written write path (the AI-summarize route) drift from the action's
-write sequence (it originally skipped the vault `.md` sync the actions all do).
+The durable problem is not transport choice. It is duplicated validation, transaction, index, Vault, and recovery ordering.
 
 ## Decision
 
-- **All mutations go through a server action** (`app/actions/*`). Actions are the
-  single write surface: they own validation, ownership checks, the DB+index
-  transaction, and the vault/embedding side effects.
-- **Use an API Route handler only when the client genuinely needs `fetch`
-  semantics** that actions can't express:
-  - **Streaming** responses: AI SDK UIMessage streams for chat; project NDJSON
-    only for autonomous writing/editor workflows that carry workflow state.
-  - **AbortSignal**-driven cancellation of a long server task.
-  - **Binary / file** responses (export bundle download).
-  - A **non-React or external** caller (a watcher, a probe).
-- A read that only feeds a React render should prefer a Server Component or an
-  action; reach for a `GET` route only when a client effect must re-fetch it.
+- Choose server actions for React-local mutations when action semantics fit.
+- Choose route handlers for fetch clients, streaming, abort, binary responses, probes, backup/restore, or external callers.
+- Put the actual domain write in a shared server-side primitive.
+- That primitive owns validation, scope/ownership checks, transaction boundaries, durable projection intent, and side-effect ordering.
+- Transport adapters stay thin and must not implement competing write sequences.
 
-## Shared write primitive
-
-To keep the action path and any *justified* route write path (e.g. AI-summarize,
-which is a route because it streams a model call + needs abort) from diverging,
-the actual entry-write side effects are centralised:
-
-- `lib/knowledge/apply-write.ts#applyKnowledgeEntryWrite` — DB row + index in one
-  transaction, then best-effort vault `.md` sync, embedding invalidation, and a
-  scheduled re-embed. Both `updateKnowledgeEntry` (action) and the summarize
-  route call it, so the "what happens on a knowledge write" list lives once.
-- `lib/knowledge/refresh-index.ts#buildIndexSyncInputForEntry` — the single
-  entry-row → index-input projection (relations folded in, with optional
-  add/exclude adjustments). Replaces three near-identical copies.
+For knowledge entry writes, `lib/knowledge/apply-write.ts` and `lib/knowledge/refresh-index.ts` remain the shared implementation.
 
 ## Consequences
 
-- New write features default to a server action; choosing a route requires one of
-  the justifications above.
-- The knowledge read-route/write-action split remains for now (the read route is
-  consumed by a client effect), but no *new* feature should reproduce it.
+- The original “all mutations use server actions” rule is superseded.
+- New route handlers are acceptable when their transport is justified and they reuse domain primitives.
+- Review focuses on transaction/rollback symmetry, stale-run suppression, and durable outbox behavior across every caller.

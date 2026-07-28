@@ -1,36 +1,17 @@
-# Launch Readiness - InkMarshal
+# macOS Release Runbook
 
-Last checked: 2026-07-23
+This file retains its historical name to preserve links. It is the operating procedure for every published Apple Silicon macOS release.
 
-This is the release operating document for the launched product. It describes the launch path that exists now. This documentation pass does **not** claim that signing, notarization, real-model, BYOK, offline, or manual GUI smoke passed.
+## Boundaries
 
-## Launch Scope
+- Packaging, Git tagging, GitHub upload/release mutation, and website deployment are separate actions.
+- A package is not ready until it is built cleanly, validated from the exact final DMG, and passes the manual checklist.
+- Published SQLite/Vault data, updater manifest shape, and stable asset names are compatibility contracts.
+- Windows and other platforms remain unpublished until their signed and validated paths exist.
 
-Current public launch target:
+## Stable assets
 
-- macOS Apple Silicon DMG.
-- Public website from sibling repository `../../AiNovelSite`.
-- Local-first desktop Studio.
-
-Explicitly not in scope:
-
-- Windows public release.
-- Hosted web Studio.
-- Login, account, cloud database, platform credits, or Stripe credit checkout.
-- Server-owned provider API keys.
-
-## Product Contracts
-
-- `pnpm verify` is lint, typecheck, Knip dead-code analysis, the full Vitest suite, an isolated 80-chapter full-novel QA gate, and production build.
-- Local SQLite supports exactly the current schema v1 baseline. Empty/new databases are created at that shape only; incompatible nonempty databases fail closed without modification. Destructive cleanup is only through `pnpm local-state:reset -- --confirm-delete-inkmarshal-local-state`.
-- DB + `knowledge_index` are canonical. Vault markdown is a durable outbox/tombstone projection of that truth.
-- Desktop updater order: download → durable manuscript flush/snapshot → official Tauri install → relaunch.
-- Security gate: Next 16.2.11, narrow `sharp` 0.35.3 override, OSV, and Cargo audit with an explicit advisory-ID allowlist.
-- Outer unattended `scripts/ralph` loop is removed. The in-app Ralph writing workflow remains.
-
-## Release Assets
-
-Stable macOS asset names:
+Every macOS updater release contains:
 
 - `InkMarshal-mac-aarch64.dmg`
 - `InkMarshal-mac-aarch64.dmg.sha256`
@@ -38,150 +19,98 @@ Stable macOS asset names:
 - `InkMarshal-mac-aarch64.app.tar.gz.sig`
 - `latest.json`
 
-Canonical public URL:
+Canonical download:
 
 ```text
 https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg
 ```
 
-The website release gate in `../../AiNovelSite` pins its download button to this URL.
+Do not rename published assets without an updater migration covering every published version.
 
-## Required Local Toolchain
+## Toolchain and secrets
 
-- Node 24.
-- pnpm 10.15.x.
-- Rust and Cargo.
-- Xcode command line tools.
-- Apple Developer ID Application certificate in the login keychain.
-- Apple notarization credentials:
-  - `APPLE_SIGNING_IDENTITY`
-  - `APPLE_ID`
-  - `APPLE_TEAM_ID`
-  - `APPLE_PASSWORD`
+Use the Node/pnpm versions declared by the package, stable Rust, Xcode command-line tools, a Developer ID Application certificate, and Apple notarization credentials.
 
-Secrets must stay in the shell or local secret manager, never in `.env*` files.
+The release scripts accept:
+
+- `APPLE_SIGNING_IDENTITY`
+- `APPLE_TEAM_ID`
+- `APPLE_ID`
+- `APPLE_APP_SPECIFIC_PASSWORD` (preferred) or `APPLE_PASSWORD`
+
+Credentials may come from the process environment or `~/.inkmarshal/release/apple.env`. That file must be mode `600`; never commit or print it.
 
 ## Preflight
 
 Run from `novelcraft-ai/`:
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm verify
 pnpm verify:security
 pnpm verify:desktop
+pnpm verify:third-party-notices
+git status --short
 ```
 
-Run the desktop release gate before publish:
+Stop any non-release InkMarshal instance before packaging. Resolve every product failure and confirm the intended source state before continuing.
 
-```bash
-pnpm verify:release-desktop
-```
-
-With a local signed bundle present on macOS:
-
-```bash
-CHECK_LOCAL_MAC_BUNDLE=1 \
-pnpm verify:release-desktop
-```
-
-## Build Sequence
-
-1. Confirm `git status --short` contains only intended release changes.
-2. Export Apple signing/notarization env vars in the shell.
-3. Run:
+## Clean package
 
 ```bash
 pnpm release:mac
 ```
 
-   `release:mac` performs clean packaging, full engine manifest verification, mounts the exact final DMG, launches exactly one process from that mount, and checks desktop runtime health before retaining release assets. That automatic exact-DMG oracle complements — and does not replace — the deeper real-machine checklist.
+`release:mac` is the required packaging entry point. It:
 
-   The release builder re-signs every bundled Mach-O (Node, llama/MLX,
-   dylibs, and native Node modules) with the configured Developer ID Team ID
-   before signing the app. The app and inference engines have no Hardened
-   Runtime exceptions; only the separately spawned Node runtime has
-   `allow-jit`. The build fails if any nested code has another Team ID or
-   retains library-validation, DYLD, unsigned-memory, executable-protection,
-   or debug exceptions.
+1. stops InkMarshal/desktop runtime processes;
+2. detaches stale InkMarshal DMGs;
+3. removes packaged artifacts and cleans the Tauri target;
+4. fetches and verifies engine resources;
+5. signs nested native code and the app;
+6. builds, notarizes, staples, and validates release assets;
+7. mounts the exact final DMG;
+8. launches exactly one app process from that mount and checks runtime health.
 
-   Verify the exact signed app before publish:
+Do not validate an older mount, `/Applications/InkMarshal.app`, an incremental bundle, or a prior `dist/release` artifact as the new package.
 
-```bash
-codesign --verify --deep --strict src-tauri/target/aarch64-apple-darwin/release/bundle/macos/InkMarshal.app
-codesign -d --entitlements :- src-tauri/target/aarch64-apple-darwin/release/bundle/macos/InkMarshal.app
-pnpm verify:mac-library-validation src-tauri/target/aarch64-apple-darwin/release/bundle/macos/InkMarshal.app
-```
-
-4. Upload all five files from `dist/release/` to the GitHub Release:
-   - `InkMarshal-mac-aarch64.dmg`
-   - `InkMarshal-mac-aarch64.dmg.sha256`
-   - `InkMarshal-mac-aarch64.app.tar.gz`
-   - `InkMarshal-mac-aarch64.app.tar.gz.sig`
-   - `latest.json`
-5. Re-run the public gate with published-updater checks enabled:
+## Verify the exact output
 
 ```bash
-CHECK_PUBLISHED_UPDATER=1 \
-pnpm verify:release-desktop
+CHECK_LOCAL_MAC_BUNDLE=1 pnpm verify:release-desktop
 ```
 
-   The release is blocked unless the manifest, updater archive, and signature all resolve publicly.
-6. Run the manual smoke checklist in `docs/RELEASE_SMOKE_CHECKLIST.md`.
+Also confirm:
 
-## Website Release
+- `codesign --verify --deep --strict` succeeds for the final app;
+- Gatekeeper accepts the final DMG/app;
+- stapling validates;
+- the updater archive signature and `latest.json` match the final archive;
+- exactly one running InkMarshal process points inside the current DMG mount.
 
-Vercel settings, public environment variables, and the website build gate are
-owned by `../../AiNovelSite`. A website release must run that repository's
-`pnpm verify` and production build gate; no `NEXT_PUBLIC_*` configuration belongs
-in this desktop repository.
+Run [RELEASE_SMOKE_CHECKLIST.md](RELEASE_SMOKE_CHECKLIST.md) against that package before calling it ready.
 
-## Manual Smoke
+## Publish verification
 
-The release is not launch-ready until a real macOS machine passes `docs/RELEASE_SMOKE_CHECKLIST.md`. Automated exact-DMG health smoke from `pnpm release:mac` is a packaging oracle only.
-
-Critical paths still requiring human confirmation:
-
-- DMG install and first launch.
-- Model download, Use, engine start, and full chapter generation.
-- Chat send, Stop, persisted partial reply, retry.
-- BYOK key add/use/delete.
-- Physical offline behavior.
-- Chapter edit/save/restart.
-- EPUB, TXT, DOCX, PDF, and ZIP export.
-- Force quit and restart without data loss.
-- Window sizing and theme switching.
-
-## Hygiene Before Publish
-
-Before final release tagging:
+Uploading or changing a GitHub release requires separate authorization. When authorized, upload all five stable assets without moving an existing tag, then run:
 
 ```bash
-pnpm clean
-git status --short --ignored
+CHECK_PUBLISHED_UPDATER=1 pnpm verify:release-desktop
 ```
 
-Confirm there are no committed or untracked release leftovers:
+The published manifest, archive, signature, checksum, and canonical DMG URL must all resolve and agree.
 
-- logs
-- screenshots
-- audit bundles
-- `.cargo-tools/`
-- `.ui-audit/`
-- `.superpowers/`
-- local `.env*`
-- generated `dist/release/` unless intentionally preparing local assets
+Website work is owned by `../../AiNovelSite` and runs that repository's independent verification/deployment flow.
 
-Generated caches can be recreated by the documented scripts. Source files, icons, logo, fonts, and active app docs are not cleanup targets.
+## Stop conditions
 
-## Stop Conditions
+Block release when:
 
-Block release if any of these are true:
-
-- `pnpm verify`, `pnpm verify:security`, or `pnpm verify:desktop` fails for a product reason.
-- The DMG is not Developer ID signed and notarized.
-- Gatekeeper or stapler validation fails.
-- The public macOS download URL is not reachable.
-- A Windows URL is configured.
-- Production env contains cloud/provider/server secrets.
-- Manual smoke fails in first-run, model, chat stop/retry, export, or restart persistence paths.
+- any applicable verification gate fails for a product reason;
+- the exact final DMG is not signed, notarized, stapled, or Gatekeeper-accepted;
+- more than one InkMarshal instance runs during package smoke;
+- the running executable is not inside the current final DMG mount;
+- updater assets are missing, inconsistent, or unreachable;
+- manual first-run, model, offline, writing, export, or recovery smoke fails;
+- a platform URL is configured without a signed validated build;
+- secrets or local user data appear in source or release assets.

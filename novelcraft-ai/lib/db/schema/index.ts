@@ -1,6 +1,6 @@
 import { sql as currentSchemaSql } from '@/lib/db/schema/0001_initial';
 
-/** The only on-disk shape supported by the unpublished product. */
+/** The current published on-disk schema version. */
 export const CURRENT_SCHEMA_VERSION = 1;
 
 export const CURRENT_SCHEMA_TABLES = [

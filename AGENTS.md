@@ -1,19 +1,38 @@
-## Desktop Packaging Gate
+# InkMarshal Repository Guide
 
-- **MUST clean build every desktop package.** Before producing or verifying a macOS desktop package, stop any running InkMarshal app/runtime, detach old mounted DMGs, remove stale packaged artifacts, run the project clean step, and clean the Tauri build target so the delivered DMG cannot reuse an old bundle.
-- **MUST verify the exact newly built DMG.** After packaging, mount the newly created DMG from its final release path, launch that mounted app, and smoke-test the affected desktop screen from that app before reporting the package as ready.
-- **MUST run only one InkMarshal instance during package smoke tests.** Before launching the mounted app, kill all existing `InkMarshal` / `inkmarshal-desktop` processes, then assert exactly one app process remains and its executable path is inside the current final DMG mount. Do not leave `/Applications/InkMarshal.app` and a mounted DMG app running at the same time.
-- **NEVER report a desktop package from an older mount, older `dist/release` file, or incremental bundle output as the new build.**
+## Scope
 
-## InkMarshal Current State
+- The repository root is `InkMarshal`; application code lives in `novelcraft-ai/`.
+- The shipped product is the local-first Tauri v2 desktop Studio. The sibling `../AiNovelSite` repository owns the public website, downloads, examples, legal pages, and Vercel configuration.
+- Do not add a hosted writing workspace, cloud auth/database, platform credits, Supabase, or Stripe generation paths to this repository.
 
-- App code lives under `novelcraft-ai/`; repo root is `AiNovel`.
-- Project is **launched** (publicly released since 2026-07-23): released builds may hold real user data. Changes touching the local SQLite schema, vault layout, `~/.inkmarshal/app/` data layout, updater manifest, or published release asset names must preserve existing user data and published contracts — schema changes ship with forward migrations from every published release, and the updater path must keep working from every published version.
-- Launched does **not** mean hoarding speculative compatibility debt: dead code, unused config, and duplicate implementations with no published dependents should still be deleted outright. Destructive local cleanup remains an explicit operator action through the reset script; normal startup must never delete or silently discard user data.
-- Product in this repository is the local-first Tauri v2 desktop Studio. The public website lives in sibling repo `../AiNovelSite`; do not reintroduce landing/Vercel code, cloud auth, cloud DB, platform credits, or Supabase runtime assumptions here.
-- Canonical runtime data/config root is `~/.inkmarshal/app/`: `inkmarshal.db`, SQLite WAL/SHM, `models/`, `vaults/`, `locale.txt`, `model-root.txt`, fallback `secrets/`, and logs.
-- `INKMARSHAL_HOME` may override the root (`~/.inkmarshal`). `INKMARSHAL_DATA_DIR` is only a DB-dir override for tests/scripts and is intentionally not passed through the packaged desktop runtime.
-- Local/generated project dot-state can be relocated with `node novelcraft-ai/scripts/relocate-dot-state.mjs --apply`; destructive cleanup requires `node novelcraft-ai/scripts/reset-inkmarshal-local-state.mjs --confirm-delete-inkmarshal-local-state`. Normal startup must not delete or migrate old data implicitly.
-- Tracked repo contract files stay in repo: `.git`, `.github`, `.gitignore`, `.env.example`, `.node-version`, docs, and source-controlled config.
-- Apple release env may be loaded from `~/.inkmarshal/release/apple.env` with strict file permissions; never commit or paste release secrets.
-- Use Node `>=24 <25` and pnpm `>=10.15.1 <11`. If the shell exposes pnpm 11.x, use the project/Corepack-pinned pnpm 10 or local binaries for verification.
+## Delivery
+
+- Complete the authorized scope end to end and run every applicable gate; do not leave QA to the user.
+- Reply to the user in concise Chinese. Keep implementation details focused on risks, trade-offs, and non-obvious decisions.
+- Make reversible product and engineering decisions autonomously. Ask only before destructive, paid, production-data, or shared-state changes.
+
+## Published Data Contracts
+
+- Published builds may contain real user data. SQLite schema, Vault layout, `~/.inkmarshal/app/`, updater manifests, and release asset names are compatibility contracts.
+- Schema changes require tested forward migrations from every published schema. Startup may migrate data forward but must never delete, reset, or silently discard it.
+- `~/.inkmarshal/app/` owns the database, WAL/SHM, models, Vaults, locale/model-root files, fallback secrets, and logs. `INKMARSHAL_HOME` overrides the root; `INKMARSHAL_DATA_DIR` is test/script-only.
+- Destructive cleanup is operator-only through `node novelcraft-ai/scripts/reset-inkmarshal-local-state.mjs --confirm-delete-inkmarshal-local-state`.
+- Dead code and duplicate implementations without published dependants should still be removed; do not preserve speculative compatibility debt.
+
+## Verification
+
+- Use Node `>=24 <25` and pnpm `>=10.15.1 <11`; run package commands from `novelcraft-ai/`.
+- Run `pnpm verify` for TypeScript/UI/docs changes, `pnpm verify:desktop` for Rust/Tauri changes, and `pnpm verify:security` when dependencies or security boundaries change.
+- Unsigned local packaging uses
+  `pnpm clean:desktop-build && pnpm desktop:build` and is never a release-ready
+  artifact. Publishable packaging must use `pnpm release:mac`, which performs
+  cleanup, signing/notarization, and exact-final-DMG single-instance smoke.
+- Packaging does not authorize upload, tag, release, or deployment changes. Release steps live in `novelcraft-ai/docs/LAUNCH_READINESS.md`.
+
+## Documentation
+
+- Start with `docs/README.md`; use code, manifests, tests, and live service state as the source of truth.
+- All developer, design, release, ADR, and agent documentation must be concise English. Localized user/legal documents such as `README_zh-CN.md` and the Chinese summary in `PRIVACY.md` are explicit exceptions.
+- Link to code-owned values instead of copying token tables, dependency versions, model catalogs, schema counts, or recent test results into prose.
+- Update affected docs in the same change. Remove stale plans or mark durable decisions superseded; do not archive misleading snapshots in active docs.

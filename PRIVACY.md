@@ -31,7 +31,7 @@ InkMarshal does not sell personal information and does not use manuscript conten
 - Disable automatic update checks in **Settings → General**; manual checks remain available.
 - Use an on-device model to keep AI prompts on your machine.
 - Review a provider's privacy terms before connecting its API.
-- Delete local InkMarshal data with the repository's explicit reset tool, or remove selected projects/models through the app. Normal startup does not silently erase or migrate unpublished local data.
+- Delete local InkMarshal data with the repository's explicit reset tool, or remove selected projects/models through the app. Normal startup may apply tested forward migrations, but it never silently resets or discards published user data.
 
 ## Changes and contact
 

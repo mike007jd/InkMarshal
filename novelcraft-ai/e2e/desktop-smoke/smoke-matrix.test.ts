@@ -23,11 +23,11 @@ describe('desktop smoke matrix', () => {
     }
   });
 
-  it('has unique ids and gated paths declare what runtime they require', () => {
+  it('has unique ids and manual paths declare what runtime they require', () => {
     const ids = DESKTOP_SMOKE_MATRIX.map(p => p.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const p of DESKTOP_SMOKE_MATRIX) {
-      if (p.status === 'gated-macos') expect(p.requires, p.id).toBeTruthy();
+      if (p.status === 'manual-packaged-gui') expect(p.requires, p.id).toBeTruthy();
     }
   });
 

@@ -1,34 +1,24 @@
-# InkMarshal Desktop
+# InkMarshal Desktop Package
 
-This directory is the local-first Tauri v2 writing Studio. The public landing, download, examples, legal pages, and Vercel build live independently in sibling repository `../../AiNovelSite`.
+The real Studio runs in Tauri at `/desktop-studio`. The sibling `../../AiNovelSite` repository owns all public web pages.
 
-## Commands
-
-Run from `novelcraft-ai/` with Node 24 and pnpm 10.15.1:
+Run package commands here with the toolchain declared in `package.json`:
 
 ```bash
-pnpm install
-pnpm dev                # desktop Next runtime for local UI work
-pnpm desktop:dev        # Tauri desktop Studio
-pnpm build              # Next desktop runtime
-pnpm desktop:build      # local .app + .dmg
-pnpm release:mac        # signed/notarized release assets + exact-DMG oracle
-pnpm verify             # lint + typecheck + Knip + Vitest + 80-chapter QA + build
-pnpm verify:desktop     # rustfmt + clippy + cargo test
-pnpm verify:security    # OSV + Cargo audit (advisory-ID allowlist)
-pnpm verify:release-desktop
-pnpm local-state:reset  # explicit destructive wipe of unpublished local state
+pnpm desktop:dev
+pnpm verify
+pnpm verify:desktop
+pnpm verify:security
+pnpm desktop:build
+pnpm release:mac
 ```
 
-## Runtime contract
+Runtime contracts:
 
-- The real workspace runs inside Tauri at `/desktop-studio`; `/novel/*` and local `/api/*` require the desktop session.
-- Data is local under `~/.inkmarshal/app/`; provider keys are configured in the desktop UI and stored locally/keychain-backed.
-- Local SQLite supports exactly schema v1. Empty/new DBs are created at that baseline; incompatible nonempty DBs fail closed unchanged. Destructive cleanup is only via `pnpm local-state:reset -- --confirm-delete-inkmarshal-local-state`.
-- DB + `knowledge_index` are canonical; Vault markdown is a durable outbox/tombstone projection.
-- GGUF uses bundled `llama-server`; Apple Silicon can also use the native MLX server when the toolchain is available.
-- In-app Ralph writing workflow remains; the outer unattended `scripts/ralph` loop is removed.
-- There is no hosted workspace, cloud account, cloud database, platform credit system, or Vercel deployment in this repository.
-- Apple release env may be loaded from `~/.inkmarshal/release/apple.env` with mode `600`.
+- Product data lives under `~/.inkmarshal/app/`; schema and migration ownership is in `lib/db/schema/` and `lib/db/migrations.ts`.
+- DB state plus `knowledge_index` is canonical; Vault Markdown is a durable outbox/tombstone projection.
+- Provider keys are configured locally and stored through the OS keychain, with a restricted local fallback.
+- The bundled GGUF engine is the default; compatible local servers and BYOK connections are secondary.
+- There is no hosted workspace, cloud account/database, platform-credit system, or Vercel deployment in this package.
 
-Before publishing a desktop release, run `pnpm verify`, `pnpm verify:security`, `pnpm verify:desktop`, `CHECK_LOCAL_MAC_BUNDLE=1 pnpm verify:release-desktop`, and [the real-machine smoke checklist](docs/RELEASE_SMOKE_CHECKLIST.md). `pnpm release:mac` adds an automated exact-final-DMG health oracle; it complements that checklist and does not replace it.
+For setup use [CONTRIBUTING.md](../CONTRIBUTING.md). For architecture use [SYSTEM_FRAMEWORK.md](../spec/SYSTEM_FRAMEWORK.md). For release work use [LAUNCH_READINESS.md](docs/LAUNCH_READINESS.md).
