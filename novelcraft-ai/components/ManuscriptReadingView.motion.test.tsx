@@ -7,13 +7,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocaleProvider } from '@/components/LanguageProvider';
 import { ManuscriptReadingView } from '@/components/ManuscriptReadingView';
 import type { ManuscriptChapter } from '@/components/ManuscriptShell';
+import type { FlipbookGeometry } from '@/lib/flipbook-geometry';
 import { paginateManuscript } from '@/lib/pagination';
 
 const flipBookProbe = vi.hoisted(() => ({
   mountCount: 0,
   latestFlippingTime: 0,
+  latestWidth: 0,
+  latestHeight: 0,
+  latestMinWidth: 0,
   onFlip: null as null | ((event: { data: number }) => void),
 }));
+
+function evenDisplayPageCount(realPageCount: number): number {
+  if (realPageCount <= 0) return 2;
+  return realPageCount % 2 === 0 ? realPageCount : realPageCount + 1;
+}
 
 const paginationProbe = vi.hoisted(() => ({
   onContainerResize: null as null | (() => void),
@@ -25,8 +34,30 @@ const paginationProbe = vi.hoisted(() => ({
     spreadPages: 2 as 1 | 2,
     left: 0,
     top: 0,
+    // Widen beyond the initial 'book' literal so sheet assignments type-check.
+    shape: 'book' as 'book' | 'sheet',
   },
 }));
+
+const BOOK_GEOMETRY: FlipbookGeometry = {
+  pageWidth: 500,
+  pageHeight: 850,
+  spreadWidth: 1000,
+  spreadPages: 2,
+  left: 0,
+  top: 0,
+  shape: 'book',
+};
+
+const SHEET_GEOMETRY: FlipbookGeometry = {
+  pageWidth: 578,
+  pageHeight: 340,
+  spreadWidth: 578,
+  spreadPages: 1,
+  left: 81,
+  top: 0,
+  shape: 'sheet',
+};
 
 const pageFlip = vi.hoisted(() => ({
   currentPage: 0,
@@ -46,20 +77,26 @@ function installPageFlipBehavior() {
   pageFlip.turnToPage.mockImplementation((page: number) => {
     // Real page-flip: out-of-range turn is a silent no-op.
     if (!Number.isInteger(page) || page < 0 || page >= pageFlip.pageCount) return;
-    pageFlip.currentPage = page;
+    // Landscape + showCover=false: PageCollection.show(n) maps n into its
+    // spread ([0,1], [2,3], …) and showSpread sets currentPageIndex=spread[0].
+    // turnToPage(1) therefore lands on 0 and emits flip 0 — not page 1.
+    const normalized = page % 2 === 0 ? page : page - 1;
+    pageFlip.currentPage = normalized;
     pageFlip.blank = false;
-    flipBookProbe.onFlip?.({ data: page });
+    flipBookProbe.onFlip?.({ data: normalized });
   });
   pageFlip.getCurrentPageIndex.mockImplementation(() => pageFlip.currentPage);
   pageFlip.flipNext.mockImplementation(() => {
     const next = Math.min(pageFlip.currentPage + 2, Math.max(0, pageFlip.pageCount - 1));
-    pageFlip.currentPage = next;
+    const normalized = next % 2 === 0 ? next : next - 1;
+    pageFlip.currentPage = normalized;
     pageFlip.blank = false;
     flipBookProbe.onFlip?.({ data: pageFlip.currentPage });
   });
   pageFlip.turnToNextPage.mockImplementation(() => {
     const next = Math.min(pageFlip.currentPage + 2, Math.max(0, pageFlip.pageCount - 1));
-    pageFlip.currentPage = next;
+    const normalized = next % 2 === 0 ? next : next - 1;
+    pageFlip.currentPage = normalized;
     pageFlip.blank = false;
     flipBookProbe.onFlip?.({ data: pageFlip.currentPage });
   });
@@ -71,6 +108,9 @@ vi.mock('next/dynamic', async () => {
     { pageFlip(): typeof pageFlip },
     React.PropsWithChildren<{
       flippingTime: number;
+      width: number;
+      height: number;
+      minWidth: number;
       onFlip?: (event: { data: number }) => void;
       onInit?: () => void;
     }>
@@ -98,6 +138,9 @@ vi.mock('next/dynamic', async () => {
       initialOnInit.current?.();
     }, []);
     flipBookProbe.latestFlippingTime = props.flippingTime;
+    flipBookProbe.latestWidth = props.width;
+    flipBookProbe.latestHeight = props.height;
+    flipBookProbe.latestMinWidth = props.minWidth;
     flipBookProbe.onFlip = props.onFlip ?? null;
     return <div data-testid="flipbook">{props.children}</div>;
   });
@@ -128,6 +171,53 @@ const chapter: ManuscriptChapter = {
 let mediaQuery: MediaQueryList;
 let mediaListeners: Set<(event: MediaQueryListEvent) => void>;
 
+function resetFlipbookTestState() {
+  mediaListeners = new Set();
+  mediaQuery = {
+    matches: false,
+    media: '(prefers-reduced-motion: reduce)',
+    onchange: null,
+    addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      if (typeof listener === 'function') {
+        mediaListeners.add(listener as (event: MediaQueryListEvent) => void);
+      }
+    },
+    removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      if (typeof listener === 'function') {
+        mediaListeners.delete(listener as (event: MediaQueryListEvent) => void);
+      }
+    },
+    addListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
+      if (listener) mediaListeners.add(listener);
+    },
+    removeListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
+      if (listener) mediaListeners.delete(listener);
+    },
+    dispatchEvent: () => true,
+  } as unknown as MediaQueryList;
+  vi.stubGlobal('matchMedia', vi.fn(() => mediaQuery));
+  pageFlip.currentPage = 0;
+  pageFlip.pageCount = 0;
+  pageFlip.blank = false;
+  pageFlip.update.mockReset();
+  pageFlip.flipNext.mockReset();
+  pageFlip.flipPrev.mockReset();
+  pageFlip.turnToNextPage.mockReset();
+  pageFlip.turnToPrevPage.mockReset();
+  pageFlip.turnToPage.mockReset();
+  pageFlip.getCurrentPageIndex.mockReset();
+  installPageFlipBehavior();
+  flipBookProbe.mountCount = 0;
+  flipBookProbe.latestFlippingTime = 0;
+  flipBookProbe.latestWidth = 0;
+  flipBookProbe.latestHeight = 0;
+  flipBookProbe.latestMinWidth = 0;
+  flipBookProbe.onFlip = null;
+  paginationProbe.onContainerResize = null;
+  paginationProbe.charsPerPage = 40;
+  paginationProbe.geometry = { ...BOOK_GEOMETRY };
+}
+
 function setReducedMotion(matches: boolean) {
   Object.defineProperty(mediaQuery, 'matches', { configurable: true, value: matches });
   const event = { matches, media: mediaQuery.media } as MediaQueryListEvent;
@@ -151,56 +241,7 @@ function renderFlipbook() {
 }
 
 describe('ManuscriptReadingView reduced-motion page flips', () => {
-  beforeEach(() => {
-    mediaListeners = new Set();
-    mediaQuery = {
-      matches: false,
-      media: '(prefers-reduced-motion: reduce)',
-      onchange: null,
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (typeof listener === 'function') {
-          mediaListeners.add(listener as (event: MediaQueryListEvent) => void);
-        }
-      },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (typeof listener === 'function') {
-          mediaListeners.delete(listener as (event: MediaQueryListEvent) => void);
-        }
-      },
-      addListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
-        if (listener) mediaListeners.add(listener);
-      },
-      removeListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
-        if (listener) mediaListeners.delete(listener);
-      },
-      dispatchEvent: () => true,
-    } as unknown as MediaQueryList;
-    vi.stubGlobal('matchMedia', vi.fn(() => mediaQuery));
-    pageFlip.currentPage = 0;
-    pageFlip.pageCount = 0;
-    pageFlip.blank = false;
-    pageFlip.update.mockReset();
-    pageFlip.flipNext.mockReset();
-    pageFlip.flipPrev.mockReset();
-    pageFlip.turnToNextPage.mockReset();
-    pageFlip.turnToPrevPage.mockReset();
-    pageFlip.turnToPage.mockReset();
-    pageFlip.getCurrentPageIndex.mockReset();
-    installPageFlipBehavior();
-    flipBookProbe.mountCount = 0;
-    flipBookProbe.latestFlippingTime = 0;
-    flipBookProbe.onFlip = null;
-    paginationProbe.onContainerResize = null;
-    paginationProbe.charsPerPage = 40;
-    paginationProbe.geometry = {
-      pageWidth: 500,
-      pageHeight: 850,
-      spreadWidth: 1000,
-      spreadPages: 2,
-      left: 0,
-      top: 0,
-    };
-  });
+  beforeEach(resetFlipbookTestState);
 
   afterEach(() => {
     cleanup();
@@ -384,6 +425,7 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
       spreadPages: 2,
       left: 0,
       top: 0,
+      shape: 'book',
     };
     const before = paginateManuscript([anchoredChapter], { charsPerPage: 140, chapterTitleReserve: 0 });
     const oldIndex = Math.min(4, before.length - 1);
@@ -415,6 +457,7 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
       spreadPages: 1,
       left: 0,
       top: 0,
+      shape: 'book',
     };
     const after = paginateManuscript([anchoredChapter], { charsPerPage: 220, chapterTitleReserve: 0 });
     const expectedTarget = after.findIndex(page => (
@@ -437,7 +480,8 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
     );
 
     await waitFor(() => expect(pageFlip.turnToPage).toHaveBeenCalledWith(expectedTarget));
-    expect(screen.getByTestId('flipbook').children).toHaveLength(after.length);
+    // Book PageFlip always pads to an even child list for its constructor props.
+    expect(screen.getByTestId('flipbook').children).toHaveLength(evenDisplayPageCount(after.length));
     expect(screen.queryByTestId('flipbook-spine')).toBeNull();
 
     const narrowPage = after[expectedTarget];
@@ -452,6 +496,7 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
       spreadPages: 2,
       left: 0,
       top: 0,
+      shape: 'book',
     };
     const backToDesktop = paginateManuscript(
       [anchoredChapter],
@@ -477,12 +522,12 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
 
     await waitFor(() => expect(pageFlip.turnToPage).toHaveBeenCalledWith(desktopTarget));
     expect(screen.getByTestId('flipbook').children).toHaveLength(
-      backToDesktop.length + (backToDesktop.length % 2),
+      evenDisplayPageCount(backToDesktop.length),
     );
     expect(screen.queryByTestId('flipbook-spine')).not.toBeNull();
   });
 
-  it('does not add a filler page or fake spine in one-page portrait mode', () => {
+  it('keeps the parked book child list even-padded and hides the spine in portrait book mode', () => {
     paginationProbe.geometry = {
       pageWidth: 400,
       pageHeight: 680,
@@ -490,11 +535,12 @@ describe('ManuscriptReadingView reduced-motion page flips', () => {
       spreadPages: 1,
       left: 0,
       top: 0,
+      shape: 'book',
     };
     renderFlipbook();
 
     const realPages = paginateManuscript([chapter], { charsPerPage: 40, chapterTitleReserve: 0 });
-    expect(screen.getByTestId('flipbook').children).toHaveLength(realPages.length);
+    expect(screen.getByTestId('flipbook').children).toHaveLength(evenDisplayPageCount(realPages.length));
     expect(screen.queryByTestId('flipbook-spine')).toBeNull();
   });
 
@@ -572,56 +618,7 @@ function renderLive(props: {
 }
 
 describe('ManuscriptReadingView live-writing follow & suspend', () => {
-  beforeEach(() => {
-    mediaListeners = new Set();
-    mediaQuery = {
-      matches: false,
-      media: '(prefers-reduced-motion: reduce)',
-      onchange: null,
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (typeof listener === 'function') {
-          mediaListeners.add(listener as (event: MediaQueryListEvent) => void);
-        }
-      },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (typeof listener === 'function') {
-          mediaListeners.delete(listener as (event: MediaQueryListEvent) => void);
-        }
-      },
-      addListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
-        if (listener) mediaListeners.add(listener);
-      },
-      removeListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
-        if (listener) mediaListeners.delete(listener);
-      },
-      dispatchEvent: () => true,
-    } as unknown as MediaQueryList;
-    vi.stubGlobal('matchMedia', vi.fn(() => mediaQuery));
-    pageFlip.currentPage = 0;
-    pageFlip.pageCount = 0;
-    pageFlip.blank = false;
-    pageFlip.update.mockReset();
-    pageFlip.flipNext.mockReset();
-    pageFlip.flipPrev.mockReset();
-    pageFlip.turnToNextPage.mockReset();
-    pageFlip.turnToPrevPage.mockReset();
-    pageFlip.turnToPage.mockReset();
-    pageFlip.getCurrentPageIndex.mockReset();
-    installPageFlipBehavior();
-    flipBookProbe.mountCount = 0;
-    flipBookProbe.latestFlippingTime = 0;
-    flipBookProbe.onFlip = null;
-    paginationProbe.onContainerResize = null;
-    paginationProbe.charsPerPage = 40;
-    paginationProbe.geometry = {
-      pageWidth: 500,
-      pageHeight: 850,
-      spreadWidth: 1000,
-      spreadPages: 2,
-      left: 0,
-      top: 0,
-    };
-  });
+  beforeEach(resetFlipbookTestState);
 
   afterEach(() => {
     cleanup();
@@ -962,5 +959,257 @@ describe('ManuscriptReadingView live-writing follow & suspend', () => {
       </LocaleProvider>,
     );
     expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------- Sheet-mode park (no remount) regression suite ---------- */
+
+describe('ManuscriptReadingView sheet-mode park', () => {
+  beforeEach(resetFlipbookTestState);
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps exactly one PageFlip mount across repeated book ↔ sheet transitions', async () => {
+    const { rerender } = renderFlipbook();
+    await waitFor(() => expect(flipBookProbe.mountCount).toBe(1));
+    expect(flipBookProbe.latestWidth).toBe(500);
+    expect(flipBookProbe.latestHeight).toBe(850);
+    expect(flipBookProbe.latestMinWidth).toBe(260);
+
+    for (let i = 0; i < 3; i += 1) {
+      paginationProbe.geometry = { ...SHEET_GEOMETRY };
+      rerender(
+        <LocaleProvider>
+          <ManuscriptReadingView
+            novelId="nv-test"
+            chapters={[chapter]}
+            liveChapter={null}
+            mode="reading-review"
+            activeChapter={null}
+            layout="flipbook"
+            onLayoutChange={() => {}}
+          />
+        </LocaleProvider>,
+      );
+      expect(flipBookProbe.mountCount).toBe(1);
+      expect(flipBookProbe.latestWidth).toBe(500);
+      expect(flipBookProbe.latestHeight).toBe(850);
+      expect(flipBookProbe.latestMinWidth).toBe(260);
+      expect(screen.getByTestId('manuscript-sheet-page')).toBeTruthy();
+
+      paginationProbe.geometry = { ...BOOK_GEOMETRY };
+      rerender(
+        <LocaleProvider>
+          <ManuscriptReadingView
+            novelId="nv-test"
+            chapters={[chapter]}
+            liveChapter={null}
+            mode="reading-review"
+            activeChapter={null}
+            layout="flipbook"
+            onLayoutChange={() => {}}
+          />
+        </LocaleProvider>,
+      );
+      expect(flipBookProbe.mountCount).toBe(1);
+      expect(screen.queryByTestId('manuscript-sheet-page')).toBeNull();
+    }
+  });
+
+  it('exposes only the static sheet page to assistive tech while PageFlip is parked', async () => {
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    renderFlipbook();
+    await waitFor(() => expect(flipBookProbe.mountCount).toBe(1));
+
+    const host = screen.getByTestId('flipbook-host');
+    expect(host.getAttribute('aria-hidden')).toBe('true');
+    expect(host.hasAttribute('inert')).toBe(true);
+    expect(host.className).toContain('pointer-events-none');
+
+    const sheet = screen.getByTestId('manuscript-sheet-page');
+    expect(sheet.getAttribute('aria-hidden')).toBeNull();
+    expect(sheet.textContent).toContain('The First Page');
+    expect(screen.queryByTestId('flipbook-spine')).toBeNull();
+  });
+
+  it('resets the static sheet scroller to top when navigating one real page', async () => {
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    renderFlipbook();
+    await waitFor(() => expect(flipBookProbe.mountCount).toBe(1));
+
+    const realPages = paginateManuscript([chapter], { charsPerPage: 40, chapterTitleReserve: 0 });
+    expect(realPages.length).toBeGreaterThan(1);
+
+    const firstSheet = screen.getByTestId('manuscript-sheet-page');
+    Object.defineProperty(firstSheet, 'scrollHeight', { configurable: true, value: 800 });
+    Object.defineProperty(firstSheet, 'clientHeight', { configurable: true, value: 340 });
+    firstSheet.scrollTop = 137;
+    expect(firstSheet.scrollTop).toBe(137);
+    expect(firstSheet.textContent).toContain(realPages[0].content.slice(0, 24));
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Next' })[0]);
+    await waitFor(() => expect(screen.getByText(`Page 2 of ${realPages.length}`)).toBeTruthy());
+
+    const nextSheet = screen.getByTestId('manuscript-sheet-page');
+    expect(nextSheet).not.toBe(firstSheet);
+    expect(nextSheet.scrollTop).toBe(0);
+    expect(nextSheet.textContent).toContain(realPages[1].content.slice(0, 24));
+    expect(flipBookProbe.mountCount).toBe(1);
+
+    nextSheet.scrollTop = 96;
+    fireEvent.click(screen.getAllByRole('button', { name: 'Previous' })[0]);
+    await waitFor(() => expect(screen.getByText(`Page 1 of ${realPages.length}`)).toBeTruthy());
+
+    const prevSheet = screen.getByTestId('manuscript-sheet-page');
+    expect(prevSheet).not.toBe(nextSheet);
+    expect(prevSheet.scrollTop).toBe(0);
+    expect(prevSheet.textContent).toContain(realPages[0].content.slice(0, 24));
+    expect(flipBookProbe.mountCount).toBe(1);
+  });
+
+  it('advances exactly one real page in sheet mode without parked landscape turnToPage', async () => {
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    const { rerender } = renderFlipbook();
+    await waitFor(() => expect(flipBookProbe.mountCount).toBe(1));
+
+    const realPages = paginateManuscript([chapter], { charsPerPage: 40, chapterTitleReserve: 0 });
+    expect(realPages.length).toBeGreaterThan(2);
+    // Parked book still owns an even child list; the accessible surface is the sheet.
+    expect(screen.getByTestId('flipbook').children).toHaveLength(evenDisplayPageCount(realPages.length));
+    expect(screen.getByText(`Page 1 of ${realPages.length}`)).toBeTruthy();
+
+    // Prove the old controller-driven path cannot advance one page: landscape
+    // turnToPage(1) normalizes to spread [0,1] and reports index 0.
+    pageFlip.turnToPage(1);
+    expect(pageFlip.currentPage).toBe(0);
+    pageFlip.turnToPage.mockClear();
+
+    const next = screen.getAllByRole('button', { name: 'Next' })[0];
+    fireEvent.click(next);
+    expect(pageFlip.flipNext).not.toHaveBeenCalled();
+    expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(`Page 2 of ${realPages.length}`)).toBeTruthy());
+
+    // Stale parked onFlip must not overwrite the sheet page.
+    act(() => flipBookProbe.onFlip?.({ data: 0 }));
+    expect(screen.getByText(`Page 2 of ${realPages.length}`)).toBeTruthy();
+
+    fireEvent.click(next);
+    expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+    expect(pageFlip.flipNext).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(`Page 3 of ${realPages.length}`)).toBeTruthy());
+
+    // Returning to book syncs the parked controller once to the sheet page
+    // (landscape may normalize an odd index to its spread start).
+    pageFlip.turnToPage.mockClear();
+    paginationProbe.geometry = { ...BOOK_GEOMETRY };
+    rerender(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-test"
+          chapters={[chapter]}
+          liveChapter={null}
+          mode="reading-review"
+          activeChapter={null}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+    expect(flipBookProbe.mountCount).toBe(1);
+    await waitFor(() => expect(pageFlip.turnToPage).toHaveBeenCalledWith(2));
+    expect(screen.queryByTestId('manuscript-sheet-page')).toBeNull();
+  });
+
+  it('retains the source passage across book → sheet → book without remounting', async () => {
+    const anchoredChapter: ManuscriptChapter = {
+      id: 'anchor-shape',
+      chapterNumber: 1,
+      title: 'Shape',
+      content: Array.from({ length: 360 }, (_, index) => `word-${index}`).join(' '),
+    };
+    paginationProbe.charsPerPage = 140;
+    const before = paginateManuscript([anchoredChapter], { charsPerPage: 140, chapterTitleReserve: 0 });
+    const oldIndex = Math.min(4, before.length - 1);
+    const sourceOffset = before[oldIndex].sourceStart
+      + Math.floor((before[oldIndex].sourceEnd - before[oldIndex].sourceStart) / 2);
+
+    const { rerender } = render(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-shape"
+          chapters={[anchoredChapter]}
+          liveChapter={null}
+          mode="reading-review"
+          activeChapter={1}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(flipBookProbe.mountCount).toBe(1));
+    pageFlip.currentPage = oldIndex;
+    act(() => flipBookProbe.onFlip?.({ data: oldIndex }));
+    pageFlip.turnToPage.mockClear();
+
+    paginationProbe.charsPerPage = 220;
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    const after = paginateManuscript([anchoredChapter], { charsPerPage: 220, chapterTitleReserve: 0 });
+    const sheetTarget = after.findIndex(page => (
+      sourceOffset >= page.sourceStart && sourceOffset < page.sourceEnd
+    ));
+    expect(sheetTarget).toBeGreaterThanOrEqual(0);
+
+    rerender(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-shape"
+          chapters={[anchoredChapter]}
+          liveChapter={null}
+          mode="reading-review"
+          activeChapter={1}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+
+    expect(flipBookProbe.mountCount).toBe(1);
+    // Sheet restore writes React currentPage; it must not depend on turnToPage.
+    await waitFor(() => expect(screen.getByText(`Page ${sheetTarget + 1} of ${after.length}`)).toBeTruthy());
+    expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+    expect(screen.getByTestId('manuscript-sheet-page')).toBeTruthy();
+
+    const sheetPage = after[sheetTarget];
+    const sheetSourceOffset = sheetPage.sourceStart
+      + Math.floor((sheetPage.sourceEnd - sheetPage.sourceStart) / 2);
+    pageFlip.turnToPage.mockClear();
+    paginationProbe.charsPerPage = 140;
+    paginationProbe.geometry = { ...BOOK_GEOMETRY };
+    const back = paginateManuscript([anchoredChapter], { charsPerPage: 140, chapterTitleReserve: 0 });
+    const bookTarget = back.findIndex(page => (
+      sheetSourceOffset >= page.sourceStart && sheetSourceOffset < page.sourceEnd
+    ));
+
+    rerender(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-shape"
+          chapters={[anchoredChapter]}
+          liveChapter={null}
+          mode="reading-review"
+          activeChapter={1}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+
+    expect(flipBookProbe.mountCount).toBe(1);
+    await waitFor(() => expect(pageFlip.turnToPage).toHaveBeenCalledWith(bookTarget));
+    expect(screen.queryByTestId('manuscript-sheet-page')).toBeNull();
   });
 });

@@ -6,6 +6,7 @@ import React, { useState, useRef, useCallback, useMemo, useEffect, useLayoutEffe
 import { BookOpen, ArrowRight, Scroll } from 'lucide-react';
 
 import {
+  estimateManuscriptCharWidth,
   findPageIndexForSourceOffset,
   paginateManuscript,
   type ManuscriptPage,
@@ -13,6 +14,7 @@ import {
 import { FLIPBOOK_LAYOUT } from '@/lib/flipbook-geometry';
 import { useLanguage } from '@/components/LanguageProvider';
 import { parsePositiveIntegerParam } from '@/lib/route-params';
+import { readManuscriptTypographyFromDocument } from '@/lib/settings';
 import { useToast } from '@/components/Toast';
 import { useDynamicPagination } from '@/hooks/useDynamicPagination';
 import { useGlobalHotkey } from '@/hooks/useGlobalHotkey';
@@ -145,6 +147,8 @@ function ChapterPageContent({ page }: { page: ManuscriptPage | null }) {
 const FlipBookPage = React.memo(
   React.forwardRef<HTMLDivElement, { page: ManuscriptPage | null }>(
     ({ page }, ref) => (
+      // Capacity must fit the page; page-flip disables touch scrolling
+      // (`mobileScrollSupport={false}`), so overflow here is not a safety path.
       <div
         ref={ref}
         className="manuscript-page bg-book-bg-card px-9 py-7 h-full overflow-hidden"
@@ -155,6 +159,26 @@ const FlipBookPage = React.memo(
   ),
 );
 FlipBookPage.displayName = 'FlipBookPage';
+
+/** Real-page identity for the static sheet scroller. Index alone is wrong after
+ *  source-anchor re-pagination; chapter + source bounds remount the overflow
+ *  node so a retained scrollTop cannot leak onto the next page. */
+function staticSheetPageKey(page: ManuscriptPage | null): string {
+  if (!page) return 'sheet-empty';
+  return `${page.chapterNumber}:${page.sourceStart}:${page.sourceEnd}`;
+}
+
+/** Accessible single-page surface used while the PageFlip instance is parked. */
+function StaticSheetPage({ page }: { page: ManuscriptPage | null }) {
+  return (
+    <div
+      data-testid="manuscript-sheet-page"
+      className="manuscript-page bg-book-bg-card px-9 py-7 h-full overflow-y-auto overflow-x-hidden"
+    >
+      <ChapterPageContent page={page} />
+    </div>
+  );
+}
 
 /* ---------- Empty state ---------- */
 
@@ -487,24 +511,55 @@ function FlipbookReadingView({
     bookRef.current?.pageFlip()?.update();
   }, []);
 
+  // Live manuscript metrics from the canonical CSS variables. Settings panel
+  // writes the vars then dispatches `inkmarshal:settings-changed`.
+  const [typography, setTypography] = useState(readManuscriptTypographyFromDocument);
+  useEffect(() => {
+    const refresh = () => setTypography(readManuscriptTypographyFromDocument());
+    refresh();
+    window.addEventListener('inkmarshal:settings-changed', refresh);
+    return () => window.removeEventListener('inkmarshal:settings-changed', refresh);
+  }, []);
+
   // --- Dynamic pagination: measures ONLY the real book viewport below (the
   // centre column between the side rails). The toolbar and rails live outside
   // the measured element, so no fixed "reserve" guess is needed; the
   // ResizeObserver inside the hook re-paginates on window/zoom changes.
+  const averageCharWidth = useMemo(
+    () => estimateManuscriptCharWidth(
+      chapters.map(ch => ch.content).join('\n'),
+      typography.fontSizePx,
+    ),
+    [chapters, typography.fontSizePx],
+  );
   const { containerRef, charsPerPage, titleReserve, geometry } = useDynamicPagination({
-    lineHeight: 30,
+    lineHeight: typography.lineHeightPx,
     charsPerLine: 42,
     titleReserveLines: 5,
     paddingY: 56,
     paddingX: 72,
-    averageCharWidth: 9,
+    averageCharWidth,
     onContainerResize: updateBookLayout,
   });
+
+  // react-pageflip@2.0.3 never destroys global listeners on unmount and never
+  // re-applies constructor sizing. Keep one book-shaped instance for the
+  // reading-view lifetime; sheet mode parks it and overlays a static page.
+  const isSheetMode = geometry.shape === 'sheet';
 
   const bookOverlayStyle = useMemo<React.CSSProperties>(() => ({
     left: geometry.left,
     top: geometry.top,
     width: geometry.spreadWidth,
+    height: geometry.pageHeight,
+  }), [geometry]);
+
+  // Sheet mode always presents one real page, even when sheet geometry would
+  // mathematically fit two full-measure sheets.
+  const sheetOverlayStyle = useMemo<React.CSSProperties>(() => ({
+    left: geometry.left + (geometry.spreadWidth - geometry.pageWidth) / 2,
+    top: geometry.top,
+    width: geometry.pageWidth,
     height: geometry.pageHeight,
   }), [geometry]);
 
@@ -515,21 +570,38 @@ function FlipbookReadingView({
 
   const hasContent = pages.length > 0;
 
+  // PageFlip always uses book (two-page) constructor props, so its child list
+  // always pads to an even spread — including while the instance is parked.
   const displayPages = useMemo(() => {
     const result: (ManuscriptPage | null)[] = [...pages];
     if (result.length === 0) {
-      result.push(null);
-      if (geometry.spreadPages === 2) result.push(null);
-    } else if (geometry.spreadPages === 2 && result.length % 2 !== 0) {
+      result.push(null, null);
+    } else if (result.length % 2 !== 0) {
       result.push(null);
     }
     return result;
-  }, [pages, geometry.spreadPages]);
+  }, [pages]);
 
   const [currentPage, setCurrentPage] = useState(0);
+  const [hasFlipped, setHasFlipped] = useState(false);
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
   const previousPagesRef = useRef(pages);
   const pendingReadingAnchorRef = useRef<{ chapterNumber: number; sourceOffset: number } | null>(null);
+  const wasSheetModeRef = useRef(isSheetMode);
+
+  // Sheet mode owns React currentPage directly. The parked landscape PageFlip
+  // normalizes odd indices to spread starts (show(1) → [0,1] → index 0), so it
+  // cannot be the sheet navigation source of truth.
+  const applyReadingPage = useCallback((pageIndex: number) => {
+    if (pages.length === 0) return;
+    const next = Math.max(0, Math.min(pageIndex, pages.length - 1));
+    setCurrentPage(next);
+    setHasFlipped(true);
+    const page = pages[next];
+    if (page && page.chapterNumber !== activeChapter) {
+      onActiveChapterChange?.(page.chapterNumber);
+    }
+  }, [pages, activeChapter, onActiveChapterChange]);
 
   // Capture the centre of the currently visible source range before new page
   // boundaries replace it. A numeric page index is not a stable reading
@@ -589,12 +661,16 @@ function FlipbookReadingView({
 
   const jumpToLatestContentPage = useCallback(() => {
     if (lastContentPageIndex < 0) return;
+    if (isSheetMode) {
+      applyReadingPage(lastContentPageIndex);
+      return;
+    }
     const pf = bookRef.current?.pageFlip();
     // Always turn — including target 0. After updateFromHtml, page-flip may
     // report index 0 while the display is still blank from an out-of-range show.
     if (!pf) return;
     pf.turnToPage(lastContentPageIndex);
-  }, [lastContentPageIndex]);
+  }, [lastContentPageIndex, isSheetMode, applyReadingPage]);
   const jumpToLatestRef = useRef(jumpToLatestContentPage);
   useEffect(() => {
     jumpToLatestRef.current = jumpToLatestContentPage;
@@ -626,10 +702,12 @@ function FlipbookReadingView({
 
   // Auto-follow the live draft. Writing-live only; review mode is fully
   // manual. Fires whenever pagination grows (one page or several) and right
-  // after a suspension ends.
+  // after a suspension ends. Defer so sheet-mode setState is not sync-in-effect
+  // (book mode turns via PageFlip; sheet mode updates React currentPage).
   useEffect(() => {
     if (mode !== 'writing-live' || !liveChapter || followSuspended) return;
-    jumpToLatestContentPage();
+    const timer = setTimeout(() => jumpToLatestContentPage(), 0);
+    return () => clearTimeout(timer);
   }, [mode, liveChapter, followSuspended, jumpToLatestContentPage]);
 
   // React-pageflip refreshes its internal HTML collection in a passive effect.
@@ -647,24 +725,51 @@ function FlipbookReadingView({
       }
 
       const anchor = pendingReadingAnchorRef.current;
-      const pf = bookRef.current?.pageFlip();
-      if (!anchor || !pf) return;
+      if (!anchor) return;
       const target = findPageIndexForSourceOffset(pages, anchor.chapterNumber, anchor.sourceOffset);
-      // Unconditional turn after collection refresh, including target 0: the
-      // getter can already read 0 while show(oldIndex) no-op'd to a blank page.
-      if (target >= 0) pf.turnToPage(target);
       pendingReadingAnchorRef.current = null;
+      if (target < 0) return;
+      // Sheet mode sets React state directly; book mode must turnToPage even
+      // for target 0 (getter can already read 0 while show(oldIndex) no-op'd).
+      if (isSheetMode) {
+        applyReadingPage(target);
+        return;
+      }
+      const pf = bookRef.current?.pageFlip();
+      if (!pf) return;
+      pf.turnToPage(target);
     }, 0);
 
     return () => clearTimeout(timer);
-  }, [pages, mode, liveChapter, followSuspended, jumpToLatestContentPage]);
+  }, [
+    pages,
+    mode,
+    liveChapter,
+    followSuspended,
+    isSheetMode,
+    applyReadingPage,
+    jumpToLatestContentPage,
+  ]);
 
-  const [hasFlipped, setHasFlipped] = useState(false);
+  // After leaving sheet mode, sync the parked landscape controller once so the
+  // visible spread contains the sheet page. Skip when a source-anchor restore
+  // already owns the turn.
+  useEffect(() => {
+    const wasSheet = wasSheetModeRef.current;
+    wasSheetModeRef.current = isSheetMode;
+    if (!wasSheet || isSheetMode || !hasContent) return;
+    if (pendingReadingAnchorRef.current) return;
+    const pf = bookRef.current?.pageFlip();
+    if (!pf) return;
+    pf.turnToPage(Math.min(currentPage, displayPages.length - 1));
+  }, [isSheetMode, hasContent, currentPage, displayPages.length]);
 
   // onFlip is a passive sync: it records the current page and mirrors the
   // chapter into the sidebar. It must NOT infer user intent — programmatic
   // turns fire it too, so suspending follow here would break auto-follow.
+  // Ignore while sheet-parked: landscape show() can emit stale spread starts.
   const handleFlip = useCallback((e: { data: number }) => {
+    if (isSheetMode) return;
     setCurrentPage(e.data);
     setHasFlipped(true);
     // Map page → chapterNumber for sidebar sync
@@ -672,10 +777,16 @@ function FlipbookReadingView({
     if (page && page.chapterNumber !== activeChapter) {
       onActiveChapterChange?.(page.chapterNumber);
     }
-  }, [pages, activeChapter, onActiveChapterChange]);
+  }, [isSheetMode, pages, activeChapter, onActiveChapterChange]);
 
   const flipNext = useCallback(() => {
     if (!hasContent) return;
+    if (isSheetMode) {
+      if (currentPage >= pages.length - 1) return;
+      suspendFollow();
+      applyReadingPage(currentPage + 1);
+      return;
+    }
     const pf = bookRef.current?.pageFlip();
     if (!pf) return;
     const cur = pf.getCurrentPageIndex();
@@ -683,10 +794,25 @@ function FlipbookReadingView({
     suspendFollow();
     if (prefersReducedMotion) pf.turnToNextPage();
     else pf.flipNext();
-  }, [hasContent, displayPages.length, prefersReducedMotion, suspendFollow]);
+  }, [
+    hasContent,
+    isSheetMode,
+    currentPage,
+    pages.length,
+    displayPages.length,
+    prefersReducedMotion,
+    suspendFollow,
+    applyReadingPage,
+  ]);
 
   const flipPrev = useCallback(() => {
     if (!hasContent) return;
+    if (isSheetMode) {
+      if (currentPage <= 0) return;
+      suspendFollow();
+      applyReadingPage(currentPage - 1);
+      return;
+    }
     const pf = bookRef.current?.pageFlip();
     if (!pf) return;
     const cur = pf.getCurrentPageIndex();
@@ -694,7 +820,14 @@ function FlipbookReadingView({
     suspendFollow();
     if (prefersReducedMotion) pf.turnToPrevPage();
     else pf.flipPrev();
-  }, [hasContent, prefersReducedMotion, suspendFollow]);
+  }, [
+    hasContent,
+    isSheetMode,
+    currentPage,
+    prefersReducedMotion,
+    suspendFollow,
+    applyReadingPage,
+  ]);
 
   // Arrow keys flip pages. We delegate the input-focus skip to
   // useGlobalHotkey so it walks `isContentEditable` ancestors too —
@@ -711,11 +844,15 @@ function FlipbookReadingView({
   const turnToChapterStart = useCallback((chapterNumber: number): boolean => {
     const target = pages.findIndex(p => p.chapterNumber === chapterNumber && p.isFirstOfChapter);
     if (target < 0) return false;
+    if (isSheetMode) {
+      applyReadingPage(target);
+      return true;
+    }
     const pf = bookRef.current?.pageFlip();
     if (!pf) return false;
     if (pf.getCurrentPageIndex() !== target) pf.turnToPage(target);
     return true;
-  }, [pages]);
+  }, [pages, isSheetMode, applyReadingPage]);
 
   const selectionStateRef = useRef<{ seq: number; chapterNumber: number; done: boolean } | null>(null);
 
@@ -744,8 +881,11 @@ function FlipbookReadingView({
 
   const { t } = useLanguage();
   const totalPages = pages.length;
+  const navigationLastIndex = isSheetMode
+    ? Math.max(0, pages.length - 1)
+    : Math.max(0, displayPages.length - 1);
   const boundedCurrentPage = hasContent
-    ? Math.min(currentPage, Math.max(0, displayPages.length - 1))
+    ? Math.min(currentPage, navigationLastIndex)
     : 0;
 
   const pageInfo = hasContent
@@ -753,7 +893,8 @@ function FlipbookReadingView({
     : t.manuscriptEmpty;
 
   const isAtStart = !hasContent || boundedCurrentPage <= 0;
-  const isAtEnd = !hasContent || boundedCurrentPage >= displayPages.length - 1;
+  const isAtEnd = !hasContent || boundedCurrentPage >= navigationLastIndex;
+  const sheetPage = pages[boundedCurrentPage] ?? null;
 
   // Single page indicator: it lives in the toolbar at every width. The prev/
   // next buttons render twice — in the toolbar below xl and inside the fixed
@@ -820,34 +961,50 @@ function FlipbookReadingView({
         >
           {hasContent ? (
             <>
-              {/* @ts-expect-error — dynamic import typing */}
-              <HTMLFlipBook
-                ref={bookRef}
-                width={FLIPBOOK_LAYOUT.pageWidth}
-                height={FLIPBOOK_LAYOUT.pageHeight}
-                size="stretch"
-                minWidth={FLIPBOOK_LAYOUT.minPageWidth}
-                maxWidth={FLIPBOOK_LAYOUT.maxPageWidth}
-                minHeight={FLIPBOOK_LAYOUT.minPageHeight}
-                autoSize={false}
-                drawShadow={true}
-                maxShadowOpacity={0.45}
-                flippingTime={FLIP_TIME_MS}
-                usePortrait={true}
-                showCover={false}
-                showPageCorners={false}
-                mobileScrollSupport={false}
-                swipeDistance={30}
-                onInit={handleBookInit}
-                onFlip={handleFlip}
-                className="manuscript-flipbook"
+              <div
+                data-testid="flipbook-host"
+                className={isSheetMode ? 'pointer-events-none absolute inset-0 opacity-0' : 'h-full w-full'}
+                aria-hidden={isSheetMode || undefined}
+                {...(isSheetMode ? ({ inert: true } as React.HTMLAttributes<HTMLDivElement>) : {})}
               >
-                {displayPages.map((page, i) => (
-                  <FlipBookPage key={i} page={page} />
-                ))}
-              </HTMLFlipBook>
+                {/* @ts-expect-error — dynamic import typing */}
+                <HTMLFlipBook
+                  ref={bookRef}
+                  width={FLIPBOOK_LAYOUT.pageWidth}
+                  height={FLIPBOOK_LAYOUT.pageHeight}
+                  size="stretch"
+                  minWidth={FLIPBOOK_LAYOUT.minPageWidth}
+                  maxWidth={FLIPBOOK_LAYOUT.maxPageWidth}
+                  minHeight={FLIPBOOK_LAYOUT.minPageHeight}
+                  autoSize={false}
+                  drawShadow={true}
+                  maxShadowOpacity={0.45}
+                  flippingTime={FLIP_TIME_MS}
+                  usePortrait={true}
+                  showCover={false}
+                  showPageCorners={false}
+                  mobileScrollSupport={false}
+                  swipeDistance={30}
+                  onInit={handleBookInit}
+                  onFlip={handleFlip}
+                  className="manuscript-flipbook"
+                >
+                  {displayPages.map((page, i) => (
+                    <FlipBookPage key={i} page={page} />
+                  ))}
+                </HTMLFlipBook>
+              </div>
 
-              {geometry.pageHeight > 0 && (
+              {isSheetMode && geometry.pageHeight > 0 && (
+                <div
+                  className="absolute z-10"
+                  style={sheetOverlayStyle}
+                >
+                  <StaticSheetPage key={staticSheetPageKey(sheetPage)} page={sheetPage} />
+                </div>
+              )}
+
+              {!isSheetMode && geometry.pageHeight > 0 && (
                 <div className="pointer-events-none absolute z-10" style={bookOverlayStyle} aria-hidden>
                   {geometry.spreadPages === 2 && (
                     <div data-testid="flipbook-spine" className="hidden md:block absolute left-1/2 top-2 h-[calc(100%-1rem)] w-6 -translate-x-1/2 rounded-full bg-[radial-gradient(circle,_rgba(78,51,23,0.18),_rgba(78,51,23,0.04)_68%,_transparent_100%)]" />

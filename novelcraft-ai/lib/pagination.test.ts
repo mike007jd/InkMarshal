@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { findPageIndexForSourceOffset, paginateManuscript } from '@/lib/pagination';
+import {
+  estimateManuscriptCharWidth,
+  findPageIndexForSourceOffset,
+  paginateManuscript,
+} from '@/lib/pagination';
 
 const sourceChapter = {
   id: 'chapter-anchor',
@@ -56,5 +60,33 @@ describe('manuscript pagination source anchors', () => {
     expect(after[target].sourceEnd).toBeGreaterThan(sourceOffset);
     expect(cjkChapter.content.slice(after[target].sourceStart, after[target].sourceEnd))
       .toContain(cjkChapter.content.slice(sourceOffset, sourceOffset + 1));
+  });
+});
+
+describe('estimateManuscriptCharWidth', () => {
+  it('budgets a full em per character for CJK manuscripts', () => {
+    const cjk = '春江潮水连海平，海上明月共潮生。'.repeat(20);
+    expect(estimateManuscriptCharWidth(cjk)).toBe(17);
+    expect(estimateManuscriptCharWidth(cjk, 19)).toBe(19);
+  });
+
+  it('keeps the Latin budget for English manuscripts', () => {
+    const latin = 'The rain slipped down the neon signs of Shanghai. '.repeat(10);
+    expect(estimateManuscriptCharWidth(latin)).toBe(9);
+    expect(estimateManuscriptCharWidth(latin, 19)).toBeCloseTo(19 * (9 / 17));
+  });
+
+  it('uses the full-em budget when any later CJK appears after a Latin lead-in', () => {
+    // A 4000-char Latin sample would previously under-budget and let trailing
+    // CJK overflow the page.
+    const latinLead = 'The rain slipped down the neon signs of Shanghai. '.repeat(100);
+    const trailingCjk = '春江潮水连海平，海上明月共潮生。'.repeat(40);
+    expect(latinLead.length).toBeGreaterThan(4000);
+    expect(estimateManuscriptCharWidth(latinLead + trailingCjk, 19)).toBe(19);
+  });
+
+  it('falls back to the Latin budget for empty or whitespace-only text', () => {
+    expect(estimateManuscriptCharWidth('')).toBe(9);
+    expect(estimateManuscriptCharWidth('   \n  ')).toBe(9);
   });
 });
