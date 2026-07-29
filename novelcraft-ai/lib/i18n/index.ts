@@ -1,7 +1,15 @@
 import { en } from './en';
 import { zhCN } from './zh-CN';
 import { zhTW } from './zh-TW';
-import { type Locale, LOCALES, DEFAULT_LOCALE, normalizeLocale, isZhLocale, LOCALE_NAMES } from './types';
+import {
+  type Locale,
+  LOCALES,
+  DEFAULT_LOCALE,
+  parseSupportedLocale,
+  normalizeLocale,
+  isZhLocale,
+  LOCALE_NAMES,
+} from './types';
 
 // Widen literal types to string for cross-locale compatibility
 type DeepStringify<T> = {
@@ -34,4 +42,12 @@ export const LOCALE_COOKIE = 'locale';
 export const LOCALE_STORAGE_KEY = 'locale';
 
 // Re-export everything
-export { type Locale, LOCALES, DEFAULT_LOCALE, normalizeLocale, isZhLocale, LOCALE_NAMES };
+export {
+  type Locale,
+  LOCALES,
+  DEFAULT_LOCALE,
+  parseSupportedLocale,
+  normalizeLocale,
+  isZhLocale,
+  LOCALE_NAMES,
+};

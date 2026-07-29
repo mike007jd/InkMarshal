@@ -4,7 +4,7 @@ import path from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
-import { normalizeLocale } from '@/lib/i18n/types';
+import { normalizeLocale, parseSupportedLocale } from '@/lib/i18n/types';
 import { getTranslations } from '@/lib/i18n';
 import { en } from '@/lib/i18n/en';
 
@@ -20,6 +20,13 @@ describe('normalizeLocale', () => {
     expect(normalizeLocale('zh-Hant')).toBe('zh-TW');
     expect(normalizeLocale('zh-Hant'.replace('-', '%2D'))).toBe('zh-TW');
     expect(normalizeLocale('javascript:alert(1)')).toBe('en');
+  });
+
+  it('distinguishes unsupported values when callers need a nullable result', () => {
+    expect(parseSupportedLocale('zh%2DHant')).toBe('zh-TW');
+    expect(parseSupportedLocale('')).toBeNull();
+    expect(parseSupportedLocale('not-a-locale')).toBeNull();
+    expect(parseSupportedLocale('%E0%A4%A')).toBeNull();
   });
 });
 

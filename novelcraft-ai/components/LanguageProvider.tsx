@@ -5,11 +5,13 @@ import {
   type Locale,
   type Translations,
   DEFAULT_LOCALE,
+  parseSupportedLocale,
   normalizeLocale,
   getTranslations,
   LOCALE_COOKIE,
   LOCALE_STORAGE_KEY,
 } from '@/lib/i18n';
+import { isTauriRuntime } from '@/lib/desktop-runtime';
 
 interface LocaleContextType {
   locale: Locale;
@@ -32,7 +34,7 @@ function getInitialLocale(): Locale {
 function readCookieLocale(): Locale | null {
   if (typeof document === 'undefined') return null;
   const cookieMatch = document.cookie.match(new RegExp(`(?:^|; )${LOCALE_COOKIE}=([^;]*)`));
-  return cookieMatch ? normalizeLocale(cookieMatch[1]) : null;
+  return cookieMatch ? parseSupportedLocale(cookieMatch[1]) : null;
 }
 
 function readLocalStorage(key: string): string | null {
@@ -64,29 +66,37 @@ export function LocaleProvider({ children }: { children: React.ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(getInitialLocale);
   const [hydrated, setHydrated] = useState(false);
   const explicitLocaleRef = useRef<Locale | null>(null);
+  const nativeLocaleWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
 
-  // On mount: reconcile with localStorage / navigator.language (client-only sources)
+  // On mount: reconcile from client-only sources. Cookie is host+path scoped
+  // (not port), so it is the cross-runtime-port canonical frontend preference;
+  // port-local localStorage is only a same-origin cache and must not outrank it.
   useEffect(() => {
     let mounted = true;
     const applyHydratedLocale = (nextLocale: Locale) => {
       queueMicrotask(() => {
-        if (!mounted || explicitLocaleRef.current !== null) return;
-        setLocaleState(nextLocale);
+        if (!mounted) return;
+        // An explicit setLocale before this microtask already persisted the
+        // chosen language; still mark hydrated so the desktop reveal gate and
+        // post-hydration persist path can proceed.
+        if (explicitLocaleRef.current === null) {
+          setLocaleState(nextLocale);
+        }
         setHydrated(true);
       });
     };
 
-    const saved = readLocalStorage(LOCALE_STORAGE_KEY);
-    if (saved) {
-      applyHydratedLocale(normalizeLocale(saved));
+    const cookieLocale = readCookieLocale();
+    if (cookieLocale) {
+      applyHydratedLocale(cookieLocale);
       return () => {
         mounted = false;
       };
     }
 
-    const cookieLocale = readCookieLocale();
-    if (cookieLocale) {
-      applyHydratedLocale(cookieLocale);
+    const saved = readLocalStorage(LOCALE_STORAGE_KEY);
+    if (saved) {
+      applyHydratedLocale(normalizeLocale(saved));
       return () => {
         mounted = false;
       };
@@ -113,16 +123,36 @@ export function LocaleProvider({ children }: { children: React.ReactNode }) {
   // persisted/OS locale has been applied and React has committed that frame,
   // so users never see an English shell flash before their chosen language.
   useEffect(() => {
-    if (!hydrated || typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return;
+    if (!hydrated || !isTauriRuntime()) return;
     void import('@tauri-apps/api/window')
       .then(({ getCurrentWindow }) => getCurrentWindow().show())
       .catch(() => undefined);
   }, [hydrated]);
 
-  // Sync cookie + localStorage whenever locale changes
+  // Mirror the canonical UI locale into native locale.txt only after hydration
+  // so the SSR-safe default first paint cannot clobber a stored preference.
   useEffect(() => {
+    if (!hydrated || !isTauriRuntime()) return;
+    nativeLocaleWriteQueueRef.current = nativeLocaleWriteQueueRef.current
+      .then(async () => {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('write_app_locale', { locale });
+      })
+      .catch((err: unknown) => {
+        if (typeof console !== 'undefined') {
+          console.warn('Failed to persist locale for menu:', err);
+        }
+      });
+  }, [locale, hydrated]);
+
+  // Persist only after hydration so the SSR-safe default first render cannot
+  // overwrite the cross-port cookie (or heal localStorage with the wrong value)
+  // before the canonical preference is applied. Explicit setLocale persists
+  // immediately on its own path.
+  useEffect(() => {
+    if (!hydrated) return;
     persistLocale(locale);
-  }, [locale]);
+  }, [locale, hydrated]);
 
   const setLocale = useCallback((nextLocale: Locale) => {
     explicitLocaleRef.current = nextLocale;

@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/desktop-runtime', () => ({
+  isTauriRuntime: () => false,
   getDesktopStatus: mocks.getDesktopStatus,
   engineStatus: mocks.engineStatus,
 }));

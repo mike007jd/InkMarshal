@@ -87,7 +87,7 @@ interface DesktopShellProps {
 }
 
 export function DesktopShell({ children }: DesktopShellProps) {
-  const { t, locale } = useLanguage();
+  const { t } = useLanguage();
   const { toast } = useToast();
   const router = useRouter();
   const params = useParams();
@@ -296,25 +296,6 @@ export function DesktopShell({ children }: DesktopShellProps) {
           '{roles}',
           modelCoverage.notReadyRoles.map(role => roleChipLabel(role, t)).join(', '),
         );
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        if (cancelled) return;
-        await invoke('write_app_locale', { locale });
-      } catch (err) {
-        if (typeof console !== 'undefined') {
-          console.warn('Failed to persist locale for menu:', err);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [locale]);
 
   const searchScope = useMemo<NovelListScope>(() => ({
     kind: 'novel-list',
