@@ -179,7 +179,7 @@ export async function executeStartWriting(
       phase: 'preparing',
       progress: Math.max(0, novel.progress),
       completedChapters: existingChapters.length,
-      message: isZhLocale(language) ? '正在准备写作上下文...' : 'Preparing writing context...',
+      message: isZhLocale(language) ? '正在准备写作上下文…' : 'Preparing writing context...',
     });
     await updateNovel(id, { stage: 'autonomous_writing', progress: 5 });
     latestProgress = 5;
@@ -188,9 +188,9 @@ export async function executeStartWriting(
       phase: 'planning',
       progress: 5,
       completedChapters: existingChapters.length,
-      message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...',
+      message: isZhLocale(language) ? '正在规划章节蓝图…' : 'Planning chapter blueprint...',
     });
-    sink.emit({ type: 'progress', progress: 5, message: isZhLocale(language) ? '正在规划章节蓝图...' : 'Planning chapter blueprint...' });
+    sink.emit({ type: 'progress', progress: 5, message: isZhLocale(language) ? '正在规划章节蓝图…' : 'Planning chapter blueprint...' });
 
     const blueprint = await loadOrGenerateBlueprint({
       novelId: id,
@@ -226,7 +226,7 @@ export async function executeStartWriting(
       type: 'progress',
       progress: progressForCompleted(completedChapters),
       message: isZhLocale(language)
-        ? `蓝图就绪，共 ${blueprint.chapters.length} 章，剩余 ${chaptersToWrite.length} 章待写...`
+        ? `蓝图就绪，共 ${blueprint.chapters.length} 章，剩余 ${chaptersToWrite.length} 章待写…`
         : `Blueprint ready: ${blueprint.chapters.length} chapters. ${chaptersToWrite.length} chapters remaining...`,
     });
 

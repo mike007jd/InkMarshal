@@ -17,15 +17,17 @@ import {
 } from '@/lib/db';
 import {
   getNovelVault,
-  setNovelVaultPath,
+  bindNovelVaultRoot,
   clearNovelVaultPath,
   getKnowledgeIndexRowByPath,
+  isVaultRootPending,
   replaceVaultKnowledgeProjection,
 } from '@/lib/db/queries-vault';
+import { withNovelVaultRootLock } from '@/lib/vault/root-lock';
+import type { VaultRootFence } from '@/lib/vault/types';
 import {
   listKnowledgeIndexForNovel,
   getKnowledgeIndexById,
-  deleteKnowledgeEmbedding,
 } from '@/lib/db/queries-knowledge-vault';
 import {
   invalidateEmbeddingCache,
@@ -52,7 +54,10 @@ import {
 import { isUuid, nowIso, parseJsonField } from '@/lib/utils';
 import type { VaultEntry } from '@/lib/vault/entry';
 import type { KnowledgeEntryRow } from '@/lib/db/queries-knowledge';
-import { getKnowledgeVaultOutboxIntent } from '@/lib/db/queries-knowledge-vault-outbox';
+import {
+  enqueueKnowledgeVaultUpsertForCurrentEntry,
+  getKnowledgeVaultOutboxIntent,
+} from '@/lib/db/queries-knowledge-vault-outbox';
 import {
   tryDeleteKnowledgeEntryFromVault,
   trySyncKnowledgeEntryToVault,
@@ -71,6 +76,13 @@ export interface VaultChangedFileInput {
 
 export interface VaultReconcileOptions {
   deletedPathsHint?: string[];
+  /**
+   * When false, pending outbox upserts do not force DB→Vault replay. Used by
+   * pending-root non-destructive import so newer Markdown can win by updatedAt.
+   */
+  allowUpsertMirrorReplay?: boolean;
+  /** Fixed pending-root generation captured before reading this batch. */
+  rootFence?: VaultRootFence;
 }
 
 export interface VaultIndexedEntryRef {
@@ -111,14 +123,38 @@ export async function setNovelVaultPathAction(novelId: string, vaultPath: string
   const user = await getUser();
   if (!user?.id) throw new Error('Local user context missing');
   await verifyNovelOwnership(novelId, user.id);
-  await setNovelVaultPath(novelId, validateVaultPathInput(vaultPath));
+  const validated = validateVaultPathInput(vaultPath);
+  await withNovelVaultRootLock(novelId, async () => {
+    await bindNovelVaultRoot(novelId, validated);
+  });
+}
+
+/**
+ * Pending-root transition: non-destructive import → missing-only projection →
+ * CAS promote. Callers should pass the fixed root+token for this attempt.
+ */
+export async function bootstrapNovelVaultRootAction(
+  novelId: string,
+  fence?: VaultRootFence,
+): Promise<{
+  vaultPath: string | null;
+  allowMissingFileDeletes: boolean;
+  transitionToken: number | null;
+}> {
+  const user = await getUser();
+  if (!user?.id) throw new Error('Local user context missing');
+  await verifyNovelOwnership(novelId, user.id);
+  const { prepareVaultRootForReconcile } = await import('@/lib/vault/root-bootstrap');
+  return prepareVaultRootForReconcile(novelId, fence);
 }
 
 export async function clearNovelVaultPathAction(novelId: string): Promise<void> {
   const user = await getUser();
   if (!user?.id) throw new Error('Local user context missing');
   await verifyNovelOwnership(novelId, user.id);
-  await clearNovelVaultPath(novelId);
+  await withNovelVaultRootLock(novelId, async () => {
+    await clearNovelVaultPath(novelId);
+  });
 }
 
 export async function reconcileVaultChangedFiles(
@@ -131,13 +167,42 @@ export async function reconcileVaultChangedFiles(
   await verifyNovelOwnership(novelId, user.id);
 
   const changes = normalizeVaultChangedFiles(files);
+  const reconcileOptions = normalizeVaultReconcileOptions(options);
+  if (reconcileOptions.rootFence) {
+    return withNovelVaultRootLock(novelId, async () => {
+      const current = await getNovelVault(novelId);
+      if (
+        !current?.vaultPath
+        || current.vaultPath !== reconcileOptions.rootFence!.expectedRoot
+        || current.vaultVersion !== reconcileOptions.rootFence!.expectedToken
+        || !isVaultRootPending(current.vaultVersion)
+      ) {
+        throw new Error('Vault root changed during pending reconcile');
+      }
+      return reconcileNormalizedVaultChanges(novelId, changes, reconcileOptions, true);
+    });
+  }
+  return reconcileNormalizedVaultChanges(novelId, changes, reconcileOptions, false);
+}
+
+async function reconcileNormalizedVaultChanges(
+  novelId: string,
+  changes: VaultChangedFileInput[],
+  reconcileOptions: VaultReconcileOptions,
+  fencedPendingImport: boolean,
+): Promise<{ updated: number; deleted: number; skipped: number }> {
+  const allowUpsertMirrorReplay = reconcileOptions.allowUpsertMirrorReplay !== false;
+  const vault = await getNovelVault(novelId);
+  const deleteEligible = !vault || !isVaultRootPending(vault.vaultVersion);
   const deletedPaths = new Set(
-    [
-      ...changes
-        .filter(change => change.content === null)
-        .map(change => change.path),
-      ...(normalizeVaultReconcileOptions(options).deletedPathsHint ?? []),
-    ],
+    deleteEligible
+      ? [
+          ...changes
+            .filter(change => change.content === null)
+            .map(change => change.path),
+          ...(reconcileOptions.deletedPathsHint ?? []),
+        ]
+      : [],
   );
   const incoming = collectIncomingVaultEntries(novelId, changes);
   const incomingIdsByPath = incoming.idsByPath;
@@ -157,6 +222,12 @@ export async function reconcileVaultChangedFiles(
     try {
       const previousIndex = await getKnowledgeIndexRowByPath(novelId, change.path);
       if (change.content === null) {
+        // Pending roots are never delete-eligible — retain DB rows until
+        // promotion; runtime will replay remove/rename after establish.
+        if (!deleteEligible) {
+          skipped++;
+          continue;
+        }
         const intent = getKnowledgeVaultOutboxIntent(
           novelId,
           previousIndex?.id ?? null,
@@ -186,7 +257,7 @@ export async function reconcileVaultChangedFiles(
           const danglingRefCleanup = await collectDanglingRefCleanup(novelId, previousIndex.id);
           await dbDeleteKnowledgeEntry(previousIndex.id, await buildDanglingRefCleanupUpdates(danglingRefCleanup));
           invalidateEmbeddingCache(novelId);
-          await refreshCleanedDanglingRefs(novelId, danglingRefCleanup);
+          scheduleCleanedDanglingRefRefreshes(novelId, danglingRefCleanup);
           deleted++;
         }
         continue;
@@ -200,6 +271,12 @@ export async function reconcileVaultChangedFiles(
       const { entry, projection } = parsed;
       const intent = getKnowledgeVaultOutboxIntent(novelId, entry.id, change.path);
       if (intent?.operation === 'delete') {
+        if (fencedPendingImport) {
+          // The durable tombstone wins, but pending-root import is read-only
+          // toward the filesystem. Established drain removes it afterward.
+          updated++;
+          continue;
+        }
         await tryDeleteKnowledgeEntryFromVault(
           novelId,
           intent.entryId,
@@ -209,7 +286,7 @@ export async function reconcileVaultChangedFiles(
         deleted++;
         continue;
       }
-      if (intent?.operation === 'upsert') {
+      if (allowUpsertMirrorReplay && intent?.operation === 'upsert') {
         await trySyncKnowledgeEntryToVault(novelId, intent.entryId, 'reconcileVaultChangedFiles.replayMirror');
         updated++;
         continue;
@@ -233,8 +310,9 @@ export async function reconcileVaultChangedFiles(
         continue;
       }
 
-      const now = normalizeIsoTimestamp(projection.updatedAt) ?? nowIso();
-      const createdAt = normalizeIsoTimestamp(projection.createdAt) ?? now;
+      const proposedUpdatedAt = normalizeIsoTimestamp(projection.updatedAt) ?? nowIso();
+      const proposedUpdatedAtMs = Date.parse(proposedUpdatedAt);
+      const createdAt = normalizeIsoTimestamp(projection.createdAt) ?? proposedUpdatedAt;
       const dataJson = JSON.stringify(projection.data);
       if (dataJson.length > MAX_VAULT_ENTRY_DATA_JSON_LENGTH) {
         skipped++;
@@ -252,9 +330,16 @@ export async function reconcileVaultChangedFiles(
           deletedPaths.has(existingIndexForId.path)
         ) &&
         Number.isFinite(Date.parse(existing.updated_at)) &&
-        Number.isFinite(Date.parse(now)) &&
-        Date.parse(now) <= Date.parse(existing.updated_at)
+        Number.isFinite(proposedUpdatedAtMs) &&
+        proposedUpdatedAtMs < Date.parse(existing.updated_at)
       ) {
+        if (fencedPendingImport) {
+          // Bootstrap applies this DB-newer mirror after releasing the root
+          // lock, using the same expected root and generation.
+          enqueueKnowledgeVaultUpsertForCurrentEntry(entry.id);
+          updated++;
+          continue;
+        }
         await trySyncKnowledgeEntryToVault(novelId, entry.id, 'reconcileVaultChangedFiles.rejectStaleMirror');
         updated++;
         continue;
@@ -287,7 +372,7 @@ export async function reconcileVaultChangedFiles(
           sortOrder,
           tags: JSON.stringify(projection.tags),
           createdAt,
-          updatedAt: now,
+          updatedAt: proposedUpdatedAt,
         },
         index: {
           id: entry.id,
@@ -301,16 +386,15 @@ export async function reconcileVaultChangedFiles(
           data: dataJson,
           outgoingLinks: JSON.stringify(outgoingLinksFor(entry)),
           contentHash,
-          updatedAt: now,
+          updatedAt: proposedUpdatedAt,
         },
         cleanupUpdates: await buildDanglingRefCleanupUpdates(danglingRefCleanup),
       });
       if (replacedPreviousId) {
         invalidateEmbeddingCache(novelId);
-        await refreshCleanedDanglingRefs(novelId, danglingRefCleanup);
+        scheduleCleanedDanglingRefRefreshes(novelId, danglingRefCleanup);
       }
       if (!previousIndex || previousIndex.id !== entry.id || previousIndex.contentHash !== contentHash) {
-        await deleteKnowledgeEmbedding(entry.id);
         invalidateEmbeddingCache(novelId);
         queueMicrotask(() => {
           void upsertEntryEmbedding(entry.id);
@@ -397,24 +481,21 @@ async function buildDanglingRefCleanupUpdates(dirty: DanglingRefCleanup[]) {
   }));
 }
 
-async function refreshCleanedDanglingRefs(
+function scheduleCleanedDanglingRefRefreshes(
   novelId: string,
   dirty: DanglingRefCleanup[],
-): Promise<void> {
+): void {
   if (dirty.length === 0) return;
 
-  await Promise.all(dirty.map(async item => {
-    try {
-      await deleteKnowledgeEmbedding(item.row.id);
-      invalidateEmbeddingCache(novelId);
-      queueMicrotask(() => {
-        void upsertEntryEmbedding(item.row.id);
-      });
-    } catch (err) {
-      invalidateEmbeddingCache(novelId);
-      console.warn('[vault/reconcile] failed to refresh cleaned dangling ref', item.row.id, err);
-    }
-  }));
+  // The transaction already removed every stale vector. A crash can now leave
+  // a safe missing vector to rebuild, never a vector for relations that no
+  // longer exist.
+  invalidateEmbeddingCache(novelId);
+  for (const item of dirty) {
+    queueMicrotask(() => {
+      void upsertEntryEmbedding(item.row.id);
+    });
+  }
 }
 
 function normalizeVaultChangedFiles(files: unknown): VaultChangedFileInput[] {
@@ -440,15 +521,56 @@ function normalizeVaultChangedFiles(files: unknown): VaultChangedFileInput[] {
 function normalizeVaultReconcileOptions(options: unknown): VaultReconcileOptions {
   if (!options || typeof options !== 'object') return {};
   const record = options as Record<string, unknown>;
+  const allowUpsertMirrorReplay = record.allowUpsertMirrorReplay === false
+    ? false
+    : record.allowUpsertMirrorReplay === true
+      ? true
+      : undefined;
+  const rootFence = normalizeVaultRootFence(record.rootFence);
+  const effectiveAllowUpsertMirrorReplay = rootFence
+    ? false
+    : allowUpsertMirrorReplay;
   const rawHints = record.deletedPathsHint;
-  if (rawHints === undefined) return {};
+  if (rawHints === undefined) {
+    return {
+      ...(effectiveAllowUpsertMirrorReplay === undefined
+        ? {}
+        : { allowUpsertMirrorReplay: effectiveAllowUpsertMirrorReplay }),
+      ...(rootFence ? { rootFence } : {}),
+    };
+  }
   if (!Array.isArray(rawHints) || rawHints.length > MAX_VAULT_DELETED_PATH_HINTS) {
     throw new Error('Invalid vault reconcile options');
   }
   const deletedPathsHint = Array.from(new Set(
     rawHints.map(path => validateVaultRelativeMarkdownPath(path)),
   ));
-  return { deletedPathsHint };
+  return {
+    deletedPathsHint,
+    ...(effectiveAllowUpsertMirrorReplay === undefined
+      ? {}
+      : { allowUpsertMirrorReplay: effectiveAllowUpsertMirrorReplay }),
+    ...(rootFence ? { rootFence } : {}),
+  };
+}
+
+function normalizeVaultRootFence(value: unknown): VaultRootFence | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object') {
+    throw new Error('Invalid Vault root fence');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.expectedRoot !== 'string'
+    || !Number.isSafeInteger(record.expectedToken)
+    || (record.expectedToken as number) >= 0
+  ) {
+    throw new Error('Invalid Vault root fence');
+  }
+  return {
+    expectedRoot: validateVaultPathInput(record.expectedRoot),
+    expectedToken: record.expectedToken as number,
+  };
 }
 
 function validateVaultRelativeMarkdownPath(path: unknown): string {

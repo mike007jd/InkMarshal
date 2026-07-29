@@ -11,10 +11,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tauri::command]
 pub fn vault_read_file(vault_path: String, rel_path: String) -> Result<VaultReadResult, String> {
-    let root = vault_root(&vault_path)?;
+    let root =
+        vault_root(&vault_path).map_err(|error| format!("VAULT_ROOT_UNREACHABLE: {error}"))?;
     let rel = safe_entry_rel_path(&rel_path)?;
     let abs = root.join(&rel);
-    let resolved = ensure_regular_file_inside(&root, &abs)?;
+    let resolved = match ensure_regular_file_inside(&root, &abs) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let entry_is_missing = std::fs::symlink_metadata(&abs)
+                .err()
+                .map(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false);
+            if !entry_is_missing {
+                return Err(error);
+            }
+            // Re-check the authenticated root before authorizing an entry
+            // tombstone. A missing/unmounted root is not evidence that every
+            // file beneath it was deleted.
+            if let Err(root_error) = vault_root(&vault_path) {
+                return Err(format!("VAULT_ROOT_UNREACHABLE: {root_error}"));
+            }
+            return Err(format!(
+                "VAULT_ENTRY_NOT_FOUND: Cannot stat '{}': No such file or directory",
+                abs.display()
+            ));
+        }
+    };
     let md = std::fs::metadata(&resolved)
         .map_err(|e| format!("Cannot stat '{}': {e}", abs.display()))?;
     if md.len() > MAX_VAULT_ENTRY_FILE_BYTES {

@@ -18,8 +18,10 @@ import {
   completeKnowledgeVaultUpsert,
   enqueueKnowledgeVaultDeleteIntent,
   enqueueKnowledgeVaultUpsertForCurrentEntry,
+  getKnowledgeVaultOutboxRow,
   recordKnowledgeVaultFailure,
 } from '@/lib/db/queries-knowledge-vault-outbox';
+import type { VaultRootFence } from '@/lib/vault/types';
 
 export interface KnowledgeEntryWriteFields {
   title?: string;
@@ -52,20 +54,110 @@ function warnVaultSyncFailure(action: string, error: unknown): void {
   console.warn('[knowledge] vault markdown sync failed', { action }, error);
 }
 
+const vaultEntryWriteTails = new Map<string, Promise<void>>();
+
+/**
+ * File I/O cannot participate in the SQLite transaction. Serialize attempts
+ * for one entry so an older write can never finish after a newer upsert/delete
+ * and leave Markdown stale even though revision CAS protected the outbox row.
+ */
+async function withVaultEntryWriteLock(
+  entryId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const previous = vaultEntryWriteTails.get(entryId) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(task);
+  const tail = run.then(() => undefined, () => undefined);
+  vaultEntryWriteTails.set(entryId, tail);
+  try {
+    await run;
+  } finally {
+    if (vaultEntryWriteTails.get(entryId) === tail) {
+      vaultEntryWriteTails.delete(entryId);
+    }
+  }
+}
+
+/**
+ * Attempt a vault upsert for an already-enqueued intent revision without
+ * re-enqueueing (drain / deferred-I/O CAS path).
+ */
+export async function attemptKnowledgeVaultUpsert(
+  novelId: string,
+  entryId: string,
+  intentRevision: number,
+  action: string,
+  fence?: VaultRootFence,
+): Promise<void> {
+  await withVaultEntryWriteLock(entryId, async () => {
+    const current = getKnowledgeVaultOutboxRow(entryId);
+    if (
+      current?.operation !== 'upsert'
+      || current.status !== 'pending'
+      || current.intentRevision !== intentRevision
+    ) {
+      return;
+    }
+    try {
+      const result = await syncKnowledgeEntryToVault(novelId, entryId, fence);
+      if (result === 'skipped_unbound' || result === 'skipped_stale_root') {
+        // Leave the durable intent pending until a root is configured /
+        // the active transition generation matches.
+        return;
+      }
+      // written or skipped_missing_entry (stale intent after hard DB delete)
+      completeKnowledgeVaultUpsert(entryId, intentRevision);
+    } catch (error) {
+      recordKnowledgeVaultFailure(entryId, intentRevision, error);
+      warnVaultSyncFailure(action, error);
+    }
+  });
+}
+
+/**
+ * Attempt a vault delete for an already-enqueued intent revision without
+ * re-enqueueing (drain / deferred-I/O CAS path).
+ */
+export async function attemptKnowledgeVaultDelete(
+  novelId: string,
+  entryId: string,
+  relPath: string | null,
+  intentRevision: number,
+  action: string,
+  fence?: VaultRootFence,
+): Promise<void> {
+  await withVaultEntryWriteLock(entryId, async () => {
+    const current = getKnowledgeVaultOutboxRow(entryId);
+    if (
+      current?.operation !== 'delete'
+      || current.status !== 'pending'
+      || current.intentRevision !== intentRevision
+    ) {
+      return;
+    }
+    try {
+      const result = await deleteKnowledgeEntryFromVault(novelId, entryId, relPath, fence);
+      if (result === 'skipped_unbound' || result === 'skipped_stale_root') {
+        return;
+      }
+      completeKnowledgeVaultDelete(entryId, intentRevision);
+    } catch (error) {
+      recordKnowledgeVaultFailure(entryId, intentRevision, error);
+      warnVaultSyncFailure(action, error);
+    }
+  });
+}
+
 /** Attempt the durable mirror intent without making Vault the source of truth. */
 export async function trySyncKnowledgeEntryToVault(
   novelId: string,
   entryId: string,
   action: string,
+  fence?: VaultRootFence,
 ): Promise<void> {
-  enqueueKnowledgeVaultUpsertForCurrentEntry(entryId);
-  try {
-    await syncKnowledgeEntryToVault(novelId, entryId);
-    completeKnowledgeVaultUpsert(entryId);
-  } catch (error) {
-    recordKnowledgeVaultFailure(entryId, error);
-    warnVaultSyncFailure(action, error);
-  }
+  const intentRevision = enqueueKnowledgeVaultUpsertForCurrentEntry(entryId);
+  if (intentRevision == null) return;
+  await attemptKnowledgeVaultUpsert(novelId, entryId, intentRevision, action, fence);
 }
 
 /** Attempt the durable delete intent while retaining its tombstone. */
@@ -75,14 +167,8 @@ export async function tryDeleteKnowledgeEntryFromVault(
   relPath: string | null,
   action: string,
 ): Promise<void> {
-  enqueueKnowledgeVaultDeleteIntent({ entryId, novelId, relPath });
-  try {
-    await deleteKnowledgeEntryFromVault(novelId, entryId, relPath);
-    completeKnowledgeVaultDelete(entryId);
-  } catch (error) {
-    recordKnowledgeVaultFailure(entryId, error);
-    warnVaultSyncFailure(action, error);
-  }
+  const intentRevision = enqueueKnowledgeVaultDeleteIntent({ entryId, novelId, relPath });
+  await attemptKnowledgeVaultDelete(novelId, entryId, relPath, intentRevision, action);
 }
 
 /**

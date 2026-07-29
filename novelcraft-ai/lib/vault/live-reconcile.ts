@@ -1,9 +1,23 @@
 import { isVaultEntryPath, VAULT_RECONCILE_BATCH } from '@/lib/vault/entry';
-import type { VaultChangedEvent } from '@/lib/vault/types';
+import type { VaultChangedKind } from '@/lib/vault/types';
 
-export interface LiveVaultChangedFile {
+interface LiveVaultChangedFile {
   path: string;
   content: string | null;
+}
+
+export interface LiveVaultCollectOptions {
+  /**
+   * When false, missing remove/rename/other paths are deferred (not emitted as
+   * `content: null`) so a pending root cannot delete canonical SQLite rows.
+   */
+  allowMissingFileDeletes?: boolean;
+}
+
+export interface LiveVaultCollectResult {
+  files: LiveVaultChangedFile[];
+  /** Missing delete-kind paths retained for replay after the root is established. */
+  deferredDeletePaths: string[];
 }
 
 export function chunkLiveVaultMarkdownPaths(paths: string[]): string[][] {
@@ -15,25 +29,47 @@ export function chunkLiveVaultMarkdownPaths(paths: string[]): string[][] {
   return chunks;
 }
 
+/**
+ * Build reconcile payloads from watcher paths. Deletion is determined only from
+ * an explicit missing-file read result for rename/remove/other — a still-readable
+ * path never becomes `content: null` merely because a sibling event was remove.
+ */
 export async function collectLiveVaultChangedFiles(
-  kind: VaultChangedEvent['kind'],
+  kind: VaultChangedKind,
   paths: string[],
   readContent: (relPath: string) => Promise<string>,
-): Promise<LiveVaultChangedFile[]> {
+  options: LiveVaultCollectOptions = {},
+): Promise<LiveVaultCollectResult> {
+  const allowMissingFileDeletes = options.allowMissingFileDeletes !== false;
+  const deferredDeletePaths: string[] = [];
   const files = await Promise.all(paths.map(async relPath => {
-    if (kind === 'remove') return { path: relPath, content: null };
     try {
       return { path: relPath, content: await readContent(relPath) };
     } catch (err) {
-      return kind === 'rename' && isMissingVaultReadError(err)
-        ? { path: relPath, content: null }
-        : null;
+      if (!isMissingVaultReadError(err)) {
+        // Permission/transient I/O is neither content nor proof of deletion.
+        // Fail the batch so the runtime can retain and retry it.
+        throw err;
+      }
+      if (kind === 'remove' || kind === 'rename' || kind === 'other') {
+        if (!allowMissingFileDeletes) {
+          deferredDeletePaths.push(relPath);
+          return null;
+        }
+        return { path: relPath, content: null };
+      }
+      return null;
     }
   }));
-  return files.filter((file): file is LiveVaultChangedFile => Boolean(file));
+  return {
+    files: files.filter((file): file is LiveVaultChangedFile => Boolean(file)),
+    deferredDeletePaths,
+  };
 }
 
 function isMissingVaultReadError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
-  return /cannot stat|no such file|not found|missing/i.test(message);
+  // Only the Rust command's authenticated entry-level absence code authorizes
+  // a destructive DB delete. Root/mount loss and generic I/O remain retryable.
+  return message.startsWith('VAULT_ENTRY_NOT_FOUND:');
 }

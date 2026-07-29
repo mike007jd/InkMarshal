@@ -131,16 +131,30 @@ export interface VaultReachable {
   error?: string | null;
 }
 
+export type VaultChangedKind = 'create' | 'modify' | 'rename' | 'remove' | 'other';
+
 export interface VaultChangedEvent {
   novelId: string;
   paths: string[];
-  kind: 'create' | 'modify' | 'rename' | 'remove' | 'other';
+  kind: VaultChangedKind;
+  /** Watcher instance id; stale watchers must be rejected by the runtime. */
+  watchId: string;
 }
 
 /** Per-novel state stored in SQLite alongside the vault path. */
 export interface NovelVaultRow {
   vaultPath: string | null;
   vaultVersion: number;
+}
+
+/**
+ * Fixed root + transition token captured for one bootstrap / mirror attempt.
+ * `expectedToken <= 0` identifies a pending generation; stale generations must
+ * not write the current root (including ABA B→C→B with a newer token).
+ */
+export interface VaultRootFence {
+  expectedRoot: string;
+  expectedToken: number;
 }
 
 /** Bridge type the existing app code expects (lib/knowledge.ts, etc). */

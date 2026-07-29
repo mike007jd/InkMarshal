@@ -189,7 +189,9 @@ export function ChapterSplitEditor({
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="skip">{copy.actionSkip}</SelectItem>
-                        <SelectItem value="overwrite">{copy.actionOverwrite}</SelectItem>
+                        {dd.matchedChapterNumber !== null && (
+                          <SelectItem value="overwrite">{copy.actionOverwrite}</SelectItem>
+                        )}
                         <SelectItem value="append">{copy.actionAppend}</SelectItem>
                       </SelectContent>
                     </Select>

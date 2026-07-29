@@ -124,6 +124,65 @@ export interface ImportPlanToNovelResult {
   skippedChapters: number;
 }
 
+/** Validate the client report envelope before any target lookup or mutation. */
+function assertMergeDedupeDecisions(
+  chapters: ImportPlan['chapters'],
+  decisions: DedupeDecision[] | undefined,
+): Map<number, DedupeDecision> {
+  if (!decisions) {
+    throw new Error('Merge import requires an explicit dedupe decision for every chapter.');
+  }
+
+  const planNumbers = new Set(chapters.map(chapter => chapter.chapterNumber));
+  if (planNumbers.size !== chapters.length) {
+    throw new Error('Merge import plan contains duplicate chapter numbers.');
+  }
+
+  const decisionByNumber = new Map<number, DedupeDecision>();
+  const overwriteTargets = new Set<number>();
+  for (const decision of decisions) {
+    if (!Number.isInteger(decision.chapterNumber) || decision.chapterNumber <= 0) {
+      throw new Error('Merge import dedupe decisions are incomplete or invalid.');
+    }
+    if (!planNumbers.has(decision.chapterNumber)) {
+      throw new Error('Merge import includes a dedupe decision outside the import plan.');
+    }
+    if (decisionByNumber.has(decision.chapterNumber)) {
+      throw new Error('Merge import includes duplicate dedupe decisions for the same chapter.');
+    }
+    if (decision.action !== 'skip' && decision.action !== 'overwrite' && decision.action !== 'append') {
+      throw new Error('Merge import dedupe decisions are incomplete or invalid.');
+    }
+    if (
+      decision.matchedChapterNumber !== null
+      && (
+        !Number.isInteger(decision.matchedChapterNumber)
+        || decision.matchedChapterNumber <= 0
+      )
+    ) {
+      throw new Error('Merge import dedupe decisions are incomplete or invalid.');
+    }
+    if (decision.action === 'overwrite') {
+      if (decision.matchedChapterNumber === null) {
+        throw new Error('Merge import cannot overwrite without a matched target chapter.');
+      }
+      if (overwriteTargets.has(decision.matchedChapterNumber)) {
+        throw new Error('Merge import cannot overwrite the same target chapter twice.');
+      }
+      overwriteTargets.add(decision.matchedChapterNumber);
+    }
+    decisionByNumber.set(decision.chapterNumber, decision);
+  }
+
+  for (const chapterNumber of planNumbers) {
+    if (!decisionByNumber.has(chapterNumber)) {
+      throw new Error('Merge import requires an explicit dedupe decision for every chapter.');
+    }
+  }
+
+  return decisionByNumber;
+}
+
 /**
  * Transact the corrected plan into a novel. NEW mode creates a novel (stage
  * jumps straight to autonomous_writing — an existing manuscript skips the
@@ -145,6 +204,12 @@ export async function importPlanToNovel(
     throw new Error('Nothing to import.');
   }
 
+  // Merge mode must fail closed before any chapter mutation: missing, duplicate,
+  // or out-of-plan dedupe decisions never silently default to append.
+  const decisionByNumber = input.mode === 'merge'
+    ? assertMergeDedupeDecisions(plan.chapters, input.dedupeDecisions)
+    : new Map<number, DedupeDecision>();
+
   // Resolve the target novel up front (outside the write transaction, since
   // createNovel runs its own transaction).
   let novelId: string;
@@ -159,10 +224,6 @@ export async function importPlanToNovel(
     });
     novelId = created.id;
   }
-
-  const decisionByNumber = new Map(
-    (input.dedupeDecisions ?? []).map(d => [d.chapterNumber, d.action]),
-  );
 
   const db = getDb();
   const now = nowIso();
@@ -195,12 +256,45 @@ export async function importPlanToNovel(
 
   const write = db.transaction(() => {
     // Snapshot existing chapter numbers for merge-mode overwrite detection.
-    const existingNumbers = new Map<number, { content: string }>();
+    const existingNumbers = new Map<number, { title: string; content: string }>();
     if (input.mode === 'merge') {
       const rows = db
-        .prepare('SELECT chapter_number, content FROM chapters WHERE novel_id = ?')
-        .all(novelId) as { chapter_number: number; content: string }[];
-      for (const r of rows) existingNumbers.set(r.chapter_number, { content: r.content });
+        .prepare('SELECT chapter_number, title, content FROM chapters WHERE novel_id = ?')
+        .all(novelId) as { chapter_number: number; title: string; content: string }[];
+      for (const r of rows) {
+        existingNumbers.set(r.chapter_number, { title: r.title, content: r.content });
+      }
+      const serverReport = dedupeCandidates(
+        plan.chapters.map(chapter => ({
+          id: String(chapter.chapterNumber),
+          chapterNumber: chapter.chapterNumber,
+          title: chapter.title,
+          volumeTitle: null,
+          content: chapter.content,
+          wordCount: countWords(chapter.content),
+          inferred: false,
+        })),
+        rows.map(row => ({
+          chapterNumber: row.chapter_number,
+          title: row.title,
+          content: row.content,
+        })),
+      );
+      for (const [index, chapter] of plan.chapters.entries()) {
+        const decision = decisionByNumber.get(chapter.chapterNumber)!;
+        const expected = serverReport[index]!;
+        if (decision.matchedChapterNumber !== expected.matchedChapterNumber) {
+          throw new Error(
+            'Merge import dedupe report is stale or does not match the target novel.',
+          );
+        }
+        if (
+          decision.action === 'overwrite'
+          && !existingNumbers.has(decision.matchedChapterNumber!)
+        ) {
+          throw new Error('Merge import overwrite target no longer exists.');
+        }
+      }
     }
 
     // For merge/append we must not collide with existing chapter numbers; track
@@ -210,9 +304,10 @@ export async function importPlanToNovel(
       : 1;
 
     for (const chapter of plan.chapters) {
-      const action = input.mode === 'merge'
-        ? decisionByNumber.get(chapter.chapterNumber) ?? 'append'
-        : 'append';
+      const decision = input.mode === 'merge'
+        ? decisionByNumber.get(chapter.chapterNumber)!
+        : null;
+      const action = decision?.action ?? 'append';
 
       if (input.mode === 'merge' && action === 'skip') {
         skipped++;
@@ -223,7 +318,7 @@ export async function importPlanToNovel(
       if (input.mode === 'merge' && action === 'overwrite') {
         // Overwrite the matched existing chapter number. Snapshot its current
         // content first so the merge is reversible.
-        targetNumber = chapter.chapterNumber;
+        targetNumber = decision!.matchedChapterNumber!;
         const existing = existingNumbers.get(targetNumber);
         if (existing) {
           appendSafetySnapshot(db, novelId, targetNumber, existing.content, '(before import)');

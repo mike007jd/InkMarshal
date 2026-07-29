@@ -39,7 +39,7 @@ describe('desktop boot smoke (automated-unit)', () => {
     const { createNovel, getNovel } = await import('@/lib/db');
     try {
       const db = getDb();
-      expect(db.pragma('user_version', { simple: true })).toBe(1);
+      expect(db.pragma('user_version', { simple: true })).toBe(19);
       // The DB file was actually created on disk under the data dir.
       expect(existsSync(path.join(tmpDir, 'inkmarshal.db'))).toBe(true);
 

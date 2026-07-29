@@ -1,114 +1,16 @@
-import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
-import path from 'node:path';
-
 import { getKnowledgeEntryById, getKnowledgeRelationsByEntry } from '@/lib/db';
-import { getNovelVault } from '@/lib/db/queries-vault';
+import { getNovelVault, isVaultRootPending } from '@/lib/db/queries-vault';
 import { getKnowledgeIndexById } from '@/lib/db/queries-knowledge-vault';
-import { renderEntryToMarkdown, VAULT_ENTRY_DIRS, type VaultEntry } from '@/lib/vault/entry';
+import { renderEntryToMarkdown, type VaultEntry } from '@/lib/vault/entry';
+import {
+  deleteAnchoredVaultEntry,
+  writeAnchoredVaultEntry,
+} from '@/lib/vault/anchored-fs';
+import { withNovelVaultRootLock } from '@/lib/vault/root-lock';
 import { parseJsonField } from '@/lib/utils';
 import type { KnowledgeType } from '@/lib/types/knowledge';
 import type { KnowledgeEntryRow } from '@/lib/db/queries-knowledge';
-import type { VaultFrontmatter } from '@/lib/vault/types';
-
-const MAX_SYNC_MARKDOWN_BYTES = 128 * 1024;
-
-function validateVaultEntryRelPath(root: string, relPath: string): string[] {
-  if (!root || !relPath || path.isAbsolute(relPath) || relPath.includes('\\')) {
-    throw new Error('Invalid vault entry path');
-  }
-  const normalized = path.posix.normalize(relPath);
-  if (normalized.startsWith('../') || normalized === '..' || normalized !== relPath) {
-    throw new Error('Invalid vault entry path');
-  }
-  const parts = normalized.split('/');
-  if (parts.length !== 2 || !VAULT_ENTRY_DIRS.has(parts[0]) || !parts[1].endsWith('.md')) {
-    throw new Error('Invalid vault entry path');
-  }
-  return parts;
-}
-
-async function safeVaultEntryFile(root: string, relPath: string, createParent: boolean): Promise<string> {
-  const parts = validateVaultEntryRelPath(root, relPath);
-  const rootAbs = path.resolve(root);
-  const rootStat = await lstat(rootAbs);
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error('Invalid vault root');
-  }
-  const rootReal = await realpath(rootAbs);
-  const parentAbs = path.resolve(rootAbs, parts[0]);
-  if (!parentAbs.startsWith(rootAbs + path.sep)) {
-    throw new Error('Invalid vault entry path');
-  }
-
-  // Defense-in-depth: verify whatever already lives at parentAbs is a real
-  // directory inside the root BEFORE we mkdir. If the path exists as a
-  // symlink (or a regular file masquerading as our dir), bail out without
-  // touching the filesystem. If it doesn't exist at all, only then do we
-  // create it — the string-level startsWith check above already proves
-  // `parts[0]` is a direct child of `rootAbs`, so the mkdir cannot escape.
-  let exists = true;
-  try {
-    const preStat = await lstat(parentAbs);
-    if (preStat.isSymbolicLink() || !preStat.isDirectory()) {
-      throw new Error('Invalid vault entry parent');
-    }
-  } catch (error: unknown) {
-    const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
-    if (code === 'ENOENT') {
-      exists = false;
-    } else {
-      throw error;
-    }
-  }
-
-  if (!exists) {
-    if (!createParent) {
-      throw new Error('Invalid vault entry parent');
-    }
-    await mkdir(parentAbs, { recursive: false }).catch((error: unknown) => {
-      const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
-      if (code === 'EEXIST') return;
-      throw error;
-    });
-    // After mkdir, re-stat to catch a race (someone replaced the freshly
-    // created dir with a symlink between our mkdir and the rest of this
-    // function).
-    const postStat = await lstat(parentAbs);
-    if (postStat.isSymbolicLink() || !postStat.isDirectory()) {
-      throw new Error('Invalid vault entry parent');
-    }
-  }
-
-  const parentReal = await realpath(parentAbs);
-  if (!parentReal.startsWith(rootReal + path.sep)) {
-    throw new Error('Invalid vault entry parent');
-  }
-  return path.join(parentReal, parts[1]);
-}
-
-async function writeAtomic(file: string, content: string): Promise<void> {
-  if (Buffer.byteLength(content, 'utf8') > MAX_SYNC_MARKDOWN_BYTES) {
-    throw new Error('Vault markdown is too large');
-  }
-  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
-  let handle: Awaited<ReturnType<typeof open>> | null = null;
-  let renamed = false;
-  try {
-    handle = await open(tmp, 'wx');
-    await handle.writeFile(content, 'utf8');
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    await rename(tmp, file);
-    renamed = true;
-  } finally {
-    await handle?.close().catch(() => undefined);
-    if (!renamed) {
-      await rm(tmp, { force: true }).catch(() => undefined);
-    }
-  }
-}
+import type { VaultFrontmatter, VaultRootFence } from '@/lib/vault/types';
 
 function markdownBodyFor(row: KnowledgeEntryRow, data: Record<string, unknown>): string {
   const chunks = [
@@ -174,31 +76,78 @@ async function renderKnowledgeEntryMarkdown(row: KnowledgeEntryRow, relPath: str
   return renderEntryToMarkdown(entry);
 }
 
-export async function syncKnowledgeEntryToVault(novelId: string, entryId: string): Promise<void> {
-  const [vault, row, index] = await Promise.all([
-    getNovelVault(novelId),
-    getKnowledgeEntryById(entryId),
-    getKnowledgeIndexById(entryId),
-  ]);
-  if (!vault?.vaultPath || !row || row.novel_id !== novelId || !index || index.novelId !== novelId) return;
-  const file = await safeVaultEntryFile(vault.vaultPath, index.path, true);
-  await writeAtomic(file, await renderKnowledgeEntryMarkdown(row, index.path));
+export type VaultMirrorWriteResult =
+  | 'written'
+  | 'skipped_unbound'
+  | 'skipped_missing_entry'
+  | 'skipped_stale_root';
+
+function fenceMatches(
+  vault: { vaultPath: string | null; vaultVersion: number } | null | undefined,
+  fence: VaultRootFence | undefined,
+): boolean {
+  if (!fence) return true;
+  return Boolean(
+    vault?.vaultPath
+    && vault.vaultPath === fence.expectedRoot
+    && vault.vaultVersion === fence.expectedToken,
+  );
+}
+
+export async function syncKnowledgeEntryToVault(
+  novelId: string,
+  entryId: string,
+  fence?: VaultRootFence,
+): Promise<VaultMirrorWriteResult> {
+  return withNovelVaultRootLock(novelId, async () => {
+    const [vault, row, index] = await Promise.all([
+      getNovelVault(novelId),
+      getKnowledgeEntryById(entryId),
+      getKnowledgeIndexById(entryId),
+    ]);
+    // Unbound novels must leave durable outbox intents pending — never pretend
+    // the mirror write completed when no root is configured.
+    if (!vault?.vaultPath) return 'skipped_unbound';
+    if (isVaultRootPending(vault.vaultVersion) && !fence) return 'skipped_stale_root';
+    if (!fenceMatches(vault, fence)) return 'skipped_stale_root';
+    if (!row || row.novel_id !== novelId || !index || index.novelId !== novelId) {
+      return 'skipped_missing_entry';
+    }
+    const root = vault.vaultPath;
+    const latest = await getNovelVault(novelId);
+    if (!latest?.vaultPath || latest.vaultPath !== root) return 'skipped_stale_root';
+    if (!fenceMatches(latest, fence)) return 'skipped_stale_root';
+    await writeAnchoredVaultEntry(
+      root,
+      index.path,
+      await renderKnowledgeEntryMarkdown(row, index.path),
+    );
+    return 'written';
+  });
 }
 
 export async function deleteKnowledgeEntryFromVault(
   novelId: string,
   entryId: string,
   relPath?: string | null,
-): Promise<void> {
-  const vault = await getNovelVault(novelId);
-  if (!vault?.vaultPath) return;
-  const pathToDelete = relPath ?? (await getKnowledgeIndexById(entryId))?.path ?? null;
-  if (!pathToDelete) return;
-  await rm(await safeVaultEntryFile(vault.vaultPath, pathToDelete, false), { force: true });
+  fence?: VaultRootFence,
+): Promise<VaultMirrorWriteResult> {
+  return withNovelVaultRootLock(novelId, async () => {
+    const vault = await getNovelVault(novelId);
+    if (!vault?.vaultPath) return 'skipped_unbound';
+    if (isVaultRootPending(vault.vaultVersion) && !fence) return 'skipped_stale_root';
+    if (!fenceMatches(vault, fence)) return 'skipped_stale_root';
+    const pathToDelete = relPath ?? (await getKnowledgeIndexById(entryId))?.path ?? null;
+    if (!pathToDelete) return 'skipped_missing_entry';
+    const root = vault.vaultPath;
+    const latest = await getNovelVault(novelId);
+    if (!latest?.vaultPath || latest.vaultPath !== root) return 'skipped_stale_root';
+    if (!fenceMatches(latest, fence)) return 'skipped_stale_root';
+    await deleteAnchoredVaultEntry(root, pathToDelete);
+    return 'written';
+  });
 }
 
 export const __serverSyncTest = {
-  safeVaultEntryFile,
-  writeAtomic,
   renderKnowledgeEntryMarkdown,
 };

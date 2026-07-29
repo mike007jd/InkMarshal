@@ -244,7 +244,7 @@ export function ConversationList({
       {/* List */}
       <div className="flex-1 overflow-y-auto">
         {loading && conversations.length === 0 && (
-          <p className="px-3 py-4 text-xs text-book-ink-muted text-center">{t.loading}...</p>
+          <p className="px-3 py-4 text-xs text-book-ink-muted text-center">{t.loading}…</p>
         )}
 
         {error && (

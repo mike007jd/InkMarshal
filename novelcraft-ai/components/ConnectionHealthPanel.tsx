@@ -22,6 +22,7 @@ import {
   getConnections,
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
+import { categorizeHealthFailure, healthFailureMessage } from '@/lib/model-supply/health-failure';
 import { checkConnectionHealth } from '@/lib/model-supply/runtime-health';
 import type { ConnectionHealth, RuntimeConnection } from '@/lib/model-supply/types';
 
@@ -232,9 +233,9 @@ export function ConnectionHealthPanel() {
                         {health.latencyMs > 0 && <span>{health.latencyMs} ms</span>}
                       </>
                     )}
-                    {!ok && health.message && (
+                    {!ok && (
                       <span className="text-book-ink-secondary">
-                        {health.message}
+                        {healthFailureMessage(categorizeHealthFailure(health), t)}
                       </span>
                     )}
                   </div>

@@ -371,4 +371,13 @@ export interface ConnectionHealth {
   models: string[];
   latencyMs: number;
   message: string;
+  /**
+   * Client-side classification set by the JS wrappers (never sent by Rust):
+   * `desktop-required` marks the off-desktop degraded result, `probe-failed`
+   * marks a desktop probe that itself threw. Undefined for genuine Rust
+   * responses, which are classified from the reachable/transportOk flags.
+   * `message` may carry raw backend detail for developer diagnostics — product
+   * UI must map failures to localized copy, never render it directly.
+   */
+  failureKind?: 'desktop-required' | 'probe-failed';
 }

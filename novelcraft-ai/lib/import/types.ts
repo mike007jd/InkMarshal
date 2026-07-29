@@ -119,4 +119,6 @@ export interface ImportPlanChapter {
 export interface DedupeDecision {
   chapterNumber: number;
   action: DedupeAction;
+  /** Existing target reported by server dedupe; null when no match exists. */
+  matchedChapterNumber: number | null;
 }

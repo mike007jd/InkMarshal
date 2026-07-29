@@ -20,6 +20,7 @@ function webDegradedHealth(): ConnectionHealth {
     models: [],
     latencyMs: 0,
     message: 'Runtime health checks require the desktop app',
+    failureKind: 'desktop-required',
   };
 }
 
@@ -49,10 +50,14 @@ export async function checkConnectionHealth(
       transportOk: false,
       models: [],
       latencyMs: 0,
+      // Raw detail stays available for developer diagnostics only — product UI
+      // renders the localized category copy (see health-failure.ts), never
+      // this message.
       message:
         error instanceof Error && error.message
           ? error.message
           : 'Runtime health probe failed',
+      failureKind: 'probe-failed',
     };
   }
 }

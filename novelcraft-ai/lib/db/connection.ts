@@ -10,10 +10,11 @@ import { nowIso } from '@/lib/utils';
 import { LOCAL_USER_ID, LOCAL_USER_EMAIL } from '@/lib/local-user';
 import { resolveLocalDbPath } from '@/lib/db-local-path';
 import {
-  assertCurrentSchema,
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
+  ensureCurrentSchema,
   initializeCurrentSchema,
+  inspectSchemaOpenPlan,
 } from '@/lib/db/migrations';
 import { seedPromptTemplates } from '@/lib/prompt-seed';
 
@@ -44,6 +45,14 @@ function seedLocalUser(db: Database.Database): void {
   ).run(LOCAL_USER_ID, LOCAL_USER_EMAIL, now, now);
 }
 
+function applyConnectionPragmas(db: Database.Database): void {
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('temp_store = MEMORY');
+}
+
 export function getDb(): Database.Database {
   if (_db) return _db;
   assertDbRuntimeAllowed();
@@ -53,30 +62,31 @@ export function getDb(): Database.Database {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     const hasExistingDatabase = existsSync(dbPath) && statSync(dbPath).size > 0;
     if (hasExistingDatabase) {
+      // Classify on a readonly handle first so unsupported databases fail closed
+      // without creating WAL/SHM sidecars or rewriting published bytes.
       const verifier = new Database(dbPath, { readonly: true, fileMustExist: true });
       try {
-        assertCurrentSchema(verifier);
+        inspectSchemaOpenPlan(verifier);
       } finally {
         verifier.close();
       }
     }
+
     db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    db.pragma('busy_timeout = 5000');
-    db.pragma('synchronous = NORMAL');
-    db.pragma('temp_store = MEMORY');
-    if (!hasExistingDatabase) {
+    applyConnectionPragmas(db);
+    if (hasExistingDatabase) {
+      ensureCurrentSchema(db);
+    } else {
       initializeCurrentSchema(db);
     }
     seedLocalUser(db);
     seedPromptTemplates(db);
   } catch (e) {
     db?.close();
-    // Fail closed on a newer-than-supported database: surface the typed error
-    // unchanged so the shell can tell the user to update rather than treating it
-    // as a generic open failure. The handle is already closed — no read/write
-    // touched the newer on-disk shape.
+    // Fail closed on a newer-than-supported / incompatible database: surface the
+    // typed error unchanged so the shell can tell the user to update rather than
+    // treating it as a generic open failure. The handle is already closed — no
+    // read/write touched an unsupported on-disk shape.
     if (
       e instanceof DatabaseFromNewerAppVersionError ||
       e instanceof IncompatibleDatabaseSchemaError

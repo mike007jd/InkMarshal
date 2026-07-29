@@ -2,7 +2,7 @@
 
 import { createElement } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LanguageProvider } from '@/components/LanguageProvider';
 import { StudioFirstRunWizard, resolveStarterRowAffordance } from '@/components/StudioFirstRunWizard';
@@ -72,6 +72,10 @@ beforeEach(() => {
   wizardMocks.startAndBindLocalEngine.mockResolvedValue(undefined);
 });
 
+afterEach(() => {
+  window.localStorage.clear();
+});
+
 describe('resolveStarterRowAffordance', () => {
   it('never reports a green "ready" when the engine failed to bind, even though bytes are on disk', () => {
     // installedHere is true (file downloaded) but binding failed — must NOT be "ready".
@@ -102,6 +106,21 @@ describe('resolveStarterRowAffordance', () => {
 });
 
 describe('StudioFirstRunWizard download lifecycle', () => {
+  it('renders the starter purpose in the selected locale instead of the raw catalog category', async () => {
+    window.localStorage.setItem('locale', 'zh-CN');
+
+    render(
+      createElement(
+        LanguageProvider,
+        null,
+        createElement(StudioFirstRunWizard, { installedCount: 0 }),
+      ),
+    );
+
+    expect(await screen.findByText('起草')).toBeTruthy();
+    expect(screen.queryByText('Writing')).toBeNull();
+  });
+
   it('starts and announces a downloaded model even when the wizard unmounts mid-download', async () => {
     let resolveDownload!: (path: string) => void;
     wizardMocks.downloadStarterModel.mockReturnValueOnce(

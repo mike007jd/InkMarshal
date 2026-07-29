@@ -476,7 +476,7 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
       type: 'progress',
       progress: input.progress,
       message: isZhLocale(language)
-        ? `Ralph loop 正在修订第 ${plan.chapterNumber} 章的一致性问题...`
+        ? `Ralph loop 正在修订第 ${plan.chapterNumber} 章的一致性问题…`
         : `Ralph loop is revising Chapter ${plan.chapterNumber} for continuity...`,
     });
     if (!(await deps.renewLock())) {
@@ -512,7 +512,7 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
         type: 'progress',
         progress: input.progress,
         message: isZhLocale(language)
-          ? `Ralph loop 修订失败，已保留第 ${plan.chapterNumber} 章初稿并继续...`
+          ? `Ralph loop 修订失败，已保留第 ${plan.chapterNumber} 章初稿并继续…`
           : `Ralph loop repair failed; keeping Chapter ${plan.chapterNumber}'s draft and continuing...`,
       });
       repairOutcome = null;

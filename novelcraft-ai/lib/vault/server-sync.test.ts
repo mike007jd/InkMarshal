@@ -1,10 +1,24 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
+import { readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { __serverSyncTest } from '@/lib/vault/server-sync';
+import {
+  __anchoredFsTest,
+  deleteAnchoredVaultEntry,
+  readAnchoredVaultMarkdown,
+  writeAnchoredVaultEntry,
+} from '@/lib/vault/anchored-fs';
 
 let tmpRoot: string | null = null;
 
@@ -14,6 +28,7 @@ function tempDir(): string {
 }
 
 afterEach(() => {
+  __anchoredFsTest.afterDirectoryValidated = null;
   if (tmpRoot) {
     rmSync(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
@@ -24,22 +39,23 @@ describe('vault server sync filesystem guard', () => {
   it('resolves only canonical top-level vault entry files', async () => {
     const root = tempDir();
 
-    const file = await __serverSyncTest.safeVaultEntryFile(root, 'characters/mira.md', true);
+    await writeAnchoredVaultEntry(root, 'characters/mira.md', 'Mira');
 
-    expect(file).toBe(path.join(realpathSync(root), 'characters', 'mira.md'));
+    const file = path.join(root, 'characters', 'mira.md');
+    expect(await readFile(file, 'utf8')).toBe('Mira');
     expect(existsSync(path.join(root, 'characters'))).toBe(true);
     await expect(
-      __serverSyncTest.safeVaultEntryFile(root, '../mira.md', true),
+      writeAnchoredVaultEntry(root, '../mira.md', 'bad'),
     ).rejects.toThrow('Invalid vault entry path');
     await expect(
-      __serverSyncTest.safeVaultEntryFile(root, 'characters/nested/mira.md', true),
+      writeAnchoredVaultEntry(root, 'characters/nested/mira.md', 'bad'),
     ).rejects.toThrow('Invalid vault entry path');
     await expect(
-      __serverSyncTest.safeVaultEntryFile(root, 'characters/../outline/mira.md', true),
+      writeAnchoredVaultEntry(root, 'characters/../outline/mira.md', 'bad'),
     ).rejects.toThrow('Invalid vault entry path');
   });
 
-  it('rejects symlinked vault roots and entry parents', async () => {
+  it('rejects symlinked vault roots and invalid entry parents', async () => {
     const workspace = tempDir();
     const realRoot = path.join(workspace, 'real-root');
     const linkedRoot = path.join(workspace, 'linked-root');
@@ -49,29 +65,105 @@ describe('vault server sync filesystem guard', () => {
     symlinkSync(realRoot, linkedRoot, 'dir');
 
     await expect(
-      __serverSyncTest.safeVaultEntryFile(linkedRoot, 'characters/mira.md', true),
-    ).rejects.toThrow('Invalid vault root');
+      writeAnchoredVaultEntry(linkedRoot, 'characters/mira.md', 'bad'),
+    ).rejects.toThrow('Invalid Vault root');
 
     const vaultRoot = path.join(workspace, 'vault-root');
     mkdirSync(vaultRoot);
     symlinkSync(outside, path.join(vaultRoot, 'characters'), 'dir');
 
     await expect(
-      __serverSyncTest.safeVaultEntryFile(vaultRoot, 'characters/mira.md', true),
-    ).rejects.toThrow('Invalid vault entry parent');
+      writeAnchoredVaultEntry(vaultRoot, 'characters/mira.md', 'bad'),
+    ).rejects.toThrow('Invalid Vault entry directory');
     expect(existsSync(path.join(outside, 'mira.md'))).toBe(false);
+
+    const fileParentRoot = path.join(workspace, 'file-parent-root');
+    mkdirSync(fileParentRoot);
+    await writeFile(path.join(fileParentRoot, 'characters'), 'not-a-directory');
+    await expect(
+      writeAnchoredVaultEntry(fileParentRoot, 'characters/mira.md', 'bad'),
+    ).rejects.toThrow('Invalid Vault entry directory');
+    expect(await readFile(path.join(fileParentRoot, 'characters'), 'utf8')).toBe(
+      'not-a-directory',
+    );
   });
 
   it('writes atomically and rejects oversized markdown', async () => {
     const root = tempDir();
-    const file = await __serverSyncTest.safeVaultEntryFile(root, 'characters/mira.md', true);
+    const file = path.join(root, 'characters', 'mira.md');
 
-    await __serverSyncTest.writeAtomic(file, 'small markdown');
+    await writeAnchoredVaultEntry(root, 'characters/mira.md', 'small markdown');
     expect(await readFile(file, 'utf8')).toBe('small markdown');
     await expect(
-      __serverSyncTest.writeAtomic(file, 'x'.repeat(128 * 1024 + 1)),
+      writeAnchoredVaultEntry(root, 'characters/mira.md', 'x'.repeat(128 * 1024 + 1)),
     ).rejects.toThrow('Vault markdown is too large');
     expect(await readFile(file, 'utf8')).toBe('small markdown');
+  });
+
+  it('rejects a parent symlink swap before anchored traversal without writing outside', async () => {
+    const workspace = tempDir();
+    const root = path.join(workspace, 'vault');
+    const outside = path.join(workspace, 'outside');
+    const displaced = path.join(workspace, 'characters-original');
+    mkdirSync(path.join(root, 'characters'), { recursive: true });
+    mkdirSync(outside);
+    let swapped = false;
+    __anchoredFsTest.afterDirectoryValidated = () => {
+      if (swapped) return;
+      swapped = true;
+      renameSync(path.join(root, 'characters'), displaced);
+      symlinkSync(outside, path.join(root, 'characters'), 'dir');
+    };
+
+    await expect(
+      writeAnchoredVaultEntry(root, 'characters/escaped.md', 'x'.repeat(128 * 1024)),
+    ).rejects.toThrow('Invalid Vault entry directory');
+    expect(existsSync(path.join(outside, 'escaped.md'))).toBe(false);
+  });
+
+  it('rejects a vault root ancestor swap without writing or deleting outside', async () => {
+    const workspace = tempDir();
+    const writeRoot = path.join(workspace, 'write-vault');
+    const displacedWriteRoot = path.join(workspace, 'write-vault-original');
+    const outsideWrite = path.join(workspace, 'outside-write');
+    mkdirSync(path.join(writeRoot, 'characters'), { recursive: true });
+    mkdirSync(path.join(outsideWrite, 'characters'), { recursive: true });
+    __anchoredFsTest.afterDirectoryValidated = () => {
+      renameSync(writeRoot, displacedWriteRoot);
+      symlinkSync(outsideWrite, writeRoot, 'dir');
+    };
+
+    await expect(
+      writeAnchoredVaultEntry(writeRoot, 'characters/escaped.md', 'outside write'),
+    ).rejects.toThrow('Anchored Vault root identity changed');
+    expect(existsSync(path.join(outsideWrite, 'characters', 'escaped.md'))).toBe(false);
+
+    const deleteRoot = path.join(workspace, 'delete-vault');
+    const displacedDeleteRoot = path.join(workspace, 'delete-vault-original');
+    const outsideDelete = path.join(workspace, 'outside-delete');
+    mkdirSync(path.join(deleteRoot, 'characters'), { recursive: true });
+    mkdirSync(path.join(outsideDelete, 'characters'), { recursive: true });
+    await writeFile(path.join(outsideDelete, 'characters', 'keep.md'), 'keep');
+    __anchoredFsTest.afterDirectoryValidated = () => {
+      renameSync(deleteRoot, displacedDeleteRoot);
+      symlinkSync(outsideDelete, deleteRoot, 'dir');
+    };
+
+    await expect(
+      deleteAnchoredVaultEntry(deleteRoot, 'characters/keep.md'),
+    ).rejects.toThrow('Anchored Vault root identity changed');
+    expect(await readFile(path.join(outsideDelete, 'characters', 'keep.md'), 'utf8')).toBe('keep');
+  });
+
+  it.runIf(process.platform !== 'win32')('rejects Markdown FIFOs without blocking bootstrap', async () => {
+    const root = tempDir();
+    const characters = path.join(root, 'characters');
+    mkdirSync(characters);
+    execFileSync('mkfifo', [path.join(characters, 'blocked.md')]);
+
+    await expect(readAnchoredVaultMarkdown(root)).rejects.toThrow(
+      'Invalid Vault bootstrap file: blocked.md',
+    );
   });
 });
 

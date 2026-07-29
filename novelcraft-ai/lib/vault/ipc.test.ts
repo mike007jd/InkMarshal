@@ -19,18 +19,20 @@ describe('vault IPC command contract', () => {
   it('starts and stops watchers with the vault path in the argument envelope', async () => {
     vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });
 
-    await vaultWatchStart('novel-1', '/vault/a', 'watch-1');
-    await vaultWatchStop('novel-1', '/vault/a', 'watch-1');
+    await vaultWatchStart('novel-1', '/vault/a', 'watch-1', 41);
+    await vaultWatchStop('novel-1', '/vault/a', 'watch-1', 41);
 
     expect(mocks.invoke).toHaveBeenCalledWith(VAULT_COMMANDS.vaultWatchStart, {
       novelId: 'novel-1',
       vaultPath: '/vault/a',
       watchId: 'watch-1',
+      watchGeneration: 41,
     });
     expect(mocks.invoke).toHaveBeenCalledWith(VAULT_COMMANDS.vaultWatchStop, {
       novelId: 'novel-1',
       vaultPath: '/vault/a',
       watchId: 'watch-1',
+      watchGeneration: 41,
     });
   });
 

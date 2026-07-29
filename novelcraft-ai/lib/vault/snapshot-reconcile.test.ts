@@ -113,6 +113,40 @@ describe('reconcileVaultSnapshot', () => {
     }]);
   });
 
+  it('skips missing-file-as-delete while a root is still bootstrapping', async () => {
+    const { reconcileVaultSnapshot } = await import('@/lib/vault/snapshot-reconcile');
+    vaultMock.indexedRefs = [
+      { id: 'old', path: 'characters/old.md' },
+      { id: 'stale', path: 'worlds/stale.md' },
+    ];
+
+    const result = await reconcileVaultSnapshot('novel-1', '/vault', {
+      allowMissingFileDeletes: false,
+    });
+
+    expect(result).toEqual({ updated: 0, deleted: 0, skipped: 0 });
+    expect(vaultMock.batches).toEqual([]);
+  });
+
+  it('passes the fixed pending-root fence with every imported snapshot batch', async () => {
+    const { reconcileVaultSnapshot } = await import('@/lib/vault/snapshot-reconcile');
+    vaultMock.files = [{ path: 'characters/entry.md', size: 8, content: '# Entry' }];
+    const rootFence = { expectedRoot: '/vault', expectedToken: -7 };
+
+    await reconcileVaultSnapshot('novel-1', '/vault', {
+      allowMissingFileDeletes: false,
+      rootFence,
+    });
+
+    expect(vaultMock.batches).toEqual([{
+      changes: [{ path: 'characters/entry.md', content: '# Entry' }],
+      options: {
+        allowUpsertMirrorReplay: false,
+        rootFence,
+      },
+    }]);
+  });
+
   it('passes missing indexed paths as move hints while rebuilding present files', async () => {
     const { reconcileVaultSnapshot } = await import('@/lib/vault/snapshot-reconcile');
     const content = entryMarkdown('entry-1', 'New Entry');

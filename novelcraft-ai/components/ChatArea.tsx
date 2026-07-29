@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { ChatStatus } from 'ai';
 import { useLanguage } from '@/components/LanguageProvider';
+import { joinLocalizedDisplayList } from '@/lib/i18n';
 import { EmptyChatInterviewGuide } from '@/components/EmptyChatInterviewGuide';
 import { WritingModelStatusBar } from '@/components/WritingModelStatusBar';
 import { useToast } from '@/components/Toast';
@@ -64,7 +65,7 @@ export function ChatArea({
       if (receipt.storyEntries.length > 0) {
         savedItems.push(t.brainstormReceiptStoryDeck.replace(
           '{titles}',
-          receipt.storyEntries.map(entry => entry.title).join(', '),
+          joinLocalizedDisplayList(receipt.storyEntries.map(entry => entry.title), locale),
         ));
       }
       if (savedItems.length === 0) return;
@@ -95,7 +96,7 @@ export function ChatArea({
       // A receipt is additive UX. Chat remains successful even if its
       // presentation endpoint is briefly unavailable.
     }
-  }, [novelId, onUpdate, t, toast]);
+  }, [locale, novelId, onUpdate, t, toast]);
 
   const { runtime, status, loading, refresh, errorMessage, retry, sendMessage } = useNovelChatRuntime({
     novelId,

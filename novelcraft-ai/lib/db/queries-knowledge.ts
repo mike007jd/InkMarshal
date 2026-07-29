@@ -247,11 +247,13 @@ export async function deleteKnowledgeEntry(
     'UPDATE knowledge_entries SET data = ?, updated_at = ? WHERE id = ?',
   );
   const deleteIndex = db.prepare('DELETE FROM knowledge_index WHERE id = ?');
+  const deleteEmbedding = db.prepare('DELETE FROM knowledge_embeddings WHERE id = ?');
   const deleteEntry = db.prepare('DELETE FROM knowledge_entries WHERE id = ?');
   const tx = db.transaction(() => {
     for (const update of cleanupUpdates) {
       updateCleanup.run(update.data, update.updatedAt, update.id);
       upsertKnowledgeIndex(db, update.index);
+      deleteEmbedding.run(update.id);
     }
     for (const index of sourceIndexUpdates) {
       upsertKnowledgeIndex(db, index);
@@ -270,6 +272,7 @@ export async function deleteKnowledgeEntry(
         updatedAt: nowIso(),
       });
     }
+    deleteEmbedding.run(id);
     deleteIndex.run(id);
     const info = deleteEntry.run(id);
     if (info.changes > 0 && row) touchNovelUpdatedAt(db, row.novel_id);

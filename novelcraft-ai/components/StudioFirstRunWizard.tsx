@@ -6,6 +6,7 @@ import { ArrowRight, Download, FolderOpen, Library, Sparkles, Upload } from 'luc
 
 import { useLanguage } from '@/components/LanguageProvider';
 import type { Translations } from '@/lib/i18n';
+import { roleSummary } from '@/components/models/model-presentation';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -414,7 +415,7 @@ export function StudioFirstRunWizard({
               {entry.name}
             </div>
             <div className="mt-1 text-xs-tight text-book-ink-muted">
-              {entry.category}
+              {roleSummary(entry, t)}
               {entry.sizeHint ? ` · ${entry.sizeHint}` : ''}
             </div>
           </div>

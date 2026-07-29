@@ -1,38 +1,38 @@
 'use client';
 
-// Client-side durable-config cache (Phase 1). A localStorage-shaped synchronous
-// shim whose authoritative backend is SQLite (origin-independent) on desktop,
-// so durable config survives a runtime-port change. Each client store
-// (settings / connections / capability profile / engine launch plans) swaps its
-// three localStorage primitives for the ones here and keeps all of its own
-// sanitize/serialize logic unchanged.
+// Client-side durable-config cache. A localStorage-shaped synchronous shim
+// whose authoritative backend is SQLite (origin-independent) on desktop.
 //
-// Behaviour by runtime:
-//   - Desktop (Tauri): reads serve from an in-memory cache hydrated once at boot
-//     from SQLite (hydrateAppSettings); writes go write-through to SQLite AND a
-//     localStorage mirror. The mirror is non-authoritative — it only feeds the
-//     inline theme/locale FOUC scripts and the first paint before hydration. A
-//     port change empties the mirror, so the first paint may briefly show
-//     defaults, then hydration restores the real values (vastly better than the
-//     old behaviour, where a port change lost the config permanently).
-//   - Web / tests (no Tauri): reads and writes go straight to localStorage. This
-//     keeps every existing localStorage-mocking test working with zero changes,
-//     and the web landing site never touches SQLite.
+// Desktop reads serve from memory after one authoritative hydration. Writes go
+// through to SQLite and a localStorage first-paint mirror. Web/test callers keep
+// direct localStorage semantics.
 
 import { isTauriRuntime } from '@/lib/desktop-runtime';
-import { isWritableAppSettingKey } from '@/lib/app-settings-keys';
+import {
+  APP_SETTINGS_CURRENT_ONLY_KEYS,
+  APP_SETTINGS_KEYS,
+  isWritableAppSettingKey,
+} from '@/lib/app-settings-keys';
+
+const ALL_WRITABLE_KEYS: readonly string[] = [
+  ...APP_SETTINGS_KEYS,
+  ...APP_SETTINGS_CURRENT_ONLY_KEYS,
+];
 
 const cache = new Map<string, string>();
+/** Hydration must never overwrite a local set/remove that started after its GET. */
+const mutationGeneration = new Map<string, number>();
 const settingPatchTails = new Map<string, Promise<boolean>>();
-const preHydrationMutatedKeys = new Set<string>();
-const preHydrationPatchResults = new Map<string, Promise<boolean>>();
-let hydrated = false;
-let hydrationPromise: Promise<boolean> | null = null;
 const hydratedListeners = new Set<() => void>();
+let hydrated = false;
+let hydrateInFlight: Promise<HydrateAppSettingsResult> | null = null;
 
-function markPreHydrationMutation(key: string): void {
-  if (!hydrated) preHydrationMutatedKeys.add(key);
-}
+const HYDRATE_MAX_ATTEMPTS = 3;
+const HYDRATE_RETRY_DELAYS_MS = [0, 150, 400] as const;
+
+export type HydrateAppSettingsResult =
+  | { ok: true }
+  | { ok: false; error: string };
 
 function safeLocalGet(key: string): string | null {
   if (typeof localStorage === 'undefined') return null;
@@ -48,7 +48,7 @@ function safeLocalSet(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
   } catch {
-    // Storage can fail in private mode; the in-memory cache still holds it.
+    // The in-memory cache still owns this session.
   }
 }
 
@@ -57,8 +57,22 @@ function safeLocalRemove(key: string): void {
   try {
     localStorage.removeItem(key);
   } catch {
-    // Non-fatal — see safeLocalSet.
+    // The in-memory cache still owns this session.
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function bumpMutation(key: string): void {
+  mutationGeneration.set(key, (mutationGeneration.get(key) ?? 0) + 1);
+}
+
+function snapshotMutationGenerations(): Map<string, number> {
+  return new Map(mutationGeneration);
 }
 
 async function patchSetting(key: string, value: string | null): Promise<boolean> {
@@ -72,7 +86,6 @@ async function patchSetting(key: string, value: string | null): Promise<boolean>
       });
       return res.ok;
     } catch {
-      // Best-effort: the localStorage mirror still holds the value this session.
       return false;
     }
   };
@@ -87,72 +100,47 @@ async function patchSetting(key: string, value: string | null): Promise<boolean>
   return request;
 }
 
-function patchSettingTrackedForHydration(
-  key: string,
-  value: string | null,
-): Promise<boolean> {
-  const request = patchSetting(key, value);
-  if (!hydrated) preHydrationPatchResults.set(key, request);
-  return request;
-}
-
-/** Synchronous read — localStorage.getItem semantics (string | null). */
+/** Synchronous localStorage.getItem-compatible read. */
 export function getStoredSetting(key: string): string | null {
   if (cache.has(key)) return cache.get(key) ?? null;
-  // Once desktop SQLite hydration succeeds, cache absence is authoritative.
-  // The localStorage mirror is only permitted before hydration for first paint.
+  // After desktop hydration, cache absence is authoritative. The mirror is
+  // permitted only before hydration for first paint.
   if (isTauriRuntime() && hydrated) return null;
   return safeLocalGet(key);
 }
 
-/**
- * Synchronous write-through. Desktop: in-memory cache + SQLite (authoritative)
- * + localStorage mirror (first-paint/FOUC). Web/test: localStorage only. Never
- * throws — callers (saveSettings, writeConnections, …) treat persistence as
- * best-effort.
- */
 export function setStoredSetting(key: string, value: string): void {
-  if (isTauriRuntime()) {
-    markPreHydrationMutation(key);
-    cache.set(key, value);
+  if (!isTauriRuntime()) {
     safeLocalSet(key, value);
-    if (isWritableAppSettingKey(key)) {
-      void patchSettingTrackedForHydration(key, value);
-    }
-  } else {
-    safeLocalSet(key, value);
+    return;
   }
+  bumpMutation(key);
+  cache.set(key, value);
+  safeLocalSet(key, value);
+  if (isWritableAppSettingKey(key)) void patchSetting(key, value);
 }
 
 export function removeStoredSetting(key: string): void {
-  if (isTauriRuntime()) {
-    markPreHydrationMutation(key);
-    cache.delete(key);
+  if (!isTauriRuntime()) {
     safeLocalRemove(key);
-    if (isWritableAppSettingKey(key)) {
-      void patchSettingTrackedForHydration(key, null);
-    }
-  } else {
-    safeLocalRemove(key);
+    return;
   }
+  bumpMutation(key);
+  cache.delete(key);
+  safeLocalRemove(key);
+  if (isWritableAppSettingKey(key)) void patchSetting(key, null);
 }
 
-/**
- * Persist a value and resolve only after the authoritative desktop SQLite
- * write has completed. The synchronous API remains for low-risk preferences;
- * crash-recovery payloads use this barrier so callers can observe failure.
- */
+/** Resolve only after the authoritative desktop PATCH has completed. */
 export function setStoredSettingDurable(key: string, value: string): Promise<boolean> {
   if (!isTauriRuntime()) {
     safeLocalSet(key, value);
     return Promise.resolve(true);
   }
-  markPreHydrationMutation(key);
+  bumpMutation(key);
   cache.set(key, value);
   safeLocalSet(key, value);
-  return isWritableAppSettingKey(key)
-    ? patchSettingTrackedForHydration(key, value)
-    : Promise.resolve(false);
+  return isWritableAppSettingKey(key) ? patchSetting(key, value) : Promise.resolve(false);
 }
 
 export function removeStoredSettingDurable(key: string): Promise<boolean> {
@@ -160,19 +148,15 @@ export function removeStoredSettingDurable(key: string): Promise<boolean> {
     safeLocalRemove(key);
     return Promise.resolve(true);
   }
-  markPreHydrationMutation(key);
+  bumpMutation(key);
   cache.delete(key);
   safeLocalRemove(key);
-  return isWritableAppSettingKey(key)
-    ? patchSettingTrackedForHydration(key, null)
-    : Promise.resolve(false);
+  return isWritableAppSettingKey(key) ? patchSetting(key, null) : Promise.resolve(false);
 }
 
 /**
- * Compare-and-restore the in-memory cache + localStorage mirror after a failed
- * durable SQLite attempt. Restores `previousValue` only when the current cache
- * still equals the attempted value (string for set, absent/null for remove), so
- * a newer queued write is never clobbered. Never enqueues another SQLite PATCH.
+ * Compare-and-restore the mirror after a failed durable attempt. A newer write
+ * wins because restoration only occurs while the attempted value is current.
  */
 export function rollbackStoredSettingMirrorAfterFailedDurableAttempt(
   key: string,
@@ -182,6 +166,7 @@ export function rollbackStoredSettingMirrorAfterFailedDurableAttempt(
   if (isTauriRuntime()) {
     const current = cache.has(key) ? (cache.get(key) ?? null) : null;
     if (current !== attemptedValue) return;
+    bumpMutation(key);
     if (previousValue === null) {
       cache.delete(key);
       safeLocalRemove(key);
@@ -192,105 +177,140 @@ export function rollbackStoredSettingMirrorAfterFailedDurableAttempt(
     return;
   }
 
-  // Web/test: no SQLite queue, but keep the same compare-and-restore contract
-  // against the localStorage mirror for callers/tests that exercise it.
-  const current = safeLocalGet(key);
-  if (current !== attemptedValue) return;
+  if (safeLocalGet(key) !== attemptedValue) return;
   if (previousValue === null) safeLocalRemove(key);
   else safeLocalSet(key, previousValue);
 }
 
-/**
- * Desktop boot: pull the one current product shape from SQLite into the cache.
- * localStorage is only a first-paint mirror and is never imported into the
- * authoritative store. No-op off-desktop. Fires hydration listeners on
- * completion so already-mounted consumers re-read the authoritative values.
- */
-export function hydrateAppSettings(): Promise<boolean> {
-  if (!isTauriRuntime() || hydrated) return Promise.resolve(true);
-  if (hydrationPromise) return hydrationPromise;
-
-  const request = (async (): Promise<boolean> => {
-    const fetchSnapshot = async (): Promise<Record<string, string> | null> => {
-      try {
-        const res = await fetch('/api/app-settings', { method: 'GET' });
-        if (!res.ok) return null;
-        const json = (await res.json()) as { settings?: Record<string, string> };
-        return json.settings ?? {};
-      } catch {
-        return null;
-      }
-    };
-
-    let settings = await fetchSnapshot();
-    if (!settings) return false;
-
-    // Reconcile every mutation that began before hydration completed. A
-    // successful final PATCH owns its cache value; a failed final PATCH forces
-    // a fresh authoritative snapshot so an earlier successful write in the same
-    // per-key queue is also represented correctly.
-    const successfulOverlapKeys = new Set<string>();
-    while (preHydrationPatchResults.size > 0) {
-      const batch = Array.from(preHydrationPatchResults.entries());
-      const results = await Promise.all(
-        batch.map(async ([key, pending]) => ({
-          key,
-          pending,
-          ok: await pending,
-        })),
-      );
-      let refetch = false;
-      for (const { key, pending, ok } of results) {
-        if (preHydrationPatchResults.get(key) !== pending) continue;
-        preHydrationPatchResults.delete(key);
-        if (ok) {
-          successfulOverlapKeys.add(key);
-        } else {
-          successfulOverlapKeys.delete(key);
-          refetch = true;
-        }
-      }
-      if (refetch) {
-        settings = await fetchSnapshot();
-        if (!settings) return false;
-      }
+function notifyHydrated(): void {
+  for (const cb of Array.from(hydratedListeners)) {
+    try {
+      cb();
+    } catch {
+      // A throwing listener must not abort the rest of the fan-out.
     }
+  }
+}
 
-    const preserveLocalValue = (key: string): boolean =>
-      successfulOverlapKeys.has(key)
-      || (preHydrationMutatedKeys.has(key) && !isWritableAppSettingKey(key));
-    for (const key of Array.from(cache.keys())) {
-      if (!preserveLocalValue(key) && !Object.hasOwn(settings, key)) {
-        cache.delete(key);
-      }
-    }
-    for (const [key, value] of Object.entries(settings)) {
-      if (!preserveLocalValue(key)) cache.set(key, value);
-    }
+async function fetchAuthoritativeSettings(): Promise<Record<string, string>> {
+  const res = await fetch('/api/app-settings', { method: 'GET' });
+  if (!res.ok) {
+    throw new Error(`app-settings GET returned HTTP ${res.status}`);
+  }
+  const json: unknown = await res.json();
+  if (
+    !json
+    || typeof json !== 'object'
+    || Array.isArray(json)
+    || !Object.prototype.hasOwnProperty.call(json, 'settings')
+  ) {
+    throw new Error('app-settings GET returned an invalid payload');
+  }
+  const settings = (json as { settings: unknown }).settings;
+  if (
+    !settings
+    || typeof settings !== 'object'
+    || Array.isArray(settings)
+    || Object.values(settings).some(value => typeof value !== 'string')
+  ) {
+    throw new Error('app-settings GET returned an invalid payload');
+  }
+  return settings as Record<string, string>;
+}
 
-    hydrated = true;
-    preHydrationMutatedKeys.clear();
-    preHydrationPatchResults.clear();
-    for (const cb of Array.from(hydratedListeners)) {
-      try {
-        cb();
-      } catch {
-        // A throwing listener must not abort the rest of the fan-out.
-      }
+function applyAuthoritativeSettings(
+  settings: Record<string, string>,
+  gensAtStart: Map<string, number>,
+): void {
+  for (const key of ALL_WRITABLE_KEYS) {
+    if ((mutationGeneration.get(key) ?? 0) !== (gensAtStart.get(key) ?? 0)) {
+      continue;
     }
-    return true;
-  })().finally(() => {
-    if (hydrationPromise === request) hydrationPromise = null;
-  });
-  hydrationPromise = request;
-  return request;
+    if (Object.prototype.hasOwnProperty.call(settings, key)) {
+      const value = settings[key]!;
+      cache.set(key, value);
+      safeLocalSet(key, value);
+    } else {
+      cache.delete(key);
+      safeLocalRemove(key);
+    }
+  }
+}
+
+async function waitForQueuedSettingPatches(): Promise<void> {
+  while (settingPatchTails.size > 0) {
+    await Promise.allSettled(Array.from(settingPatchTails.values()));
+  }
+}
+
+async function beginAuthoritativeFetchAfterQueuedPatches(): Promise<{
+  gensAtStart: Map<string, number>;
+  request: Promise<Record<string, string>>;
+}> {
+  for (;;) {
+    await waitForQueuedSettingPatches();
+    // Dispatch GET in the same continuation as the empty-queue check.
+    if (settingPatchTails.size === 0) {
+      return {
+        gensAtStart: snapshotMutationGenerations(),
+        request: fetchAuthoritativeSettings(),
+      };
+    }
+  }
+}
+
+function writableMutationChanged(gensAtStart: Map<string, number>): boolean {
+  return ALL_WRITABLE_KEYS.some(
+    key => (mutationGeneration.get(key) ?? 0) !== (gensAtStart.get(key) ?? 0),
+  );
+}
+
+async function hydrateWithBoundedRetries(): Promise<HydrateAppSettingsResult> {
+  let lastError = 'app-settings hydration failed';
+  for (let attempt = 0; attempt < HYDRATE_MAX_ATTEMPTS; attempt++) {
+    const delay = HYDRATE_RETRY_DELAYS_MS[attempt] ?? 0;
+    if (delay > 0) await sleep(delay);
+    try {
+      const { gensAtStart, request } = await beginAuthoritativeFetchAfterQueuedPatches();
+      const settings = await request;
+      // Any write that starts while GET is in flight makes that snapshot
+      // temporally ambiguous. Start over: the next iteration first drains the
+      // PATCH queue, then takes a snapshot that is newer than its outcome.
+      // This also covers the reverse race where GET resolves before a durable
+      // PATCH fails and its caller restores the previous mirror.
+      if (writableMutationChanged(gensAtStart)) {
+        lastError = 'app-settings changed during hydration';
+        continue;
+      }
+      applyAuthoritativeSettings(settings, gensAtStart);
+      hydrated = true;
+      notifyHydrated();
+      return { ok: true };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 /**
- * Run `cb` once hydration has populated the cache (immediately if already
- * hydrated). Stores that drive React subscriptions use this to refresh
- * consumers after a port-change first paint. Returns an unsubscribe fn.
+ * Pull authoritative SQLite settings. Failure never masquerades as an empty
+ * successful snapshot; callers may retry on focus/online.
  */
+export async function hydrateAppSettings(): Promise<HydrateAppSettingsResult> {
+  if (!isTauriRuntime() || hydrated) return { ok: true };
+  if (hydrateInFlight) return hydrateInFlight;
+
+  hydrateInFlight = hydrateWithBoundedRetries().finally(() => {
+    hydrateInFlight = null;
+  });
+  return hydrateInFlight;
+}
+
+export function isAppSettingsHydrated(): boolean {
+  return hydrated || !isTauriRuntime();
+}
+
 export function onAppSettingsHydrated(cb: () => void): () => void {
   if (hydrated) {
     cb();
@@ -305,10 +325,9 @@ export function onAppSettingsHydrated(cb: () => void): () => void {
 /** Test-only reset of module singletons. */
 export function __resetAppSettingsClientForTest(): void {
   cache.clear();
+  mutationGeneration.clear();
   settingPatchTails.clear();
-  preHydrationMutatedKeys.clear();
-  preHydrationPatchResults.clear();
-  hydrated = false;
-  hydrationPromise = null;
   hydratedListeners.clear();
+  hydrated = false;
+  hydrateInFlight = null;
 }

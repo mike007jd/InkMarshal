@@ -124,8 +124,8 @@ function chapterSummary(n) {
 
 function checkSchema(db) {
   const version = db.prepare('SELECT version FROM _schema_version ORDER BY version DESC LIMIT 1').get()?.version;
-  if (version !== 1) {
-    console.error(`Expected InkMarshal baseline schema v1, found ${version ?? 'none'}. Start the app once with this INKMARSHAL_DATA_DIR before seeding.`);
+  if (version !== 19) {
+    console.error(`Expected InkMarshal schema v19, found ${version ?? 'none'}. Start the app once with this INKMARSHAL_DATA_DIR before seeding.`);
     process.exit(3);
   }
 }

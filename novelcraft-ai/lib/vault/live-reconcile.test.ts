@@ -20,10 +20,13 @@ describe('live vault reconcile event helpers', () => {
     expect(chunks[1]).toEqual(['characters/entry-64.md']);
   });
 
-  it('skips transient read failures but treats missing rename paths as deletes', async () => {
+  it('deletes only on explicit missing-file results for rename/remove/other', async () => {
     const readContent = vi.fn(async (relPath: string) => {
-      if (relPath.includes('missing')) throw new Error('Cannot stat missing file');
-      if (relPath.includes('locked')) throw new Error('not ready');
+      if (relPath.includes('missing')) {
+        throw new Error(
+          "VAULT_ENTRY_NOT_FOUND: Cannot stat '/vault/missing.md': No such file or directory",
+        );
+      }
       return `content for ${relPath}`;
     });
 
@@ -31,21 +34,96 @@ describe('live vault reconcile event helpers', () => {
       collectLiveVaultChangedFiles('modify', [
         'characters/ready.md',
         'characters/missing.md',
-        'characters/locked.md',
       ], readContent),
-    ).resolves.toEqual([
-      { path: 'characters/ready.md', content: 'content for characters/ready.md' },
-    ]);
+    ).resolves.toEqual({
+      files: [
+        { path: 'characters/ready.md', content: 'content for characters/ready.md' },
+      ],
+      deferredDeletePaths: [],
+    });
 
     await expect(
       collectLiveVaultChangedFiles('rename', [
         'characters/ready.md',
         'characters/missing.md',
-        'characters/locked.md',
       ], readContent),
-    ).resolves.toEqual([
-      { path: 'characters/ready.md', content: 'content for characters/ready.md' },
-      { path: 'characters/missing.md', content: null },
-    ]);
+    ).resolves.toEqual({
+      files: [
+        { path: 'characters/ready.md', content: 'content for characters/ready.md' },
+        { path: 'characters/missing.md', content: null },
+      ],
+      deferredDeletePaths: [],
+    });
+
+    // A still-readable path must never become content:null merely because the
+    // event kind is remove (e.g. sibling B removed in the same debounce window).
+    await expect(
+      collectLiveVaultChangedFiles('remove', [
+        'characters/a.md',
+        'characters/missing-b.md',
+      ], readContent),
+    ).resolves.toEqual({
+      files: [
+        { path: 'characters/a.md', content: 'content for characters/a.md' },
+        { path: 'characters/missing-b.md', content: null },
+      ],
+      deferredDeletePaths: [],
+    });
+  });
+
+  it('defers missing remove/rename/other while deletes are ineligible', async () => {
+    const readContent = vi.fn(async (relPath: string) => {
+      if (relPath.includes('missing')) {
+        throw new Error(
+          "VAULT_ENTRY_NOT_FOUND: Cannot stat '/vault/missing.md': No such file or directory",
+        );
+      }
+      return `content for ${relPath}`;
+    });
+
+    await expect(
+      collectLiveVaultChangedFiles(
+        'remove',
+        ['characters/a.md', 'characters/missing-b.md'],
+        readContent,
+        { allowMissingFileDeletes: false },
+      ),
+    ).resolves.toEqual({
+      files: [
+        { path: 'characters/a.md', content: 'content for characters/a.md' },
+      ],
+      deferredDeletePaths: ['characters/missing-b.md'],
+    });
+  });
+
+  it.each(['modify', 'rename', 'remove', 'other'] as const)(
+    'rejects %s batches on non-missing read failures so the runtime can retry',
+    async kind => {
+      await expect(
+        collectLiveVaultChangedFiles(
+          kind,
+          ['characters/locked.md'],
+          async () => {
+            throw new Error(
+              "Cannot stat '/vault/locked.md': Permission denied (os error 13)",
+            );
+          },
+        ),
+      ).rejects.toThrow('Permission denied');
+    },
+  );
+
+  it('never treats an unreachable vault root as an entry deletion', async () => {
+    await expect(
+      collectLiveVaultChangedFiles(
+        'remove',
+        ['characters/a.md'],
+        async () => {
+          throw new Error(
+            "VAULT_ROOT_UNREACHABLE: Cannot resolve vault path '/Volumes/offline'",
+          );
+        },
+      ),
+    ).rejects.toThrow('VAULT_ROOT_UNREACHABLE');
   });
 });

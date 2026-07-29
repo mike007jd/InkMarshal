@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { en } from '@/lib/i18n/en';
-import { recoveryMessage, roleSummary, installDate, formatLabel, roleChipLabel } from './model-presentation';
+import { zhCN } from '@/lib/i18n/zh-CN';
+import {
+  recoveryMessage,
+  roleSummary,
+  installDate,
+  formatLabel,
+  roleChipLabel,
+  roleListSummary,
+} from './model-presentation';
 import type { CuratedModelEntry } from '@/lib/model-supply/types';
 
 const t = en;
@@ -51,5 +59,8 @@ describe('installDate / formatLabel / roleChipLabel', () => {
   });
   it('labels capability role chips', () => {
     expect(roleChipLabel('planning', t)).toBe(en.modelManagerRolePlanning);
+  });
+  it('localizes role ids and punctuation in visible role lists', () => {
+    expect(roleListSummary(['draft', 'rewrite'], zhCN, 'zh-CN')).toBe('起草、改写');
   });
 });

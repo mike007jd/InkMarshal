@@ -20,6 +20,7 @@ import { DeleteNovelDialog } from '@/components/DeleteNovelDialog';
 import { TrashPanel } from '@/components/TrashPanel';
 import { AIActionGateCoordinator } from '@/components/AIActionGateCoordinator';
 import { DesktopUpdateCoordinator } from '@/components/DesktopUpdateCoordinator';
+import { VaultRuntimeCoordinator } from '@/components/VaultRuntimeCoordinator';
 import { ModelsPanel } from '@/components/ModelsPanel';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { useToast } from '@/components/Toast';
@@ -197,8 +198,8 @@ export function DesktopShell({ children }: DesktopShellProps) {
     const initializeReadiness = (): void => {
       if (readinessEnabled || initializationPromise) return;
       const request = (async () => {
-        const settingsReady = await hydrateAppSettings();
-        if (!mounted || !settingsReady) return;
+        const result = await hydrateAppSettings();
+        if (!mounted || !result.ok) return;
         // Hydration makes connection endpoints authoritative. Restore local
         // child processes before the first readiness paint; a restore failure
         // still leaves provider probing safe and dead local engines truthful.
@@ -218,6 +219,8 @@ export function DesktopShell({ children }: DesktopShellProps) {
     // Local engines die with the app process, so relaunch what was running at
     // last quit (and prune dead bindings) before the first readiness read so
     // the shell never paints a zombie "bound but dead" state on boot.
+    // A failed hydrate must not restore from the unauthoritative first-paint
+    // mirror. Focus/online later retrigger the bounded hydration attempt.
     initializeReadiness();
     const unsubscribeConnections = subscribeConnectionsStore(() => {
       if (readinessEnabled) refreshReadiness(true);
@@ -227,17 +230,19 @@ export function DesktopShell({ children }: DesktopShellProps) {
       if (readinessEnabled) refreshReadiness();
       else initializeReadiness();
     });
-    const onFocus = () => {
+    const retry = () => {
       if (readinessEnabled) refreshReadiness();
       else initializeReadiness();
     };
-    window.addEventListener('focus', onFocus);
-    const healthInterval = window.setInterval(onFocus, CAPABILITY_HEALTH_REFRESH_MS);
+    window.addEventListener('focus', retry);
+    window.addEventListener('online', retry);
+    const healthInterval = window.setInterval(retry, CAPABILITY_HEALTH_REFRESH_MS);
     return () => {
       mounted = false;
       unsubscribeConnections();
       unsubscribeLocalModels();
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', retry);
+      window.removeEventListener('online', retry);
       window.clearInterval(healthInterval);
     };
   }, []);
@@ -254,15 +259,15 @@ export function DesktopShell({ children }: DesktopShellProps) {
   const modelCoverageLabel = t.modelReadinessCoverage
     .replace('{ready}', String(modelCoverage.readyCount))
     .replace('{total}', String(modelCoverage.totalCount));
-  const missingModelRolesLabel = modelCoverage.notReadyRoles
-    .map(role => roleChipLabel(role, t))
-    .join(', ');
   const modelCoverageTooltip = modelCoverage.complete
     ? t.modelReadinessCoverageComplete
     : t.modelReadinessCoverageTooltip
         .replace('{ready}', String(modelCoverage.readyCount))
         .replace('{total}', String(modelCoverage.totalCount))
-        .replace('{roles}', missingModelRolesLabel);
+        .replace(
+          '{roles}',
+          modelCoverage.notReadyRoles.map(role => roleChipLabel(role, t)).join(', '),
+        );
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -717,6 +722,7 @@ export function DesktopShell({ children }: DesktopShellProps) {
        />
        <AIActionGateCoordinator />
        <DesktopUpdateCoordinator />
+       <VaultRuntimeCoordinator />
        <ModelsPanel open={false} />
       <SettingsPanel
         open={showSettings}

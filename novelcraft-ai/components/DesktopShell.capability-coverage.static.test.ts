@@ -24,14 +24,15 @@ describe('DesktopShell non-local capability coverage health probes', () => {
   it('invalidates on config mutation but preserves confirmed health during refresh probes', () => {
     expect(shell).toContain('healthyConnectionModels');
     expect(shell).toContain('if (readinessEnabled) refreshReadiness(true)');
-    expect(shell).toContain("window.addEventListener('focus', onFocus)");
-    expect(shell).toContain('window.setInterval(onFocus, CAPABILITY_HEALTH_REFRESH_MS)');
+    expect(shell).toContain("window.addEventListener('focus', retry)");
+    expect(shell).toContain("window.addEventListener('online', retry)");
+    expect(shell).toContain('window.setInterval(retry, CAPABILITY_HEALTH_REFRESH_MS)');
     expect(shell).toContain('window.clearInterval(healthInterval)');
   });
 
   it('never probes non-authoritative connection mirrors before SQLite hydration', () => {
-    expect(shell).toContain('const settingsReady = await hydrateAppSettings()');
-    expect(shell).toContain('if (!mounted || !settingsReady) return');
+    expect(shell).toContain('const result = await hydrateAppSettings()');
+    expect(shell).toContain('if (!mounted || !result.ok) return');
     expect(shell).toContain('if (!readinessEnabled) return');
     expect(shell.indexOf('await hydrateAppSettings()')).toBeLessThan(
       shell.indexOf('readinessEnabled = true'),

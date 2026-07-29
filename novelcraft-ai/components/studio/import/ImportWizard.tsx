@@ -10,7 +10,7 @@
 // server actions are pure round-trips. i18n is the self-contained `importCopy`
 // table — the shared bundle is untouched per the W2-1 constraint.
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { FileUp, AlertTriangle } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
@@ -66,6 +66,34 @@ interface ImportWizardProps {
 
 type Step = 'pick' | 'preview';
 
+/**
+ * Merge dedupe is a real state machine — never undefined ambiguity:
+ *
+ *   idle    — new-import mode, or nothing to check yet. Confirm is free.
+ *   loading — a report request is in flight for `fingerprint`.
+ *   ready   — a complete report for `fingerprint` is in hand; decisions exist.
+ *   stale   — candidates/target changed after the last check; decisions were
+ *             discarded and the user must re-check before merging.
+ *   error   — the request failed; localized message + retry control shown.
+ *
+ * `fingerprint` binds a report to the exact target + candidate set it was
+ * computed from, so a stale async response can never satisfy a newer set.
+ */
+type DedupeState =
+  | { status: 'idle' }
+  | { status: 'loading'; fingerprint: string }
+  | { status: 'ready'; fingerprint: string; report: DedupeResult[] }
+  | { status: 'stale' }
+  | { status: 'error' };
+
+/** Bind a dedupe report to the exact target + candidate set it describes. */
+function dedupeFingerprint(targetNovelId: string, candidates: ChapterCandidate[]): string {
+  return JSON.stringify([
+    targetNovelId,
+    candidates.map(c => [c.id, c.chapterNumber, c.title, c.wordCount]),
+  ]);
+}
+
 export function ImportWizard(props: ImportWizardProps) {
   return (
     <Dialog open={props.open} onOpenChange={(next) => { if (!next) props.onClose(); }}>
@@ -93,8 +121,11 @@ function ImportWizardBody({
   const [filename, setFilename] = useState('');
   const [novelTitle, setNovelTitle] = useState('');
   const [candidates, setCandidates] = useState<ChapterCandidate[]>([]);
-  const [dedupe, setDedupe] = useState<DedupeResult[] | undefined>(undefined);
+  const [dedupeState, setDedupeState] = useState<DedupeState>({ status: 'idle' });
   const [actions, setActions] = useState<Record<string, DedupeAction>>({});
+  // Monotonic request id: a late response from an older target/candidate set
+  // sees a stale seq and is discarded instead of overwriting current state.
+  const dedupeSeqRef = useRef(0);
 
   const hasNovels = novels.length > 0;
   const [mode, setMode] = useState<'new' | 'merge'>(
@@ -108,44 +139,100 @@ function ImportWizardBody({
     () => candidates.reduce((sum, c) => sum + c.wordCount, 0),
     [candidates],
   );
-  const conflictCount = useMemo(
-    () => (dedupe ?? []).filter(d => d.status === 'conflict').length,
-    [dedupe],
+  const currentFingerprint = useMemo(
+    () => dedupeFingerprint(targetNovelId, candidates),
+    [targetNovelId, candidates],
   );
+  // The merge confirm is gated on a COMPLETE report for the exact target +
+  // candidate set currently on screen — nothing older, nothing partial.
+  const dedupeReady =
+    dedupeState.status === 'ready' && dedupeState.fingerprint === currentFingerprint;
+  const dedupeReport = dedupeReady ? dedupeState.report : undefined;
+  const conflictCount = useMemo(
+    () => (dedupeReport ?? []).filter(d => d.status === 'conflict').length,
+    [dedupeReport],
+  );
+  const duplicateOverwriteTargets = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const decision of dedupeReport ?? []) {
+      if (
+        decision.matchedChapterNumber !== null
+        && (actions[decision.candidateId] ?? decision.defaultAction) === 'overwrite'
+      ) {
+        counts.set(
+          decision.matchedChapterNumber,
+          (counts.get(decision.matchedChapterNumber) ?? 0) + 1,
+        );
+      }
+    }
+    return [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([chapterNumber]) => chapterNumber)
+      .sort((a, b) => a - b);
+  }, [actions, dedupeReport]);
 
   // Recompute the merge dedupe report against `targetId`. We no longer hold the
   // source bytes, so the report is rebuilt from the in-memory candidates via the
   // dedicated /import/dedupe endpoint (the server owns the target's chapters).
   // Driven from the mode/target change handlers (not an effect) so the network
   // round-trip is an explicit user action, never a render side effect.
-  const runDedupe = useCallback(async (targetId: string) => {
-    if (!targetId || candidates.length === 0) return;
-    setBusy(true);
-    try {
-      const report = await fetchDedupeReport(targetId, candidates);
-      setDedupe(report);
-      const nextActions: Record<string, DedupeAction> = {};
-      for (const d of report) nextActions[d.candidateId] = d.defaultAction;
-      setActions(nextActions);
-    } catch {
-      setDedupe(undefined);
-    } finally {
-      setBusy(false);
-    }
-  }, [candidates]);
+  const runDedupe = useCallback(
+    async (targetId: string, reportCandidates: ChapterCandidate[]) => {
+      if (!targetId || reportCandidates.length === 0) return;
+      const fingerprint = dedupeFingerprint(targetId, reportCandidates);
+      const seq = ++dedupeSeqRef.current;
+      setDedupeState({ status: 'loading', fingerprint });
+      try {
+        const report = await fetchDedupeReport(targetId, reportCandidates);
+        if (dedupeSeqRef.current !== seq) return; // superseded by a newer request
+        setDedupeState({ status: 'ready', fingerprint, report });
+        const nextActions: Record<string, DedupeAction> = {};
+        for (const d of report) nextActions[d.candidateId] = d.defaultAction;
+        setActions(nextActions);
+      } catch {
+        if (dedupeSeqRef.current !== seq) return;
+        setDedupeState({ status: 'error' });
+      }
+    },
+    [],
+  );
 
   const selectMode = (nextMode: 'new' | 'merge') => {
     setMode(nextMode);
     if (nextMode === 'merge') {
-      if (targetNovelId) void runDedupe(targetNovelId);
+      if (targetNovelId) void runDedupe(targetNovelId, candidates);
     } else {
-      setDedupe(undefined);
+      // New-import mode needs no report; discard any merge decisions so they
+      // can never leak into a later confirm.
+      dedupeSeqRef.current += 1;
+      setDedupeState({ status: 'idle' });
+      setActions({});
     }
   };
 
   const selectTarget = (nextTarget: string) => {
     setTargetNovelId(nextTarget);
-    if (mode === 'merge' && nextTarget) void runDedupe(nextTarget);
+    if (mode === 'merge') {
+      setActions({});
+      if (nextTarget) void runDedupe(nextTarget, candidates);
+      else {
+        dedupeSeqRef.current += 1;
+        setDedupeState({ status: 'idle' });
+      }
+    }
+  };
+
+  // Any candidate edit (title, merge, split — renumbering included) invalidates
+  // the report computed for the old set: decisions are dropped and the merge
+  // confirm stays locked until the user re-checks.
+  const handleCandidatesChange = (next: ChapterCandidate[]) => {
+    const renumbered = renumberCandidates(next);
+    setCandidates(renumbered);
+    if (mode === 'merge') {
+      dedupeSeqRef.current += 1;
+      setDedupeState(prev => (prev.status === 'idle' ? prev : { status: 'stale' }));
+      setActions({});
+    }
   };
 
   const handlePick = async () => {
@@ -171,11 +258,7 @@ function ImportWizardBody({
       // Launched against a specific novel (from its "…" menu): run the merge
       // dedupe immediately so the preview opens with the report populated.
       if (mode === 'merge' && targetNovelId) {
-        const report = await fetchDedupeReport(targetNovelId, result.candidates);
-        setDedupe(report);
-        const nextActions: Record<string, DedupeAction> = {};
-        for (const d of report) nextActions[d.candidateId] = d.defaultAction;
-        setActions(nextActions);
+        void runDedupe(targetNovelId, result.candidates);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : copy.parseFailed);
@@ -186,7 +269,11 @@ function ImportWizardBody({
 
   const handleConfirm = async () => {
     if (busy) return;
-    if (mode === 'merge' && !targetNovelId) return;
+    // Fail closed: merge confirm requires a complete, current dedupe report.
+    if (
+      mode === 'merge'
+      && (!targetNovelId || !dedupeReport || duplicateOverwriteTargets.length > 0)
+    ) return;
     setBusy(true);
     setError(null);
 
@@ -209,11 +296,14 @@ function ImportWizardBody({
         targetNovelId: mode === 'merge' ? targetNovelId : undefined,
         dedupeDecisions:
           mode === 'merge'
-            ? (dedupe ?? []).map(d => {
+            ? // Exactly one decision per current candidate, from the report
+              // whose fingerprint matches the candidate set being submitted.
+              dedupeReport!.map(d => {
                 const cand = candidates.find(c => c.id === d.candidateId);
                 return {
                   chapterNumber: cand?.chapterNumber ?? 0,
                   action: actions[d.candidateId] ?? d.defaultAction,
+                  matchedChapterNumber: d.matchedChapterNumber,
                 };
               })
             : undefined,
@@ -325,6 +415,54 @@ function ImportWizardBody({
             </label>
           )}
 
+          {mode === 'merge' && dedupeState.status === 'loading' && (
+            <div
+              className="flex items-center gap-2 rounded-md border border-book-border bg-book-bg-card px-3 py-2 text-xs text-book-ink-muted"
+              role="status"
+            >
+              <Spinner />
+              <span>{copy.dedupeChecking}</span>
+            </div>
+          )}
+
+          {mode === 'merge' && dedupeState.status === 'error' && (
+            <div
+              className="flex items-start gap-2 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-xs text-book-danger"
+              role="alert"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="min-w-0 flex-1">{copy.dedupeFailed}</span>
+              <Button
+                variant="ghost"
+                type="button"
+                onClick={() => void runDedupe(targetNovelId, candidates)}
+                disabled={busy}
+                className="h-auto shrink-0 border border-book-danger-border bg-book-bg-card px-2 py-1 text-xs"
+              >
+                {copy.dedupeRetry}
+              </Button>
+            </div>
+          )}
+
+          {mode === 'merge' && dedupeState.status === 'stale' && (
+            <div
+              className="flex items-start gap-2 rounded-md border border-book-warning-border bg-book-warning-light px-3 py-2 text-xs text-book-stage-writing"
+              role="alert"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="min-w-0 flex-1">{copy.dedupeStale}</span>
+              <Button
+                variant="ghost"
+                type="button"
+                onClick={() => void runDedupe(targetNovelId, candidates)}
+                disabled={busy}
+                className="h-auto shrink-0 border border-book-warning-border bg-book-bg-card px-2 py-1 text-xs"
+              >
+                {copy.dedupeRecheck}
+              </Button>
+            </div>
+          )}
+
           {mode === 'merge' && conflictCount > 0 && (
             <div className="flex items-start gap-2 rounded-md border border-book-warning-border bg-book-warning-light px-3 py-2 text-xs text-book-stage-writing">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -332,11 +470,21 @@ function ImportWizardBody({
             </div>
           )}
 
+          {mode === 'merge' && duplicateOverwriteTargets.length > 0 && (
+            <div
+              className="flex items-start gap-2 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-xs text-book-danger"
+              role="alert"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{copy.duplicateOverwriteTargets(duplicateOverwriteTargets)}</span>
+            </div>
+          )}
+
           <div className="min-h-0 flex-1 overflow-y-auto pr-1">
             <ChapterSplitEditor
               candidates={candidates}
-              onChange={(next) => setCandidates(renumberCandidates(next))}
-              dedupe={mode === 'merge' ? dedupe : undefined}
+              onChange={handleCandidatesChange}
+              dedupe={mode === 'merge' ? dedupeReport : undefined}
               actions={actions}
               onActionChange={(id, action) =>
                 setActions(prev => ({ ...prev, [id]: action }))
@@ -385,7 +533,13 @@ function ImportWizardBody({
             variant="ink"
             type="button"
             onClick={handleConfirm}
-            disabled={busy || (mode === 'merge' && !targetNovelId)}
+            disabled={
+              busy
+              || (
+                mode === 'merge'
+                && (!targetNovelId || !dedupeReady || duplicateOverwriteTargets.length > 0)
+              )
+            }
             className="h-auto px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40"
           >
             {busy ? <Spinner /> : null}
@@ -419,7 +573,47 @@ async function fetchDedupeReport(
     }),
   });
   if (!res.ok) throw new Error(`dedupe ${res.status}`);
-  return (await res.json()) as DedupeResult[];
+  const raw: unknown = await res.json();
+  const expectedIds = new Set(candidates.map(candidate => candidate.id));
+  if (expectedIds.size !== candidates.length || !Array.isArray(raw) || raw.length !== candidates.length) {
+    throw new Error('incomplete dedupe report');
+  }
+
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') throw new Error('invalid dedupe row');
+    const row = item as Record<string, unknown>;
+    const candidateId = row.candidateId;
+    const status = row.status;
+    const defaultAction = row.defaultAction;
+    if (
+      typeof candidateId !== 'string'
+      || !expectedIds.has(candidateId)
+      || seen.has(candidateId)
+      || (status !== 'new' && status !== 'duplicate' && status !== 'conflict')
+      || (defaultAction !== 'skip' && defaultAction !== 'overwrite' && defaultAction !== 'append')
+    ) {
+      throw new Error('invalid dedupe row identity or decision');
+    }
+    const matchedChapterNumber = row.matchedChapterNumber;
+    const matchedTitle = row.matchedTitle;
+    const expectedDefaultAction = status === 'new'
+      ? 'append'
+      : status === 'duplicate'
+        ? 'skip'
+        : 'overwrite';
+    const matchIsValid = status === 'new'
+      ? matchedChapterNumber === null && matchedTitle === null
+      : Number.isInteger(matchedChapterNumber)
+        && Number(matchedChapterNumber) > 0
+        && typeof matchedTitle === 'string';
+    if (!matchIsValid || defaultAction !== expectedDefaultAction) {
+      throw new Error('invalid dedupe match');
+    }
+    seen.add(candidateId);
+  }
+  if (seen.size !== expectedIds.size) throw new Error('incomplete dedupe report');
+  return raw as DedupeResult[];
 }
 
 async function runKbExtraction(

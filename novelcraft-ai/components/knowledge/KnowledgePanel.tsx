@@ -35,6 +35,7 @@ import {
   summarizeKnowledgeEntryPreview,
   type KnowledgeFilterTab,
 } from '@/lib/knowledge-workspace';
+import { subscribeVaultEntriesChanged } from '@/lib/vault/runtime-events';
 
 interface KnowledgePanelProps {
   novelId: string;
@@ -273,6 +274,12 @@ export function KnowledgePanel({
       cancelled = true;
     };
   }, [fetchEntries, refreshToken, retryToken]);
+
+  useEffect(() => {
+    return subscribeVaultEntriesChanged(novelId, () => {
+      setRetryToken(value => value + 1);
+    });
+  }, [novelId]);
 
   const handleSaved = () => {
     setEditingEntry(null);

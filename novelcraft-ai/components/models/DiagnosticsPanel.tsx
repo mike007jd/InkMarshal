@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLanguage } from '@/components/LanguageProvider';
+import { roleListSummary } from '@/components/models/model-presentation';
 import {
   getCapabilityProfile,
   getConnections,
@@ -17,7 +18,7 @@ import {
   isTauriRuntime,
 } from '@/lib/desktop-runtime';
 import { subscribeLocalModelStateChanged } from '@/lib/model-supply/local-model-events';
-import type { InstalledLocalModel } from '@/lib/model-supply/types';
+import type { CapabilityRole, InstalledLocalModel } from '@/lib/model-supply/types';
 
 const FREE_SPACE_WARNING_BYTES = 2 * 1024 ** 3; // 2 GB
 
@@ -34,8 +35,8 @@ export function DiagnosticsPanel({
 }: {
   includeNoModels?: boolean;
 } = {}) {
-  const { t } = useLanguage();
-  const [danglingRoles, setDanglingRoles] = useState<string[]>([]);
+  const { locale, t } = useLanguage();
+  const [danglingRoles, setDanglingRoles] = useState<CapabilityRole[]>([]);
   const [hasValidBinding, setHasValidBinding] = useState(false);
   const [freeBytes, setFreeBytes] = useState<number | null>(null);
   const [installed, setInstalled] = useState<InstalledLocalModel[]>([]);
@@ -111,7 +112,10 @@ export function DiagnosticsPanel({
         id: 'dangling-binding',
         kind: 'dangling-binding',
         title: t.diagnosticsDanglingTitle.replace('{count}', String(danglingRoles.length)),
-        detail: t.diagnosticsDanglingDetail.replace('{roles}', danglingRoles.join(', ')),
+        detail: t.diagnosticsDanglingDetail.replace(
+          '{roles}',
+          roleListSummary(danglingRoles, t, locale),
+        ),
         cta: {
           label: t.diagnosticsDanglingFix,
           onClick: async () => {
@@ -136,7 +140,7 @@ export function DiagnosticsPanel({
       });
     }
     return out;
-  }, [includeNoModels, installed.length, hasValidBinding, danglingRoles, freeBytes, t]);
+  }, [includeNoModels, installed.length, hasValidBinding, danglingRoles, freeBytes, locale, t]);
 
   if (issues.length === 0) return null;
 

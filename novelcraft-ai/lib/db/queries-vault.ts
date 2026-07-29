@@ -38,10 +38,96 @@ export async function setNovelVaultPath(
   }
 }
 
+/**
+ * The absolute value is a durable transition generation. Pending roots store
+ * it as negative; established roots store it as positive. Advancing from
+ * either state therefore cannot reuse an older B→C→B bootstrap token.
+ */
+export function nextVaultTransitionToken(currentVersion: number): number {
+  if (!Number.isSafeInteger(currentVersion)) {
+    throw new Error('Invalid Vault transition generation');
+  }
+  const nextGeneration = Math.abs(currentVersion) + 1;
+  if (!Number.isSafeInteger(nextGeneration)) {
+    throw new Error('Vault transition generation exhausted');
+  }
+  return -nextGeneration;
+}
+
+export function isVaultRootPending(vaultVersion: number): boolean {
+  return vaultVersion <= 0;
+}
+
+/**
+ * Atomically bind or rebind a novel Vault root and allocate a pending
+ * transition token. Same established root is a no-op; same pending root
+ * keeps its token.
+ */
+export async function bindNovelVaultRoot(
+  novelId: string,
+  vaultPath: string,
+): Promise<NovelVaultRow> {
+  const db = getDb();
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const row = db
+      .prepare('SELECT vault_path, vault_version FROM novels WHERE id = ?')
+      .get(novelId) as { vault_path: string | null; vault_version: number } | undefined;
+    if (!row) {
+      throw new Error(`Novel not found: ${novelId}`);
+    }
+    if (row.vault_path === vaultPath) {
+      return {
+        vaultPath,
+        vaultVersion: row.vault_version,
+      };
+    }
+    const token = nextVaultTransitionToken(row.vault_version);
+    db.prepare(
+      'UPDATE novels SET vault_path = ?, vault_version = ?, updated_at = ? WHERE id = ?',
+    ).run(vaultPath, token, now, novelId);
+    return { vaultPath, vaultVersion: token };
+  })();
+}
+
+/**
+ * Promote one exact pending Vault root (path + transition token) while
+ * retaining its generation. Never restores a stale path.
+ */
+export async function establishNovelVaultPath(
+  novelId: string,
+  expectedVaultPath: string,
+  expectedToken: number,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(expectedToken) || expectedToken >= 0) return false;
+  const establishedVersion = Math.abs(expectedToken);
+  const result = getDb().prepare(
+    `UPDATE novels
+        SET vault_version = ?, updated_at = ?
+      WHERE id = ?
+        AND vault_path = ?
+        AND vault_version = ?`,
+  ).run(
+    establishedVersion,
+    new Date().toISOString(),
+    novelId,
+    expectedVaultPath,
+    expectedToken,
+  );
+  return result.changes > 0;
+}
+
 export async function clearNovelVaultPath(novelId: string): Promise<void> {
   const db = getDb();
-  db.prepare('UPDATE novels SET vault_path = NULL, updated_at = ? WHERE id = ?')
-    .run(new Date().toISOString(), novelId);
+  db.transaction(() => {
+    const row = db.prepare('SELECT vault_version FROM novels WHERE id = ?')
+      .get(novelId) as { vault_version: number } | undefined;
+    if (!row) throw new Error(`Novel not found: ${novelId}`);
+    const clearedGeneration = Math.abs(nextVaultTransitionToken(row.vault_version));
+    db.prepare(
+      'UPDATE novels SET vault_path = NULL, vault_version = ?, updated_at = ? WHERE id = ?',
+    ).run(clearedGeneration, new Date().toISOString(), novelId);
+  })();
 }
 
 // --- knowledge_index helpers ----------------------------------------------
@@ -166,6 +252,7 @@ export async function replaceVaultKnowledgeProjection(row: {
   );
   const deleteEntry = db.prepare('DELETE FROM knowledge_entries WHERE id = ?');
   const deleteIndex = db.prepare('DELETE FROM knowledge_index WHERE id = ?');
+  const deleteEmbedding = db.prepare('DELETE FROM knowledge_embeddings WHERE id = ?');
   const updateCleanup = db.prepare(
     'UPDATE knowledge_entries SET data = ?, updated_at = ? WHERE id = ?',
   );
@@ -179,8 +266,10 @@ export async function replaceVaultKnowledgeProjection(row: {
     for (const update of row.cleanupUpdates ?? []) {
       updateCleanup.run(update.data, update.updatedAt, update.id);
       upsertKnowledgeIndex(db, update.index);
+      deleteEmbedding.run(update.id);
     }
     if (row.previousId && row.previousId !== row.entry.id) {
+      deleteEmbedding.run(row.previousId);
       deleteIndex.run(row.previousId);
       deleteEntry.run(row.previousId);
     }
@@ -197,6 +286,10 @@ export async function replaceVaultKnowledgeProjection(row: {
       row.entry.updatedAt,
     );
     upsertKnowledgeIndex(db, row.index);
+    // The projection and its derived vector are one consistency boundary.
+    // Delete the old vector inside this transaction so a crash can never leave
+    // an embedding whose content_hash describes the previous Vault contents.
+    deleteEmbedding.run(row.entry.id);
     touchNovelUpdatedAt(db, row.entry.novelId);
   });
   tx();

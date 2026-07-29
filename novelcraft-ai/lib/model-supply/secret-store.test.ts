@@ -85,4 +85,11 @@ describe('secret-store (desktop-only, fail-closed)', () => {
     isTauri.mockReturnValue(false);
     await expect(secretStoreActiveBackend()).rejects.toThrow(/desktop keychain runtime/);
   });
+
+  it('does not misreport an invoke failure as encrypted-file storage', async () => {
+    const { keychainStatus } = await import('@/lib/desktop-runtime');
+    vi.mocked(keychainStatus).mockRejectedValueOnce(new Error('command unavailable'));
+    const { secretStoreActiveBackend } = await load();
+    await expect(secretStoreActiveBackend()).rejects.toThrow('command unavailable');
+  });
 });
