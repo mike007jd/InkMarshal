@@ -197,11 +197,16 @@ pub(super) fn scan_installed_models_root(root: &Path) -> Result<Vec<InstalledLoc
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let metadata = read_installed_metadata(root);
-    let imported = read_imported_metadata(root);
+    // Walk the canonical models root so managed GGUF/MLX `model_path` values
+    // match `registered_model_path` / `engine_start` (e.g. macOS `/tmp` →
+    // `/private/tmp` via aliased ancestors). Symlinked model content is still
+    // skipped by the directory walk — this only resolves the scan root.
+    let root_canon = canonical_model_root(root)?;
+    let metadata = read_installed_metadata(&root_canon);
+    let imported = read_imported_metadata(&root_canon);
     let mut out = Vec::new();
-    scan_installed_models_dir(root, root, &metadata, &mut out)?;
-    append_imported_models(root, &imported, &mut out)?;
+    scan_installed_models_dir(&root_canon, &root_canon, &metadata, &mut out)?;
+    append_imported_models(&root_canon, &imported, &mut out)?;
     out.sort_by(|a, b| {
         a.label
             .to_ascii_lowercase()

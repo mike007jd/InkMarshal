@@ -302,9 +302,11 @@ mod installed_model_scan_tests {
         fs::create_dir_all(&nested_dir).expect("nested dir");
         let nested_model = nested_dir.join("writer.Q5_K_M.gguf");
         fs::write(&nested_model, b"GGUFnested").expect("nested gguf");
+        let flat_canon = flat_model.canonicalize().expect("canonical flat");
+        let nested_canon = nested_model.canonicalize().expect("canonical nested");
         let mut metadata = std::collections::HashMap::new();
         metadata.insert(
-            metadata_key(&flat_model),
+            metadata_key(&flat_canon),
             InstalledModelMetadata {
                 label: "Qwen3.5 9B Flat".to_string(),
                 source_repo: "unsloth/Qwen3.5-9B-GGUF".to_string(),
@@ -313,7 +315,7 @@ mod installed_model_scan_tests {
             },
         );
         metadata.insert(
-            metadata_key(&nested_model),
+            metadata_key(&nested_canon),
             InstalledModelMetadata {
                 label: "Qwen3.5 9B Nested".to_string(),
                 source_repo: "unsloth/Qwen3.5-9B-GGUF".to_string(),
@@ -331,6 +333,7 @@ mod installed_model_scan_tests {
         assert_eq!(flat.source_repo.as_deref(), Some("unsloth/Qwen3.5-9B-GGUF"));
         assert_eq!(flat.source_filename.as_deref(), Some("writer.Q4_K_M.gguf"));
         assert_eq!(flat.installed_at_unix, Some(1_717_171_717));
+        assert_eq!(flat.model_path, flat_canon.to_string_lossy());
 
         let nested = found
             .iter()
@@ -345,6 +348,7 @@ mod installed_model_scan_tests {
             Some("nested/writer.Q5_K_M.gguf")
         );
         assert_eq!(nested.installed_at_unix, Some(1_717_171_717));
+        assert_eq!(nested.model_path, nested_canon.to_string_lossy());
     }
 
     #[test]
@@ -551,6 +555,75 @@ mod installed_model_scan_tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].format, "mlx");
         assert_eq!(found[0].size_bytes, 6);
+    }
+
+    /// Models root reached through a symlinked ancestor must emit canonical
+    /// `model_path` (matching `engine_start`), while symlinked model files/dirs
+    /// remain skipped — no `/tmp` string special-case.
+    #[cfg(unix)]
+    #[test]
+    fn scan_emits_canonical_paths_through_aliased_ancestor_and_skips_symlinked_models() {
+        use std::os::unix::fs::symlink;
+
+        let real_anchor = test_root("alias-real-anchor");
+        let alias_parent = test_root("alias-link-parent");
+        let outside = test_root("alias-outside");
+
+        let real_models = real_anchor.join("models");
+        fs::create_dir_all(&real_models).expect("real models");
+        let alias_anchor = alias_parent.join("anchor");
+        symlink(&real_anchor, &alias_anchor).expect("symlinked ancestor");
+        let scan_root = alias_anchor.join("models");
+        assert_ne!(
+            scan_root.as_os_str(),
+            real_models
+                .canonicalize()
+                .expect("canonical models")
+                .as_os_str(),
+            "test setup must reach models through a non-canonical alias path"
+        );
+
+        let gguf_alias = scan_root.join("writer.Q4_K_M.gguf");
+        fs::write(&gguf_alias, b"GGUFmodel").expect("gguf");
+        let mlx_alias = scan_root.join("mlx-community_Qwen3-4B-4bit");
+        fs::create_dir_all(&mlx_alias).expect("mlx dir");
+        fs::write(mlx_alias.join("config.json"), b"{}").expect("config");
+        fs::write(mlx_alias.join("tokenizer.json"), b"{}").expect("tokenizer");
+        fs::write(mlx_alias.join("model.safetensors"), [4_u8, 5]).expect("weights");
+
+        fs::write(outside.join("linked.gguf"), b"GGUFlinked").expect("outside gguf");
+        fs::create_dir_all(outside.join("linked-dir")).expect("outside dir");
+        fs::write(
+            outside.join("linked-dir").join("extra.safetensors"),
+            [9_u8; 20],
+        )
+        .expect("outside weights");
+        symlink(outside.join("linked.gguf"), scan_root.join("skip-me.gguf")).expect("file symlink");
+        symlink(outside.join("linked-dir"), mlx_alias.join("linked-dir")).expect("dir symlink");
+
+        let found = scan_installed_models_root(&scan_root).expect("scan");
+
+        let expected_gguf = real_models
+            .join("writer.Q4_K_M.gguf")
+            .canonicalize()
+            .expect("canonical gguf");
+        let expected_mlx = real_models
+            .join("mlx-community_Qwen3-4B-4bit")
+            .canonicalize()
+            .expect("canonical mlx");
+
+        assert_eq!(found.len(), 2, "symlinked model content must stay skipped");
+        let gguf = found.iter().find(|m| m.format == "gguf").expect("gguf");
+        let mlx = found.iter().find(|m| m.format == "mlx").expect("mlx");
+        assert_eq!(gguf.model_path, expected_gguf.to_string_lossy());
+        assert_eq!(mlx.model_path, expected_mlx.to_string_lossy());
+        assert_ne!(gguf.model_path, gguf_alias.to_string_lossy());
+        assert_ne!(mlx.model_path, mlx_alias.to_string_lossy());
+        assert_eq!(mlx.size_bytes, 6);
+
+        let _ = fs::remove_dir_all(&real_anchor);
+        let _ = fs::remove_dir_all(&alias_parent);
+        let _ = fs::remove_dir_all(&outside);
     }
 }
 
