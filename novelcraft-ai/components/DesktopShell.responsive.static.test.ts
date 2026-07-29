@@ -75,13 +75,18 @@ describe('DesktopShell responsive shell boundary', () => {
       join(process.cwd(), 'components/SettingsPanel.tsx'),
       'utf8',
     );
+    const focusUtils = readFileSync(
+      join(process.cwd(), 'components/ui/focus-utils.ts'),
+      'utf8',
+    );
     expect(shell).toContain('settingsReturnFocusRef.current = event.currentTarget;');
     expect(shell).toContain('if (showSettings) return;');
     expect(shell).toContain('fallbackFocusRef={mobileNavOpenButtonRef}');
     expect(shell).toContain('returnFocusRef={settingsReturnFocusRef}');
     expect(settings).toContain('onCloseAutoFocus={event => {');
-    expect(settings).toContain('target === document.body');
-    expect(settings).toContain("target.closest('[data-slot=\"sheet-content\"]')");
+    expect(settings).toContain("import { isUsableReturnFocusTarget } from '@/components/ui/focus-utils'");
+    expect(focusUtils).toContain('target === document.body');
+    expect(focusUtils).toContain("target.closest('[data-slot=\"sheet-content\"]')");
     expect(settings).toContain('returnFocusRef.current = null;');
     expect(settings).toContain('focusTarget.focus({ preventScroll: true });');
   });

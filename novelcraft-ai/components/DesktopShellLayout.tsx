@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, usePathname, useRouter } from 'next/navigation';
-import { BarChart3, ChevronDown, Cpu, Layers, PanelLeft, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { BarChart3, Check, ChevronRight, Cpu, Layers, PanelLeft, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react';
 
 import { useGlobalHotkeys } from '@/hooks/useGlobalHotkeys';
 import { useMenuEvents } from '@/hooks/useMenuEvents';
@@ -25,7 +25,13 @@ import { ModelsPanel } from '@/components/ModelsPanel';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { InkMarshalLogo, ManuscriptIcon } from '@/components/Icons';
 import { OrnamentalDivider } from '@/components/BookOrnaments';
 import { useLanguage } from '@/components/LanguageProvider';
@@ -110,21 +116,37 @@ export function DesktopShell({ children }: DesktopShellProps) {
   // window enforces a 768px minWidth, so the <1024px drawer path is a real
   // desktop state (768–1023px), not only a browser/webview preview.
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [moreToolsOpen, setMoreToolsOpen] = useState(false);
+  const moreToolsOpenRef = useRef(false);
+  const suppressMoreToolsFocusRestoreRef = useRef(false);
+  const previousPathnameRef = useRef(pathname);
   const mobileNavOpenButtonRef = useRef<HTMLButtonElement>(null);
   const mobileNavCloseButtonRef = useRef<HTMLButtonElement>(null);
   const restoreMobileNavFocusRef = useRef(false);
   const settingsReturnFocusRef = useRef<HTMLElement>(null);
+  const moreToolsTriggerRef = useRef<HTMLButtonElement>(null);
   const [developerTools, setDeveloperTools] = useState(() => Boolean(getSettings().developerTools));
+  const closeMoreTools = useCallback((restoreFocus: boolean) => {
+    // Mutate the suppress flag outside the setState updater so React 19
+    // concurrent re-runs cannot apply the side effect twice (or skip it).
+    if (moreToolsOpenRef.current && !restoreFocus) {
+      suppressMoreToolsFocusRestoreRef.current = true;
+    }
+    moreToolsOpenRef.current = false;
+    setMoreToolsOpen(false);
+  }, []);
   const closeMobileNavigation = useCallback(() => {
+    closeMoreTools(false);
     restoreMobileNavFocusRef.current = true;
     setMobileNavOpen(false);
-  }, []);
+  }, [closeMoreTools]);
   const toggleMobileNavigation = useCallback(() => {
-    setMobileNavOpen(open => {
-      if (open) restoreMobileNavFocusRef.current = true;
-      return !open;
-    });
-  }, []);
+    if (mobileNavOpen) {
+      closeMoreTools(false);
+      restoreMobileNavFocusRef.current = true;
+    }
+    setMobileNavOpen(open => !open);
+  }, [closeMoreTools, mobileNavOpen]);
 
   useEffect(() => {
     const refreshDeveloperTools = () => setDeveloperTools(Boolean(getSettings().developerTools));
@@ -132,16 +154,22 @@ export function DesktopShell({ children }: DesktopShellProps) {
     return () => window.removeEventListener('inkmarshal:settings-changed', refreshDeveloperTools);
   }, []);
 
-  // Close the mobile drawer whenever the route changes so navigating to a
-  // novel / Models page reveals the main pane instead of leaving the overlay
-  // covering it. Adjusted during render (React's "store info from previous
-  // renders" pattern) rather than in an effect.
-  const [drawerPathname, setDrawerPathname] = useState(pathname);
-  if (pathname !== drawerPathname) {
-    setDrawerPathname(pathname);
-    if (mobileNavOpen) setMobileNavOpen(false);
-  }
+  // Close the mobile drawer / More tools portal on route change so navigating
+  // to a novel / Models page reveals the main pane. Path guard keeps the first
+  // mount and effect re-runs from dismissing an unrelated open menu.
+  useEffect(() => {
+    if (previousPathnameRef.current === pathname) return;
+    previousPathnameRef.current = pathname;
+    closeMoreTools(false);
+    setMobileNavOpen(false);
+  }, [closeMoreTools, pathname]);
 
+  useEffect(() => {
+    const breakpoint = window.matchMedia('(max-width: 1023px)');
+    const closeAtBreakpoint = () => closeMoreTools(false);
+    breakpoint.addEventListener('change', closeAtBreakpoint);
+    return () => breakpoint.removeEventListener('change', closeAtBreakpoint);
+  }, [closeMoreTools]);
   useEffect(() => {
     if (mobileNavOpen) {
       mobileNavCloseButtonRef.current?.focus();
@@ -377,7 +405,8 @@ export function DesktopShell({ children }: DesktopShellProps) {
         setNovelView('read-edit');
         return;
       case 'inkmarshal.view.toggleLeft':
-        if (showSettings) return;
+        if (showSettings || showTrash) return;
+        closeMoreTools(false);
         if (window.matchMedia('(max-width: 1023px)').matches) {
           toggleMobileNavigation();
         } else {
@@ -438,10 +467,18 @@ export function DesktopShell({ children }: DesktopShellProps) {
       default:
         return;
     }
-  }, [openCreate, router, showSettings, toggleMobileNavigation]);
+  }, [closeMoreTools, openCreate, router, showSettings, showTrash, toggleMobileNavigation]);
 
   useMenuEvents(handleMenuAction);
   useGlobalHotkeys(handleMenuAction, { enabled: isTauriRuntime() });
+
+  const activeMoreToolLabel = pathname.startsWith('/desktop-studio/workflows')
+    ? t.navWorkflows
+    : pathname.startsWith('/desktop-studio/series')
+      ? t.navSeries
+      : pathname.startsWith('/desktop-studio/usage')
+        ? t.navUsage
+        : null;
 
   return (
     <div className="flex h-screen min-h-0 w-full overflow-hidden">
@@ -637,41 +674,99 @@ export function DesktopShell({ children }: DesktopShellProps) {
               <Settings className="h-4 w-4 text-book-ink-muted" />
               {t.settings}
             </Button>
-            <Collapsible>
-              <CollapsibleTrigger asChild>
-                <Button variant="ghost" className={`${WORKSPACE_NAV_ITEM_CLASS} group`}>
-                  <SlidersHorizontal className="h-4 w-4 text-book-ink-muted" />
-                  <span className="flex-1 text-left">{t.moreTools}</span>
-                  <ChevronDown className="h-3.5 w-3.5 text-book-ink-muted transition-toggle group-data-[state=open]:rotate-180" />
+            <DropdownMenu
+              open={moreToolsOpen}
+              onOpenChange={open => {
+                if (open) suppressMoreToolsFocusRestoreRef.current = false;
+                moreToolsOpenRef.current = open;
+                setMoreToolsOpen(open);
+              }}
+            >
+              <DropdownMenuTrigger asChild>
+                <Button
+                  ref={moreToolsTriggerRef}
+                  variant="ghost"
+                  className={cn(
+                    `${WORKSPACE_NAV_ITEM_CLASS} group`,
+                    activeMoreToolLabel && 'bg-book-bg-card/70 text-book-ink-primary',
+                  )}
+                >
+                  <SlidersHorizontal
+                    className={cn('h-4 w-4', activeMoreToolLabel ? 'text-book-gold' : 'text-book-ink-muted')}
+                  />
+                  <span className="flex-1 text-left">
+                    {t.moreTools}
+                    {activeMoreToolLabel && (
+                      <span className="sr-only">{` (${activeMoreToolLabel})`}</span>
+                    )}
+                  </span>
+                  {activeMoreToolLabel && (
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-book-gold" aria-hidden />
+                  )}
+                  <ChevronRight className="h-3.5 w-3.5 text-book-ink-muted" />
                 </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="ml-3 mt-1 border-l border-book-border pl-2">
-                 {developerTools && (
-                   <Button variant="ghost" asChild className={WORKSPACE_NAV_ITEM_CLASS}>
-                     <Link href="/desktop-studio/workflows">
-                       <SlidersHorizontal className="h-4 w-4 text-book-ink-muted" />
-                       <span className="flex-1">{t.navWorkflows}</span>
-                     </Link>
-                   </Button>
-                 )}
-                <Button variant="ghost" asChild className={WORKSPACE_NAV_ITEM_CLASS}>
-                  <Link href="/desktop-studio/series">
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                side="right"
+                align="start"
+                sideOffset={8}
+                className="w-56"
+                onCloseAutoFocus={event => {
+                  if (!suppressMoreToolsFocusRestoreRef.current) return;
+                  suppressMoreToolsFocusRestoreRef.current = false;
+                  event.preventDefault();
+                }}
+              >
+                <DropdownMenuLabel>{t.moreTools}</DropdownMenuLabel>
+                {developerTools && (
+                  <DropdownMenuItem asChild onSelect={() => closeMoreTools(false)}>
+                    <Link
+                      href="/desktop-studio/workflows"
+                      aria-current={pathname.startsWith('/desktop-studio/workflows') ? 'page' : undefined}
+                    >
+                      <SlidersHorizontal className="h-4 w-4 text-book-ink-muted" />
+                      <span className="flex-1">{t.navWorkflows}</span>
+                      {pathname.startsWith('/desktop-studio/workflows') && (
+                        <Check className="h-4 w-4 text-book-gold" aria-hidden />
+                      )}
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem asChild onSelect={() => closeMoreTools(false)}>
+                  <Link
+                    href="/desktop-studio/series"
+                    aria-current={pathname.startsWith('/desktop-studio/series') ? 'page' : undefined}
+                  >
                     <Layers className="h-4 w-4 text-book-ink-muted" />
                     <span className="flex-1">{t.navSeries}</span>
+                    {pathname.startsWith('/desktop-studio/series') && (
+                      <Check className="h-4 w-4 text-book-gold" aria-hidden />
+                    )}
                   </Link>
-                </Button>
-                <Button variant="ghost" className={WORKSPACE_NAV_ITEM_CLASS} onClick={() => setShowTrash(true)}>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    closeMoreTools(false);
+                    setShowTrash(true);
+                  }}
+                >
                   <Trash2 className="h-4 w-4 text-book-ink-muted" />
-                  <span className="flex-1 text-left">{t.trashTitle}</span>
-                </Button>
-                <Button variant="ghost" asChild className={WORKSPACE_NAV_ITEM_CLASS}>
-                  <Link href="/desktop-studio/usage">
+                  <span className="flex-1">{t.trashTitle}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild onSelect={() => closeMoreTools(false)}>
+                  <Link
+                    href="/desktop-studio/usage"
+                    aria-current={pathname.startsWith('/desktop-studio/usage') ? 'page' : undefined}
+                  >
                     <BarChart3 className="h-4 w-4 text-book-ink-muted" />
                     <span className="flex-1">{t.navUsage}</span>
+                    {pathname.startsWith('/desktop-studio/usage') && (
+                      <Check className="h-4 w-4 text-book-gold" aria-hidden />
+                    )}
                   </Link>
-                </Button>
-              </CollapsibleContent>
-            </Collapsible>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
@@ -730,7 +825,13 @@ export function DesktopShell({ children }: DesktopShellProps) {
         fallbackFocusRef={mobileNavOpenButtonRef}
         returnFocusRef={settingsReturnFocusRef}
       />
-      <TrashPanel open={showTrash} onOpenChange={setShowTrash} onLibraryChange={() => void refresh()} />
+      <TrashPanel
+        open={showTrash}
+        onOpenChange={setShowTrash}
+        onLibraryChange={() => void refresh()}
+        returnFocusRef={moreToolsTriggerRef}
+        fallbackFocusRef={mobileNavOpenButtonRef}
+      />
     </div>
   );
 }
