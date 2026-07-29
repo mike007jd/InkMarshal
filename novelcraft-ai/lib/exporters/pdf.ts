@@ -1,6 +1,6 @@
-import fontkit from '@pdf-lib/fontkit';
 import { PDFDocument, PDFFont, PDFPage, StandardFonts } from 'pdf-lib';
 
+import { pdfLibFontkit } from '@/lib/exporters/pdf-lib-fontkit';
 import type { ExportChapterLike, ExportNovelLike } from '@/lib/exporters/text';
 import { loadUnicodeFontBytes } from '@/lib/exporters/unicode-font';
 
@@ -57,7 +57,9 @@ export async function buildNovelPdfBuffer(
   const pdf = await PDFDocument.create();
   let kit: FontKit;
   if (needsUnicodeFont) {
-    pdf.registerFontkit(fontkit);
+    // Upstream fontkit via pdfLibFontkit — @pdf-lib/fontkit@1.1.1's CFF
+    // subsetter emits invalid CID Type 0C streams for this OTF.
+    pdf.registerFontkit(pdfLibFontkit);
     const fontBytes = await loadUnicodeFontBytes();
     assertUnicodeFontCoverage(textsToCheck, fontBytes);
     // subset:true embeds only the glyphs actually drawn, so the produced PDF
@@ -305,11 +307,11 @@ function hasWinAnsiUnsupportedChar(text: string): boolean {
 // Parsing the ~23 MB face is the expensive part of the coverage check — cache
 // it per process. Glyph-coverage answers are cached across exports too (the
 // face is immutable, so a codepoint's coverage never changes).
-let cachedCoverageFace: ReturnType<typeof fontkit.create> | null = null;
+let cachedCoverageFace: ReturnType<typeof pdfLibFontkit.create> | null = null;
 const coverageByCodePoint = new Map<number, boolean>();
 
 function assertUnicodeFontCoverage(texts: readonly string[], fontBytes: Uint8Array): void {
-  cachedCoverageFace ??= fontkit.create(toFontkitBuffer(fontBytes));
+  cachedCoverageFace ??= pdfLibFontkit.create(fontBytes);
   const face = cachedCoverageFace;
   const checked = coverageByCodePoint;
   for (const text of texts) {
@@ -326,11 +328,4 @@ function assertUnicodeFontCoverage(texts: readonly string[], fontBytes: Uint8Arr
       if (!covered) throw new CJKNotSupportedError();
     }
   }
-}
-
-/** fontkit's TS types want a Node Buffer; hand it one when available, else the
- *  raw bytes (its runtime accepts any Uint8Array in the browser bundle). */
-function toFontkitBuffer(bytes: Uint8Array): Buffer {
-  if (typeof Buffer !== 'undefined') return Buffer.from(bytes);
-  return bytes as unknown as Buffer;
 }

@@ -5,9 +5,9 @@
  *  - the desktop webview / browser (client export) → fetch from /fonts/…
  *  - the Next.js API route (submission bundle)     → read from public/fonts/…
  *
- * The font bytes are cached per process; pdf-lib embeds a subset of the
- * glyphs actually used, so shipping the full ~23 MB face does not bloat the
- * produced PDFs.
+ * The font bytes are cached per process; the PDF exporter subsets via upstream
+ * fontkit (see pdf-lib-fontkit.ts), so shipping the full ~23 MB face does not
+ * bloat the produced PDFs.
  */
 
 const UNICODE_FONT_RELATIVE_PATH = 'fonts/NotoSerifSC-Regular.otf';
