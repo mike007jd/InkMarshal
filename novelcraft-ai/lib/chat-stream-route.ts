@@ -1,4 +1,4 @@
-import { streamText, type StopCondition, type ToolSet } from 'ai';
+import { consumeStream, streamText, type StopCondition, type ToolSet } from 'ai';
 import { toModelMessages, type ChatMessage } from '@/lib/ai';
 import type { GenerationPreset } from '@/lib/ai/generation-presets';
 import type { Message } from '@/lib/db-types';
@@ -116,6 +116,10 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
         console.error('Failed to persist stopped assistant message:', error);
       });
     },
+    // Required by AI SDK abort handling: tee + independently consume the SSE
+    // stream so onFinish({ isAborted: true }) still runs after the client Stop
+    // cancels the response body (see ai docs stopping-streams / stream-abort-handling).
+    consumeSseStream: consumeStream,
     messageMetadata: ({ part }) => {
       if (part.type === 'start') {
         return { persisted: false };
