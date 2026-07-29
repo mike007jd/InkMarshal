@@ -1186,4 +1186,78 @@ describe('model-supply orchestrator — wave 4 multi-engine', () => {
     const resetIdx = source.indexOf('restoreEnginesPromise = null', catchIdx);
     expect(resetIdx).toBeGreaterThan(catchIdx);
   });
+
+  it('restores a launch plan whose modelPath is a lexical alias of the installed path', async () => {
+    // Fresh module so the one-shot restoreEnginesPromise starts null.
+    vi.resetModules();
+    const { restoreEnginesOnLaunch } = await import('@/lib/model-supply/orchestrator');
+
+    const lexicalPath = '/tmp/models/demo.gguf';
+    const canonicalPath = '/private/tmp/models/demo.gguf';
+    const engineId = 'gguf:/private/tmp/models/demo.gguf';
+    const connectionId = `local-engine:${engineId}`;
+    const launchPlansKey = 'inkmarshal_engine_launch_plans_v1';
+    const modelLabel = 'Demo GGUF';
+
+    settingsMocks.store.set(launchPlansKey, JSON.stringify([{
+      modelPath: lexicalPath,
+      format: 'gguf',
+      modelLabel,
+      roles: ['draft'],
+      engineId,
+    }]));
+    connectionMocks.connections.set(connectionId, {
+      id: connectionId,
+      label: `Local engine · ${modelLabel}`,
+      baseUrl: 'http://127.0.0.1:51005/v1',
+    });
+    connectionMocks.profile.draft = {
+      connectionId,
+      modelId: modelLabel,
+    };
+
+    let running: EngineInfo[] = [];
+    desktopMocks.engineStatus.mockImplementation(async () => running);
+    localEngineMocks.startAndRegisterLocalEngine.mockImplementation(
+      async (modelPath: string, _format: string, label: string) => {
+        const started = fakeEngineStart(engineId, canonicalPath, 51005);
+        started.modelId = label;
+        running = [started.info];
+        return started;
+      },
+    );
+
+    const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    Object.defineProperty(globalThis, 'window', {
+      value: {},
+      configurable: true,
+      writable: true,
+    });
+    try {
+      await restoreEnginesOnLaunch();
+
+      expect(localEngineMocks.startAndRegisterLocalEngine).toHaveBeenCalledWith(
+        lexicalPath,
+        'gguf',
+        modelLabel,
+        { engineLabel: undefined },
+      );
+      expect(connectionMocks.profile.draft).toEqual({
+        connectionId,
+        modelId: modelLabel,
+      });
+      expect(connectionMocks.connections.has(connectionId)).toBe(true);
+      expect(JSON.parse(settingsMocks.store.get(launchPlansKey)!)).toEqual([
+        expect.objectContaining({
+          modelPath: lexicalPath,
+          engineId,
+          modelLabel,
+          roles: ['draft'],
+        }),
+      ]);
+    } finally {
+      if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+      else delete (globalThis as Record<string, unknown>).window;
+    }
+  });
 });

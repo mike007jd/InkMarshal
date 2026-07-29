@@ -33,7 +33,6 @@ import {
   engineResourceBudget,
   engineStatus,
   engineStop,
-  listInstalledLocalModels,
   stopOthersForPath,
   type EngineBudget,
   type EngineFormat,
@@ -782,10 +781,15 @@ let restoreEnginesPromise: Promise<void> | null = null;
 /**
  * Relaunch the engines that were running when the app last quit and re-bind
  * the roles that still point at (now-dead) local-engine connections. Roles
- * the user re-bound to a provider in the meantime are left alone. Plans whose
- * model file has been deleted are dropped. Always finishes with a stale-row
- * prune so anything unrestorable surfaces as honestly unbound. Idempotent —
- * concurrent callers share one run per app session.
+ * the user re-bound to a provider in the meantime are left alone. Do not
+ * prefilter plans against the installed-model inventory string set —
+ * lexical vs canonical path forms (e.g. `/tmp` vs `/private/tmp`) can
+ * disagree even when the file is present. Installed/validity is decided by
+ * {@link startEngineForRoles} → `engine_start` / `registered_model_path`;
+ * failed starts are caught and the final stale-row prune keeps the UI
+ * truthful. Always finishes with a stale-row prune so anything unrestorable
+ * surfaces as honestly unbound. Idempotent — concurrent callers share one
+ * run per app session.
  */
 export function restoreEnginesOnLaunch(): Promise<void> {
   restoreEnginesPromise ??= (async () => {
@@ -802,24 +806,8 @@ export function restoreEnginesOnLaunch(): Promise<void> {
     }
     const runningIds = new Set(running.map(e => e.engineId));
 
-    let installedPaths: Set<string> | null = null;
-    try {
-      const installed = await listInstalledLocalModels();
-      installedPaths = new Set(installed.map(m => normalizeModelPathForCompare(m.modelPath)));
-    } catch {
-      installedPaths = null; // Unknown — let engineStart be the arbiter.
-    }
     for (const plan of plans) {
       if (runningIds.has(plan.engineId)) continue;
-      if (installedPaths && !installedPaths.has(normalizeModelPathForCompare(plan.modelPath))) {
-        // Model file is gone — never retry this plan again.
-        try {
-          await removeEngineLaunchPlanByEngineId(plan.engineId);
-        } catch {
-          // Best-effort plan cleanup during restore.
-        }
-        continue;
-      }
       // Only re-bind roles still routed through a local engine; a role the
       // user moved to a cloud provider after the engine died stays put.
       const roles = plan.roles.filter(role => {
