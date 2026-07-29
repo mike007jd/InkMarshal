@@ -94,6 +94,41 @@ const LINE_HEIGHT: Record<AppSettings['lineSpacing'], string> = {
   relaxed: '2.0',
 };
 
+export interface ManuscriptTypography {
+  fontSizePx: number;
+  lineHeightRatio: number;
+  lineHeightPx: number;
+}
+
+const DEFAULT_MANUSCRIPT_TYPOGRAPHY: ManuscriptTypography = {
+  fontSizePx: 17,
+  lineHeightRatio: 1.75,
+  lineHeightPx: 17 * 1.75,
+};
+
+/**
+ * Resolve the live manuscript font metrics from the canonical CSS variables
+ * written by `applySettingsToDocument`. Pagination must use these — not the
+ * historic 17px/30px hardcodes — so lg + relaxed capacity stays honest.
+ */
+export function readManuscriptTypographyFromDocument(): ManuscriptTypography {
+  if (typeof document === 'undefined') return DEFAULT_MANUSCRIPT_TYPOGRAPHY;
+  const style = getComputedStyle(document.documentElement);
+  const fontSizePx = Number.parseFloat(style.getPropertyValue('--manuscript-font-size'));
+  const lineHeightRatio = Number.parseFloat(style.getPropertyValue('--manuscript-line-height'));
+  const resolvedFont = Number.isFinite(fontSizePx) && fontSizePx > 0
+    ? fontSizePx
+    : DEFAULT_MANUSCRIPT_TYPOGRAPHY.fontSizePx;
+  const resolvedRatio = Number.isFinite(lineHeightRatio) && lineHeightRatio > 0
+    ? lineHeightRatio
+    : DEFAULT_MANUSCRIPT_TYPOGRAPHY.lineHeightRatio;
+  return {
+    fontSizePx: resolvedFont,
+    lineHeightRatio: resolvedRatio,
+    lineHeightPx: resolvedFont * resolvedRatio,
+  };
+}
+
 /**
  * Write the manuscript CSS variables to the document root. Components that
  * render manuscript prose just consume `var(--manuscript-…)` so settings

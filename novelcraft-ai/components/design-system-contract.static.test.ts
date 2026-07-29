@@ -533,13 +533,21 @@ describe('business UI uses design-system primitives', () => {
     const geometry = readFileSync(join(process.cwd(), 'lib/flipbook-geometry.ts'), 'utf8');
     const globals = readFileSync(join(process.cwd(), 'app/globals.css'), 'utf8');
     expect(reading).toContain('autoSize={false}');
-    expect(reading).toContain('width={FLIPBOOK_LAYOUT.pageWidth}');
-    expect(reading).toContain('height={FLIPBOOK_LAYOUT.pageHeight}');
+    // react-pageflip@2.0.3 leaks global listeners on unmount — keep one book
+    // instance and park it for sheet mode instead of remounting on shape.
+    expect(reading).not.toContain('key={geometry.shape}');
+    expect(reading).not.toContain('FLIPBOOK_SHAPES');
+    expect(reading).toContain('FLIPBOOK_LAYOUT.pageWidth');
+    expect(reading).toContain('manuscript-sheet-page');
+    expect(reading).toContain('inkmarshal:settings-changed');
+    expect(reading).toContain('readManuscriptTypographyFromDocument');
     expect(reading).not.toContain('maxHeight=');
     expect(pagination).toContain('computeFlipbookGeometry(el.clientWidth, el.clientHeight)');
     expect(geometry).toContain('pageWidth: 500');
     expect(geometry).toContain('pageHeight: 850');
+    expect(geometry).not.toContain('FLIPBOOK_SHAPES');
     expect(globals).toMatch(/\.manuscript-flipbook\s*\{[^}]*height:\s*100%[^}]*width:\s*100%/);
+    expect(globals).not.toMatch(/\.manuscript-flipbook\s*\{[^}]*min-width:\s*0\s*!important/);
   });
 
   // INV-DD-03 — content-level empty states use the Empty family; loading and

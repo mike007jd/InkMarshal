@@ -124,6 +124,44 @@ export function paginateManuscript(
   return pages;
 }
 
+/**
+ * Character-width budget used to estimate how many characters fit on one
+ * rendered line. Latin averages about half an em; CJK and full-width
+ * punctuation take a full em. Metrics scale with the live manuscript font
+ * size (15 / 17 / 19px).
+ *
+ * The whole manuscript is scanned. Any full-width glyph forces the full-em
+ * budget so Latin-leading / CJK-trailing novels cannot over-paginate early
+ * pages and clip later CJK. Pure Latin keeps the half-em budget.
+ */
+const LATIN_EM_FRACTION = 9 / 17;
+const DEFAULT_FONT_SIZE_PX = 17;
+const FULLWIDTH_CHAR_PATTERN = /[\u2014\u2026\u1100-\u11FF\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\u3000-\u303F]/;
+
+export function estimateManuscriptCharWidth(
+  text: string,
+  fontSizePx: number = DEFAULT_FONT_SIZE_PX,
+): number {
+  const size = Number.isFinite(fontSizePx) && fontSizePx > 0
+    ? fontSizePx
+    : DEFAULT_FONT_SIZE_PX;
+  const latinWidth = size * LATIN_EM_FRACTION;
+  const fullWidthBudget = size;
+
+  let measured = 0;
+  let hasFullWidth = false;
+  for (const char of text) {
+    if (/\s/.test(char)) continue;
+    measured += 1;
+    if (FULLWIDTH_CHAR_PATTERN.test(char)) {
+      hasFullWidth = true;
+      break;
+    }
+  }
+  if (measured === 0) return latinWidth;
+  return hasFullWidth ? fullWidthBudget : latinWidth;
+}
+
 export function findPageIndexForSourceOffset(
   pages: ManuscriptPage[],
   chapterNumber: number,

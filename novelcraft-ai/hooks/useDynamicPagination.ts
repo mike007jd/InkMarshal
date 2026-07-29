@@ -13,6 +13,11 @@ interface UseDynamicPaginationOptions {
 }
 
 const FALLBACK_CHARS = 800;
+// Floors keep capacity sane on degenerate (0px / pre-measure) viewports but
+// must stay below what the smallest supported page actually fits — clamping
+// above the real capacity re-introduces clipped page content.
+const MIN_CHARS_PER_LINE = 8;
+const MIN_CHARS_PER_PAGE = 100;
 
 export function useDynamicPagination(options: UseDynamicPaginationOptions = {}) {
   const {
@@ -35,7 +40,8 @@ export function useDynamicPagination(options: UseDynamicPaginationOptions = {}) 
     if (!el) return;
     const nextGeometry = computeFlipbookGeometry(el.clientWidth, el.clientHeight);
     setGeometry(current => (
-      current.pageWidth === nextGeometry.pageWidth
+      current.shape === nextGeometry.shape
+      && current.pageWidth === nextGeometry.pageWidth
       && current.pageHeight === nextGeometry.pageHeight
       && current.spreadWidth === nextGeometry.spreadWidth
       && current.spreadPages === nextGeometry.spreadPages
@@ -46,12 +52,12 @@ export function useDynamicPagination(options: UseDynamicPaginationOptions = {}) 
     ));
     const availableHeight = nextGeometry.pageHeight - paddingY;
     const effectiveCharsPerLine = averageCharWidth
-      ? Math.max(20, Math.floor((nextGeometry.pageWidth - paddingX) / averageCharWidth))
+      ? Math.max(MIN_CHARS_PER_LINE, Math.floor((nextGeometry.pageWidth - paddingX) / averageCharWidth))
       : charsPerLine;
     // Tiny viewports can yield pageHeight - paddingY <= 0. Still converge to the
     // safe minimum instead of early-returning and keeping stale/fallback capacity.
     const lines = Math.max(0, Math.floor(availableHeight / lineHeight));
-    const chars = Math.max(200, lines * effectiveCharsPerLine);
+    const chars = Math.max(MIN_CHARS_PER_PAGE, lines * effectiveCharsPerLine);
     setCharsPerPage(chars);
     setTitleReserve(titleReserveLines * effectiveCharsPerLine);
   }, [
