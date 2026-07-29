@@ -15,6 +15,7 @@ use std::str::FromStr;
 
 mod budget;
 mod commands;
+mod crash_recovery;
 mod log;
 mod readiness;
 mod registry;
@@ -100,6 +101,7 @@ pub struct EngineBudget {
 // Glob over commands so the #[tauri::command] macro helper items keep their
 // engine::<command> paths. EngineRegistry + stop_all are referenced by name.
 pub use commands::*;
+pub use crash_recovery::reap_orphaned_packaged_engines;
 pub use registry::{stop_all, EngineRegistry};
 
 // ── Tests ───────────────────────────────────────────────────────────────────

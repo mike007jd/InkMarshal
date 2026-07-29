@@ -1407,8 +1407,12 @@ pub fn run() {
             // Startup runs off the setup hook on a worker thread so a slow or
             // failing server never blocks/panics the UI thread; failures route
             // to the error page (see boot_runtime) instead of crashing.
+            // Cold-start engine recovery runs on the same worker before boot so
+            // stubborn orphans cannot stall window setup, while still clearing
+            // PPID-1 packaged engines before any new local engine can start.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
+                engine::reap_orphaned_packaged_engines();
                 boot_runtime(&handle);
             });
             Ok(())
