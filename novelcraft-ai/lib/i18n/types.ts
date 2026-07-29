@@ -12,7 +12,7 @@ export function isZhLocale(locale: Locale): boolean {
   return locale === 'zh-CN' || locale === 'zh-TW';
 }
 
-export function normalizeLocale(value: string | null | undefined): Locale {
+export function parseSupportedLocale(value: string | null | undefined): Locale | null {
   let normalized = value;
   try {
     normalized = decodeURIComponent(value ?? '');
@@ -22,5 +22,9 @@ export function normalizeLocale(value: string | null | undefined): Locale {
   if (normalized === 'zh' || normalized === 'zh-CN' || normalized === 'zh-Hans') return 'zh-CN';
   if (normalized === 'zh-TW' || normalized === 'zh-Hant' || normalized === 'zh-HK') return 'zh-TW';
   if (normalized === 'en') return 'en';
-  return DEFAULT_LOCALE;
+  return null;
+}
+
+export function normalizeLocale(value: string | null | undefined): Locale {
+  return parseSupportedLocale(value) ?? DEFAULT_LOCALE;
 }
