@@ -18,7 +18,10 @@ import {
   scheduleEmbeddingRefresh,
   trySyncKnowledgeEntryToVault,
 } from '@/lib/knowledge/apply-write';
-import { finalizeBrainstormAtomic } from '@/lib/db/brainstorm-finalization';
+import {
+  approveExistingBrainstormAtomic,
+  finalizeBrainstormAtomic,
+} from '@/lib/db/brainstorm-finalization';
 import { isInStages, type NovelStage } from '@/lib/novel-stages';
 import type { KnowledgeType } from '@/lib/types/knowledge';
 import {
@@ -286,6 +289,146 @@ export async function finalizeApprovedStoryDeck(
       },
     ],
   }, receiptId, { preserveExistingStoryDeck: true });
+}
+
+/**
+ * Strict explicit-approval finalize: requires an already-complete profile and
+ * Story Deck inside one DB transaction. Does not repair/generate cards.
+ */
+export async function approveExplicitWritingPlan(novelId: string) {
+  const result = await approveExistingBrainstormAtomic(novelId);
+  if (!result.ok) return result;
+  return {
+    ok: true as const,
+    alreadyReady: result.alreadyReady,
+    beforeNovel: result.beforeNovel,
+    novel: result.novel,
+    coverage: result.coverage,
+  };
+}
+
+function hasWritingApprovalVeto(text: string): boolean {
+  // Questions always fail closed — even when they mention approve/begin writing.
+  if (/[?？]/.test(text)) return true;
+  if (/(?:吗|嗎|么|麼|呢)\s*[。.!！]*\s*$/u.test(text)) return true;
+  if (
+    /(?:什么时候|什麼時候|何时|何時).{0,24}(?:批准|开始写|開始寫|动笔|動筆|begin\s+writing|start\s+writing|approve)/i.test(text)
+    || /^(?:请问|請問|when\b)/i.test(text)
+    || /\b(?:can|could|should|may)\s+(?:i|we)\b/i.test(text)
+    || /\bdo\s+we\b.+\b(?:approve|begin|start)\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  // Mentions, deliberation, future intent, and help requests are not approval.
+  if (
+    /(?:明天|以后|以後|之后|之後|稍后|稍後|可能|也许|也許|或许|或許|考虑|考慮|想想|不是要|并非要|並非要).{0,24}(?:批准|开始写|開始寫|动笔|動筆)/.test(text)
+    || /(?:告诉我|告訴我|解释|解釋|说明|說明).{0,24}(?:如何|怎么|怎麼).{0,24}(?:批准|开始写|開始寫|动笔|動筆)/.test(text)
+    || /\b(?:might|maybe|perhaps|consider|considering|wonder|wondering|intend|planning|tomorrow|later|eventually|someday)\b.{0,32}\bapprove\b/i.test(text)
+    || /\bapprove\b.{0,24}\b(?:tomorrow|later|eventually|someday)\b/i.test(text)
+    || /\b(?:tell|show|explain)\b.{0,24}\bhow\s+to\s+approve\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  // Negation is bound to the approval action itself. Channel constraints such
+  // as "do not write prose in chat; approve writing" must remain approvable.
+  if (
+    /(?:不要|不用|不能|不可|先别|先別|暂不|暫不|还没|還沒|尚未|别急|別急|先不)\s*(?:再|现在|現在|马上|馬上)?\s*(?:批准|开始写|開始寫|动笔|動筆)/.test(text)
+    || /批准(?:写作|寫作|动笔|動筆)?前/.test(text)
+    || /don'?t\s+(?:yet\s+)?(?:approve|start\s+writing|begin\s+writing)/i.test(text)
+    || /(?:do\s+not|not\s+(?:yet\s+)?ready\s+to)\s+approve/i.test(text)
+    || /\bnot\s+(?:yet\s+)?(?:approve|start\s+writing|begin\s+writing)\b/i.test(text)
+    || /(?:before|without)\s+approving/i.test(text)
+    || /\bafter\s+(?:we\s+)?(?:adjust|revise|change)\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasAffirmativePlanChangeIntent(text: string): boolean {
+  const planObject = '(?:方案|大纲|大綱|设定|設定|结局|結局|角色|世界观|世界觀)';
+  const changeAction = '(?:改|调整|調整|修改|换|換)';
+  const changeCandidateText = text
+    .replace(
+      new RegExp(
+        `(?:不要|不用|不必|无需|無需|别|別)\\s*(?:再)?\\s*(?:(?:把|将|將)\\s*)?(?:${planObject}\\s*)?${changeAction}(?:.{0,16}${planObject})?`,
+        'g',
+      ),
+      '',
+    )
+    .replace(
+      new RegExp(
+        `${planObject}\\s*(?:不要|不用|不必|无需|無需|别|別)\\s*(?:再)?\\s*${changeAction}`,
+        'g',
+      ),
+      '',
+    )
+    .replace(
+      /\b(?:do\s+not|don'?t|no\s+need\s+to|need\s+not|should\s+not|shouldn'?t)\s+(?:adjust|revise|change|rewrite|fix|make)\b.{0,24}\b(?:plan|outline|story|ending|character|world)\b/gi,
+      '',
+    );
+
+  // Any same-turn plan change is multi-intent and must return to Brainstorm.
+  if (
+    /(?:把|将|將)?\s*(?:方案|大纲|大綱|设定|設定|结局|結局|角色|世界观|世界觀).{0,16}(?:改|调整|調整|修改|换|換)/.test(changeCandidateText)
+    || /(?:改|调整|調整|修改|换|換).{0,16}(?:方案|大纲|大綱|设定|設定|结局|結局|角色|世界观|世界觀)/.test(changeCandidateText)
+    || /\b(?:adjust|revise|change|rewrite|fix|make)\b.{0,24}\b(?:plan|outline|story|ending|character|world)\b/i.test(changeCandidateText)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasExplicitApproveNow(text: string): boolean {
+  return (
+    /^\s*(?:请|請)?\s*(?:批准(?:开始|開始)?(?:写作|寫作|动笔|動筆)(?:(?:并|並)?(?:开始|開始|启动|啟動)(?:写作|寫作|(?:第一章|第1章|一章)(?:写作|寫作)?)(?:任务|任務)?)?|同意(?:开始|開始)(?:写作|寫作|动笔|動筆)|(?:大纲|大綱)(?:无误|無誤|没问题|沒問題)|方案(?:没问题|沒問題|无误|無誤)|(?:就)?按(?:这个|這個|此)方案(?:开始写|開始寫)(?:第一章|第1章|一章)?|批准(?:当前|當前)?(?:的)?(?:故事)?方案(?:(?:并|並)(?:开始|開始|启动|啟動)(?:写作|寫作|(?:第一章|第1章|一章)(?:写作|寫作)?)(?:任务|任務)?)?)\s*(?:吧)?$/.test(text)
+    || /^\s*(?:请|請)?(?:使用系统写作工具|使用系統寫作工具).{0,24}批准(?:当前|當前)?(?:的)?(?:故事)?方案(?:(?:并|並)(?:开始|開始|启动|啟動)(?:写作|寫作|(?:第一章|第1章|一章)(?:写作|寫作)?)(?:任务|任務)?)?\s*$/.test(text)
+    || /^\s*(?:yes\s*)?(?:please\s+)?(?:approve\s*(?:and|&)\s*(?:begin|start)\s+writing|approve\s+writing(?:(?:\s+and\s+(?:begin|start)\s+(?:writing|chapter\s+(?:one|1)|the\s+first\s+chapter)(?:\s+now)?)|\s+now)?|approve(?:\s+the)?\s+(?:current\s+)?(?:story\s+)?(?:plan|outline|deck)(?:\s+and\s+(?:begin|start)\s+(?:writing|chapter\s+(?:one|1)|the\s+first\s+chapter)(?:\s+now)?)?|(?:begin|start)\s+writing\s+now|go\s+ahead\s+with\s+chapter\s+(?:one|1)|(?:begin|start)\s+(?:with\s+)?chapter\s+(?:one|1))\s*$/i.test(text)
+    || /^\s*(?:yes\s*)?i\s+approve\s+(?:writing|the\s+(?:current\s+)?(?:story\s+)?(?:plan|outline|deck))\s*$/i.test(text)
+  );
+}
+
+function isReportedApprovalLead(text: string): boolean {
+  return (
+    /\b(?:ui|interface|screen|button|label|editor|document|note)\b.{0,24}\b(?:says?|shows?|reads?|wrote|states?)\s*$/i.test(text)
+    || /(?:界面|介面|按钮|按鈕|标签|標籤|编辑|編輯|文档|文檔|笔记|筆記).{0,16}(?:显示|顯示|写着|寫著|说|說|标注|標註)\s*$/.test(text)
+  );
+}
+
+function isDeferredApprovalLead(text: string): boolean {
+  return /^(?:tomorrow|later|eventually|someday|明天|以后|以後|之后|之後|稍后|稍後)$/i.test(
+    text.trim(),
+  );
+}
+
+/**
+ * True when the user is explicitly approving the plan to leave Brainstorm and
+ * proceed toward writing. Ordinary brainstorm prompts, questions, deferred
+ * approval, plan adjustments, and "ready-to-approve" phrasing must stay false
+ * so small models cannot be "helped" into a silent finalize.
+ */
+export function isExplicitWritingApproval(text: string): boolean {
+  const raw = text.normalize('NFKC').trim();
+  if (!raw) return false;
+
+  // "可批准写作" means the plan is ready for review, not that the user approved.
+  const normalized = raw.replace(/可批准(?:写作|寫作)/g, '可就绪');
+  if (/[?？]/.test(normalized) || hasAffirmativePlanChangeIntent(normalized)) return false;
+
+  const clauses = normalized
+    .split(/[。.!！?？；;，,\n]+/)
+    .map(clause => clause.trim())
+    .filter(Boolean);
+  return clauses.some((clause, index) => {
+    if (!hasExplicitApproveNow(clause) || hasWritingApprovalVeto(clause)) return false;
+    const previousClause = clauses[index - 1];
+    return !previousClause
+      || (!isReportedApprovalLead(previousClause) && !isDeferredApprovalLead(previousClause));
+  });
 }
 
 export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): string {
