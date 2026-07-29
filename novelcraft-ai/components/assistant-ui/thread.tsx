@@ -1,6 +1,6 @@
 'use client';
 
-import { type FC, type ReactNode } from 'react';
+import { type FC, type ReactNode, useCallback, useLayoutEffect, useRef } from 'react';
 import {
   ActionBarPrimitive,
   AttachmentPrimitive,
@@ -198,6 +198,32 @@ const UserMessage: FC = () => {
 
 const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
   const { t } = useLocale();
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Stop owns focus while streaming; when it unmounts after a user cancel the
+  // browser parks focus on the document root. Only reclaim the composer for
+  // that explicit Stop path — never on ordinary completion / errors / unmount.
+  const restoreFocusAfterStopRef = useRef(false);
+  const isRunning = useAuiState((s) => s.thread.isRunning);
+
+  const markStopFocusRestore = useCallback(() => {
+    restoreFocusAfterStopRef.current = true;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!restoreFocusAfterStopRef.current || isRunning) return;
+    restoreFocusAfterStopRef.current = false;
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      active !== document.documentElement &&
+      active !== inputRef.current
+    ) {
+      return;
+    }
+    inputRef.current?.focus({ preventScroll: true });
+  }, [isRunning]);
+
   return (
     <ComposerPrimitive.Root className="mx-auto flex w-full max-w-3xl flex-col gap-2 rounded-lg border border-book-border bg-book-bg-card p-2 shadow-sm transition-feedback focus-within:border-book-gold focus-within:ring-1 focus-within:ring-book-gold">
       <ComposerPrimitive.Attachments components={{ Attachment: ComposerAttachmentPreview }} />
@@ -215,6 +241,7 @@ const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
           </ComposerPrimitive.AddAttachment>
         </AuiIf>
         <ComposerPrimitive.Input
+          ref={inputRef}
           placeholder={placeholder}
           rows={1}
           autoFocus
@@ -234,7 +261,7 @@ const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
           </ComposerPrimitive.Send>
         </AuiIf>
         <AuiIf condition={(s) => s.thread.isRunning}>
-          <ComposerPrimitive.Cancel asChild>
+          <ComposerPrimitive.Cancel asChild onClick={markStopFocusRestore}>
             <Button
               variant="ink"
               type="button"
