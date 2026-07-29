@@ -486,6 +486,89 @@ const FLIP_TIME_MS = 400;
 /** How long a user page-turn gesture suspends live-writing auto-follow. */
 const FOLLOW_SUSPEND_MS = 5000;
 
+/** Injectable timer surface so follow-resume lifecycle can be unit-tested
+ *  without React flushSync / passive-effect timing assumptions. */
+export interface FollowResumeScheduler {
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(id: ReturnType<typeof setTimeout>): void;
+}
+
+export interface FollowResumeTimerOwner {
+  /** Enable/disable arming. Losing eligibility bumps the generation so every
+   *  previously captured callback is inert even if the scheduler still fires. */
+  setEligible(eligible: boolean): void;
+  /** Arm (or re-arm) the full delay window. Returns false when ineligible or disposed. */
+  arm(onResume: () => void, delayMs: number): boolean;
+  /** Generation bump + clear without flipping eligibility (StrictMode cleanup). */
+  invalidate(): void;
+  /** Terminal teardown — every retained callback becomes inert. */
+  dispose(): void;
+}
+
+const defaultFollowResumeScheduler: FollowResumeScheduler = {
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: id => clearTimeout(id),
+};
+
+/** Production-used owner for the writing-live follow-resume timer. One owner
+ *  per FlipbookReadingView instance; tests inject a capturing scheduler and
+ *  manually invoke cancelled callbacks to prove inertness. */
+export function createFollowResumeTimerOwner(
+  scheduler: FollowResumeScheduler = defaultFollowResumeScheduler,
+): FollowResumeTimerOwner {
+  let eligible = false;
+  let disposed = false;
+  let generation = 0;
+  let armToken = 0;
+  let timerId: ReturnType<typeof setTimeout> | null = null;
+
+  const clearTimer = () => {
+    if (timerId == null) return;
+    scheduler.clearTimeout(timerId);
+    timerId = null;
+  };
+
+  const bump = () => {
+    generation += 1;
+    armToken += 1;
+    clearTimer();
+  };
+
+  return {
+    setEligible(next) {
+      if (disposed) return;
+      if (!next) {
+        eligible = false;
+        bump();
+        return;
+      }
+      eligible = true;
+    },
+    arm(onResume, delayMs) {
+      if (disposed || !eligible) return false;
+      const gen = generation;
+      const token = ++armToken;
+      clearTimer();
+      timerId = scheduler.setTimeout(() => {
+        timerId = null;
+        if (disposed || !eligible || gen !== generation || token !== armToken) return;
+        onResume();
+      }, delayMs);
+      return true;
+    },
+    invalidate() {
+      if (disposed) return;
+      bump();
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      eligible = false;
+      bump();
+    },
+  };
+}
+
 interface PageFlipController {
   update(): void;
   flipNext(): void;
@@ -637,13 +720,44 @@ function FlipbookReadingView({
   // auto-follow is paused until that timestamp. Every further gesture
   // re-arms the full window. When the timer fires we snap straight to the
   // latest real content page — even if no new chunk arrived meanwhile.
+  // Writing-live only: reading-review is fully manual and must never arm or
+  // honour a resume-to-latest callback after user navigation.
+  //
+  // Timer lifecycle lives in `createFollowResumeTimerOwner`. Eligibility is
+  // synchronized in useLayoutEffect (before timer macrotasks). StrictMode
+  // cleanup invalidates; unmount disposes. Cancelled callbacks stay inert via
+  // generation/arm-token guards even if a scheduler still delivers them.
   const [suspendResumeAt, setSuspendResumeAt] = useState<number | null>(null);
-  const suspendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [followNowMs, setFollowNowMs] = useState(() => Date.now());
+  const followResumeOwnerRef = useRef(createFollowResumeTimerOwner());
+  const jumpToLatestRef = useRef<() => void>(() => {});
 
-  useEffect(() => {
+  const followEligible = mode === 'writing-live' && liveChapter != null;
+
+  // Layout-commit sync (not passive): eligibility must be visible to any timer
+  // macrotask queued after this commit. Dep is the boolean so live-chapter
+  // content identity churn does not clear a valid timer.
+  useLayoutEffect(() => {
+    followResumeOwnerRef.current.setEligible(followEligible);
+    if (!followEligible) {
+      // Layout-sync clear: never queueMicrotask — a deferred reset can land after
+      // rapid re-entry and wipe a fresh suspension while its timer stays armed.
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- props-driven eligibility loss must drop suspend UI before paint/timer macrotasks
+      setSuspendResumeAt(prev => (prev == null ? prev : null));
+    }
     return () => {
-      if (suspendTimerRef.current) clearTimeout(suspendTimerRef.current);
+      // StrictMode setup/cleanup and eligibility transitions: bump generation so
+      // any callback armed in the previous effect window is inert.
+      followResumeOwnerRef.current.invalidate();
+    };
+  }, [followEligible]);
+
+  // Terminal dispose on unmount. Recreate after dispose so React StrictMode's
+  // effect cleanup → setup cycle can re-arm on the same component instance.
+  useLayoutEffect(() => {
+    return () => {
+      followResumeOwnerRef.current.dispose();
+      followResumeOwnerRef.current = createFollowResumeTimerOwner();
     };
   }, []);
 
@@ -671,21 +785,21 @@ function FlipbookReadingView({
     if (!pf) return;
     pf.turnToPage(lastContentPageIndex);
   }, [lastContentPageIndex, isSheetMode, applyReadingPage]);
-  const jumpToLatestRef = useRef(jumpToLatestContentPage);
-  useEffect(() => {
+  useLayoutEffect(() => {
     jumpToLatestRef.current = jumpToLatestContentPage;
-  });
+  }, [jumpToLatestContentPage]);
 
   const suspendFollow = useCallback(() => {
+    // Review mode (and writing-live without a live chapter) never suspends —
+    // there is no auto-follow to resume, and arming would snap the page later.
     const now = Date.now();
-    setFollowNowMs(now);
-    setSuspendResumeAt(now + FOLLOW_SUSPEND_MS);
-    if (suspendTimerRef.current) clearTimeout(suspendTimerRef.current);
-    suspendTimerRef.current = setTimeout(() => {
-      suspendTimerRef.current = null;
+    const armed = followResumeOwnerRef.current.arm(() => {
       setSuspendResumeAt(null);
       jumpToLatestRef.current();
     }, FOLLOW_SUSPEND_MS);
+    if (!armed) return;
+    setFollowNowMs(now);
+    setSuspendResumeAt(now + FOLLOW_SUSPEND_MS);
   }, []);
 
   // 1s-ish heartbeat while suspended so the toolbar countdown reads live.
