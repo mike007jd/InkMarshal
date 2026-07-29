@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+} from 'ai';
 import type { Message } from '@/lib/db-types';
 import type { NovelChatUIMessage } from '@/lib/chat-ui-message';
 
@@ -44,7 +48,12 @@ async function drain(response: Response): Promise<string> {
 }
 
 interface MockStreamTextOptions {
-  onFinish: (event: { text: string; usage: undefined }) => Promise<void>;
+  abortSignal?: AbortSignal;
+  onFinish: (event: {
+    text: string;
+    usage: undefined;
+    finishReason?: string;
+  }) => Promise<void>;
   onError: (event: { error: unknown }) => Promise<void>;
 }
 
@@ -52,6 +61,10 @@ interface MockUIMessageResponseOptions {
   headers?: HeadersInit;
   generateMessageId?: () => string;
   onError?: (error: unknown) => string;
+  originalMessages?: NovelChatUIMessage[];
+  consumeSseStream?: (options: {
+    stream: ReadableStream<string>;
+  }) => PromiseLike<void> | void;
   onFinish?: (event: {
     responseMessage: NovelChatUIMessage;
     isAborted: boolean;
@@ -74,6 +87,14 @@ function uiResponse(
       controller.close();
     },
   }), { headers });
+}
+
+function waitForAbort(signal?: AbortSignal): Promise<void> {
+  if (!signal) return Promise.resolve();
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    signal.addEventListener('abort', () => resolve(), { once: true });
+  });
 }
 
 beforeEach(() => aiMocks.streamText.mockReset());
@@ -160,23 +181,55 @@ describe('streamChatTurnResponse', () => {
     expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'failed' });
   });
 
-  it('persists an aborted partial assistant response through the server stream lifecycle', async () => {
+  it('persists an aborted partial through real response cancellation and consumeSseStream', async () => {
     aiMocks.streamText.mockImplementation((opts: MockStreamTextOptions) => ({
-      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => uiResponse(responseOptions, async () => {
-        await opts.onFinish({ text: 'partial reply', usage: undefined });
-        await responseOptions.onFinish?.({
-          responseMessage: uiMessage('assistant-1', 'assistant', 'partial reply'),
-          isAborted: true,
-          isContinuation: false,
-          messages: [],
+      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => {
+        const responseMessageId = responseOptions.generateMessageId?.() ?? 'assistant-1';
+        const stream = createUIMessageStream<NovelChatUIMessage>({
+          originalMessages: responseOptions.originalMessages ?? [uiMessage('user-1', 'user', 'hi')],
+          generateId: () => responseMessageId,
+          onError: responseOptions.onError ?? (() => 'error'),
+          onFinish: responseOptions.onFinish,
+          execute: async ({ writer }) => {
+            const textId = `${responseMessageId}:text`;
+            writer.write({ type: 'start', messageId: responseMessageId });
+            writer.write({ type: 'text-start', id: textId });
+            writer.write({ type: 'text-delta', id: textId, delta: 'partial reply' });
+
+            // Hold open like an in-flight generation until the request is aborted.
+            await waitForAbort(opts.abortSignal);
+
+            await opts.onFinish({
+              text: 'partial reply',
+              usage: undefined,
+              finishReason: 'stop',
+            });
+            writer.write({ type: 'abort' });
+          },
         });
-        return { 'text-delta': 'partial reply' };
-      }),
+
+        return createUIMessageStreamResponse({
+          stream,
+          headers: responseOptions.headers,
+          // Pass through production wiring so cancelling the response reader
+          // exercises the independent SSE consumer path.
+          consumeSseStream: responseOptions.consumeSseStream,
+        });
+      },
     }));
+
     const aiUsage = makeAiUsage();
-    const persistence = makePersistence();
+    let resolveStopped: ((value: { id: string; text: string }) => void) | undefined;
+    const stoppedPersisted = new Promise<{ id: string; text: string }>((resolve) => {
+      resolveStopped = resolve;
+    });
+    const persistence = makePersistence({
+      persistStoppedAssistant: vi.fn(async (id: string, text: string) => {
+        resolveStopped?.({ id, text });
+        return msg(id, 'assistant', text);
+      }),
+    });
     const requestController = new AbortController();
-    requestController.abort();
 
     const response = await streamChatTurnResponse({
       aiUsage: aiUsage as never,
@@ -191,10 +244,32 @@ describe('streamChatTurnResponse', () => {
       stoppedLabel: 'Stopped',
     });
 
-    await drain(response);
+    const reader = response.body?.getReader();
+    expect(reader).toBeTruthy();
+    const decoder = new TextDecoder();
+    let buffered = '';
 
+    while (reader) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      if (buffered.includes('partial reply')) {
+        // Simulate client Stop: drop the response body first, then abort the
+        // request. Without consumeSseStream the UI onFinish abort path dies here.
+        await reader.cancel();
+        requestController.abort();
+        break;
+      }
+    }
+
+    const saved = await stoppedPersisted;
+
+    expect(saved).toEqual({
+      id: 'assistant-1',
+      text: 'partial reply\n\nStopped',
+    });
+    expect(persistence.persistStoppedAssistant).toHaveBeenCalledTimes(1);
     expect(persistence.persistAssistant).not.toHaveBeenCalled();
-    expect(persistence.persistStoppedAssistant).toHaveBeenCalledWith('assistant-1', 'partial reply\n\nStopped');
     expect(aiUsage.settle).toHaveBeenCalledTimes(1);
     expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
   });
