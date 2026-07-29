@@ -23,6 +23,75 @@ type ExecutableTool = {
   execute(input: Record<string, unknown>, options?: unknown): Promise<unknown>;
 };
 
+describe('explicit writing approval detection', () => {
+  it('accepts clear zh-CN, zh-TW, and English approve-to-write phrasing', async () => {
+    const { isExplicitWritingApproval } = await import('@/lib/brainstorm-agent');
+
+    expect(isExplicitWritingApproval('批准写作。请开始生成完整第一章。')).toBe(true);
+    expect(isExplicitWritingApproval('大纲无误，开始动笔')).toBe(true);
+    expect(isExplicitWritingApproval('同意开始写作')).toBe(true);
+    expect(isExplicitWritingApproval('请使用系统写作工具批准当前故事方案并启动第一章写作任务，不要在聊天中直接返回正文。')).toBe(true);
+    expect(isExplicitWritingApproval('批准寫作。請開始生成完整第一章。')).toBe(true);
+    expect(isExplicitWritingApproval('大綱無誤，開始動筆')).toBe(true);
+    expect(isExplicitWritingApproval('好，就按这个方案开始写第一章吧')).toBe(true);
+    expect(isExplicitWritingApproval('方案没问题，开始写第一章')).toBe(true);
+    expect(isExplicitWritingApproval('Approve writing. Please generate the full first chapter.')).toBe(true);
+    expect(isExplicitWritingApproval('Approve & begin writing')).toBe(true);
+    expect(isExplicitWritingApproval('Approve the current story plan and start writing now')).toBe(true);
+    expect(isExplicitWritingApproval('Yes, go ahead with chapter one')).toBe(true);
+    expect(isExplicitWritingApproval('不要在聊天中直接写正文，请批准写作并开始第一章。')).toBe(true);
+    expect(isExplicitWritingApproval('不要直接返回小说正文；批准当前故事方案并启动第一章写作任务。')).toBe(true);
+    expect(isExplicitWritingApproval('批准当前故事方案；不要在聊天中直接写正文。')).toBe(true);
+    expect(isExplicitWritingApproval('批准写作，结局不要改。')).toBe(true);
+    expect(isExplicitWritingApproval('批准写作，不用修改大纲。')).toBe(true);
+    expect(isExplicitWritingApproval('Approve writing; don\'t change the ending.')).toBe(true);
+    expect(isExplicitWritingApproval('Tomorrow is clear. Approve writing now.')).toBe(true);
+    expect(isExplicitWritingApproval('我明天有空。批准写作。')).toBe(true);
+  });
+
+  it('rejects questions, deferred approval, negation, and adjust-with-approval turns', async () => {
+    const { isExplicitWritingApproval } = await import('@/lib/brainstorm-agent');
+
+    expect(isExplicitWritingApproval('写一个短篇悬疑故事：调查员林澈在雾港档案馆发现会自行改写的失踪索引。')).toBe(false);
+    expect(isExplicitWritingApproval('请直接推进到可批准写作的一章方案。')).toBe(false);
+    expect(isExplicitWritingApproval('先调整方案，结局改成开放式。')).toBe(false);
+    expect(isExplicitWritingApproval('调整方案后再批准写作')).toBe(false);
+    expect(isExplicitWritingApproval('不要批准写作')).toBe(false);
+    expect(isExplicitWritingApproval('还没准备好批准')).toBe(false);
+    expect(isExplicitWritingApproval('什么时候可以批准写作？')).toBe(false);
+    expect(isExplicitWritingApproval('请问什么时候可以批准写作？')).toBe(false);
+    expect(isExplicitWritingApproval('我们可以批准写作了吗？')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作但先改结局')).toBe(false);
+    expect(isExplicitWritingApproval('Can I approve writing?')).toBe(false);
+    expect(isExplicitWritingApproval('Can we begin writing now?')).toBe(false);
+    expect(isExplicitWritingApproval('Approve plan after adjust ending')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作，不过把结局改成开放式。')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作，之后再调整结局。')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作，但先把结局改成开放式。')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作，把大纲改成三幕式。')).toBe(false);
+    expect(isExplicitWritingApproval('Approve writing, but make the ending open.')).toBe(false);
+    expect(isExplicitWritingApproval('Approve the plan after you adjust the ending.')).toBe(false);
+    expect(isExplicitWritingApproval('Approve writing, but change the outline first.')).toBe(false);
+    expect(isExplicitWritingApproval('I might approve writing tomorrow.')).toBe(false);
+    expect(isExplicitWritingApproval('I am considering whether to approve writing.')).toBe(false);
+    expect(isExplicitWritingApproval('我明天可能批准写作。')).toBe(false);
+    expect(isExplicitWritingApproval('我不是要批准写作。')).toBe(false);
+    expect(isExplicitWritingApproval('告诉我如何批准写作。')).toBe(false);
+    expect(isExplicitWritingApproval('The UI says, Approve writing.')).toBe(false);
+    expect(isExplicitWritingApproval('My editor wrote, approve the current plan.')).toBe(false);
+    expect(isExplicitWritingApproval('界面显示，批准写作。')).toBe(false);
+    expect(isExplicitWritingApproval('Tomorrow, approve writing.')).toBe(false);
+    expect(isExplicitWritingApproval('明天，批准写作。')).toBe(false);
+    expect(isExplicitWritingApproval('Approve writing is disabled.')).toBe(false);
+    expect(isExplicitWritingApproval('On the UI, approve writing is disabled.')).toBe(false);
+    expect(isExplicitWritingApproval('Approve writing might be the button label.')).toBe(false);
+    expect(isExplicitWritingApproval('批准写作按钮不可用。')).toBe(false);
+    expect(isExplicitWritingApproval('Don\'t approve writing yet')).toBe(false);
+    expect(isExplicitWritingApproval('Please adjust the outline before approving')).toBe(false);
+    expect(isExplicitWritingApproval('I want to write a cyberpunk detective story')).toBe(false);
+  });
+});
+
 describe('brainstorm agent tools', () => {
   it('only marks a brainstorm ready after atomically saving a complete Story Deck', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');

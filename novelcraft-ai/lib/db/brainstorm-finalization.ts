@@ -1,10 +1,12 @@
-import type { Novel } from '@/lib/db-types';
+import { mapNovel, type Novel } from '@/lib/db-types';
 import { getDb } from '@/lib/db/connection';
-import { applyNovelUpdate } from '@/lib/db/queries-novel';
+import { applyNovelUpdate, hydrateNovelRow } from '@/lib/db/queries-novel';
 import type { KnowledgeEntryRow } from '@/lib/db/queries-knowledge';
+import { toJsonb, type InterviewState } from '@/lib/interview-state';
 import { nowIso } from '@/lib/utils';
 
 const EDITABLE_STAGES = new Set(['discovery_interview', 'ready_for_greenlight']);
+const STORY_DECK_TYPES = ['character', 'world', 'outline'] as const;
 
 export type BrainstormFinalizationEntry = {
   type: 'character' | 'world' | 'outline';
@@ -29,6 +31,120 @@ export type FinalizeBrainstormResult =
       coverage: Record<BrainstormFinalizationEntry['type'], number>;
     }
   | { ok: false; reason: 'not_found' | 'not_editable' | 'incomplete' };
+
+export type ApproveExistingBrainstormResult =
+  | {
+      ok: true;
+      alreadyReady: boolean;
+      beforeNovel: Novel;
+      novel: Novel;
+      coverage: Record<BrainstormFinalizationEntry['type'], number>;
+    }
+  | { ok: false; reason: 'not_found' | 'not_editable' | 'incomplete' };
+
+function storyDeckCoverage(db: ReturnType<typeof getDb>, novelId: string) {
+  const coverage = { character: 0, world: 0, outline: 0 };
+  const rows = db.prepare(
+    `SELECT type, COUNT(*) AS count
+       FROM knowledge_entries
+      WHERE novel_id = ? AND type IN ('character', 'world', 'outline')
+      GROUP BY type`,
+  ).all(novelId) as { type: BrainstormFinalizationEntry['type']; count: number }[];
+  for (const row of rows) coverage[row.type] = row.count;
+  return coverage;
+}
+
+function hasCompleteExistingProfile(novel: Novel): boolean {
+  return Boolean(
+    novel.storySummary.trim()
+    && novel.characterSummary.trim()
+    && novel.arcSummary.trim(),
+  );
+}
+
+function proposalReviewStateFromExistingProfile(novel: Novel): InterviewState {
+  const collectedProfile = {
+    genre: novel.genre,
+    targetWords: String(novel.targetWords),
+    storySummary: novel.storySummary,
+    characterSummary: novel.characterSummary,
+    arcSummary: novel.arcSummary,
+  };
+  const proposalSummary = [
+    collectedProfile.storySummary && `Story: ${collectedProfile.storySummary}`,
+    collectedProfile.characterSummary && `Characters: ${collectedProfile.characterSummary}`,
+    collectedProfile.arcSummary && `Arc: ${collectedProfile.arcSummary}`,
+  ].filter(Boolean).join('\n');
+
+  return {
+    mode: 'proposal_review',
+    currentQuestionId: null,
+    currentQuestion: null,
+    currentHelperText: null,
+    currentOptions: [],
+    recommendedOptionId: null,
+    slotTarget: null,
+    missingFields: [],
+    collectedProfile,
+    proposalSummary: proposalSummary || null,
+    proposalVersion: 1,
+    interviewStage: 'proposal_review',
+    stageProgress: { current: 6, total: 6 },
+  };
+}
+
+/**
+ * Strict chat-approval primitive: advance to ready_for_greenlight only when the
+ * current profile summaries and existing Story Deck coverage are already
+ * complete. Never inserts/updates knowledge cards and never falls back to title.
+ */
+export async function approveExistingBrainstormAtomic(
+  novelId: string,
+): Promise<ApproveExistingBrainstormResult> {
+  const db = getDb();
+  const tx = db.transaction((): ApproveExistingBrainstormResult => {
+    const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!currentRow) return { ok: false, reason: 'not_found' };
+    const beforeNovel = mapNovel(hydrateNovelRow(currentRow));
+    const coverage = storyDeckCoverage(db, novelId);
+
+    if (!EDITABLE_STAGES.has(beforeNovel.stage)) {
+      return { ok: false, reason: 'not_editable' };
+    }
+    if (
+      !hasCompleteExistingProfile(beforeNovel)
+      || STORY_DECK_TYPES.some(type => coverage[type] < 1)
+    ) {
+      return { ok: false, reason: 'incomplete' };
+    }
+    if (beforeNovel.stage === 'ready_for_greenlight') {
+      return {
+        ok: true,
+        alreadyReady: true,
+        beforeNovel,
+        novel: beforeNovel,
+        coverage,
+      };
+    }
+
+    const novel = applyNovelUpdate(db, novelId, {
+      stage: 'ready_for_greenlight',
+      progress: 0,
+      interviewState: toJsonb(proposalReviewStateFromExistingProfile(beforeNovel)),
+    });
+    if (!novel) throw new Error('Novel disappeared during brainstorm approval');
+    return {
+      ok: true,
+      alreadyReady: false,
+      beforeNovel,
+      novel,
+      coverage,
+    };
+  });
+  return tx();
+}
 
 function normalizedTitle(value: string): string {
   return value.trim().toLowerCase();
