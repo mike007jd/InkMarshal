@@ -5,7 +5,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LocaleProvider } from '@/components/LanguageProvider';
-import { ManuscriptReadingView } from '@/components/ManuscriptReadingView';
+import {
+  createFollowResumeTimerOwner,
+  ManuscriptReadingView,
+  type FollowResumeScheduler,
+} from '@/components/ManuscriptReadingView';
 import type { ManuscriptChapter } from '@/components/ManuscriptShell';
 import type { FlipbookGeometry } from '@/lib/flipbook-geometry';
 import { paginateManuscript } from '@/lib/pagination';
@@ -959,6 +963,221 @@ describe('ManuscriptReadingView live-writing follow & suspend', () => {
       </LocaleProvider>,
     );
     expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------- Follow eligibility / timer lifecycle (A–F) ---------- */
+
+/** Capturing scheduler: clearTimeout is a no-op so tests retain callbacks and
+ *  manually invoke them after cancellation to prove owner inertness. */
+function createCapturingScheduler(): {
+  scheduler: FollowResumeScheduler;
+  callbacks: Array<() => void>;
+} {
+  const callbacks: Array<() => void> = [];
+  let nextId = 1;
+  return {
+    callbacks,
+    scheduler: {
+      setTimeout: callback => {
+        callbacks.push(callback);
+        return nextId++ as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeout: () => {
+        // Intentionally retain callbacks — production clearTimeout is separate
+        // from the generation/arm-token inertness guarantee under test.
+      },
+    },
+  };
+}
+
+describe('ManuscriptReadingView follow eligibility epoch timer lifecycle', () => {
+  beforeEach(resetFlipbookTestState);
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('A: reading-review Previous stays put past the 5s boundary', () => {
+    vi.useFakeTimers();
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    const chapters = [ch1, liveChapterWith(30)];
+    const totalPages = lastRealPageIndex(chapters) + 1;
+    expect(totalPages).toBeGreaterThanOrEqual(3);
+
+    renderLive({ chapters, liveChapter: null, mode: 'reading-review' });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Next' })[0]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Next' })[0]);
+    expect(screen.getByText(`Page 3 of ${totalPages}`)).toBeTruthy();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Previous' })[0]);
+    expect(screen.getByText(`Page 2 of ${totalPages}`)).toBeTruthy();
+    pageFlip.turnToPage.mockClear();
+
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(screen.getByText(`Page 2 of ${totalPages}`)).toBeTruthy();
+    expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+  });
+
+  it('B: writing-live resumes to the latest real page at exactly 5s', () => {
+    vi.useFakeTimers();
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    const live = liveChapterWith(30);
+    const chapters = [ch1, live];
+    const totalPages = lastRealPageIndex(chapters) + 1;
+    expect(totalPages).toBeGreaterThanOrEqual(3);
+
+    renderLive({ chapters, liveChapter: live });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+    expect(screen.getByText(`Page ${totalPages} of ${totalPages}`)).toBeTruthy();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Previous' })[0]);
+    expect(screen.getByText(`Page ${totalPages - 1} of ${totalPages}`)).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toContain('Paused · resumes in 5s');
+
+    act(() => {
+      vi.advanceTimersByTime(4999);
+    });
+    expect(screen.getByText(`Page ${totalPages - 1} of ${totalPages}`)).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(screen.getByText(`Page ${totalPages} of ${totalPages}`)).toBeTruthy();
+  });
+
+  it('C: eligibility loss makes every retained stale callback inert', () => {
+    const { scheduler, callbacks } = createCapturingScheduler();
+    const owner = createFollowResumeTimerOwner(scheduler);
+    const resume = vi.fn();
+
+    owner.setEligible(true);
+    expect(owner.arm(resume, 5000)).toBe(true);
+    expect(callbacks).toHaveLength(1);
+
+    owner.setEligible(false);
+    // Manually invoke the cancelled callback — must not resume.
+    callbacks[0]();
+    expect(resume).not.toHaveBeenCalled();
+    expect(owner.arm(resume, 5000)).toBe(false);
+  });
+
+  it('D: rapid ineligible→eligible re-entry: old callback cannot clear or jump a fresh suspension', () => {
+    const { scheduler, callbacks } = createCapturingScheduler();
+    const owner = createFollowResumeTimerOwner(scheduler);
+    const staleResume = vi.fn();
+    const freshResume = vi.fn();
+
+    owner.setEligible(true);
+    expect(owner.arm(staleResume, 5000)).toBe(true);
+    const staleCallback = callbacks[0];
+
+    owner.setEligible(false);
+    owner.setEligible(true);
+    expect(owner.arm(freshResume, 5000)).toBe(true);
+    expect(callbacks).toHaveLength(2);
+
+    // Old callback after cancellation must not fire stale resume or the fresh one.
+    staleCallback();
+    expect(staleResume).not.toHaveBeenCalled();
+    expect(freshResume).not.toHaveBeenCalled();
+
+    // Fresh arm still completes when its own callback runs.
+    callbacks[1]();
+    expect(freshResume).toHaveBeenCalledOnce();
+    expect(staleResume).not.toHaveBeenCalled();
+  });
+
+  it('E: rapid eligible → ineligible → eligible re-entry keeps a fresh suspension safe from the old callback', () => {
+    vi.useFakeTimers();
+    paginationProbe.geometry = { ...SHEET_GEOMETRY };
+    const live = liveChapterWith(30);
+    const chapters = [ch1, live];
+    const totalPages = lastRealPageIndex(chapters) + 1;
+    const { rerender } = renderLive({ chapters, liveChapter: live, mode: 'writing-live' });
+
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Previous' })[0]);
+    expect(screen.getByRole('status').textContent).toContain('Paused · resumes in 5s');
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    rerender(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-live"
+          chapters={chapters}
+          liveChapter={null}
+          mode="reading-review"
+          activeChapter={null}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+    rerender(
+      <LocaleProvider>
+        <ManuscriptReadingView
+          novelId="nv-live"
+          chapters={chapters}
+          liveChapter={live}
+          mode="writing-live"
+          activeChapter={null}
+          layout="flipbook"
+          onLayoutChange={() => {}}
+        />
+      </LocaleProvider>,
+    );
+
+    // Fresh suspension in the new eligibility epoch.
+    fireEvent.click(screen.getAllByRole('button', { name: 'Previous' })[0]);
+    expect(screen.getByRole('status').textContent).toContain('Paused · resumes in 5s');
+    const pageAfterFreshSuspend = screen.getByText(/Page \d+ of/).textContent;
+    pageFlip.turnToPage.mockClear();
+
+    // Old epoch's remaining ~3s must not clear or jump the fresh suspension.
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.getByRole('status').textContent).toContain('Paused');
+    expect(screen.getByText(/Page \d+ of/).textContent).toBe(pageAfterFreshSuspend);
+    expect(pageFlip.turnToPage).not.toHaveBeenCalled();
+
+    // Fresh 5s window still completes normally.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.getByText(`Page ${totalPages} of ${totalPages}`)).toBeTruthy();
+  });
+
+  it('F: dispose makes every captured callback inert', () => {
+    const { scheduler, callbacks } = createCapturingScheduler();
+    const owner = createFollowResumeTimerOwner(scheduler);
+    const resume = vi.fn();
+
+    owner.setEligible(true);
+    expect(owner.arm(resume, 5000)).toBe(true);
+    owner.invalidate(); // StrictMode-style cleanup while still "eligible" in props
+    expect(owner.arm(resume, 5000)).toBe(true);
+    expect(callbacks).toHaveLength(2);
+
+    owner.dispose();
+    for (const callback of callbacks) callback();
+    expect(resume).not.toHaveBeenCalled();
+    expect(owner.arm(resume, 5000)).toBe(false);
   });
 });
 
