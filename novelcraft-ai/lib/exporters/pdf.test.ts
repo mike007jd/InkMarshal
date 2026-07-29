@@ -1,4 +1,9 @@
-import { PDFDocument } from 'pdf-lib';
+import {
+  decodePDFRawStream,
+  PDFDocument,
+  PDFName,
+  PDFRawStream,
+} from 'pdf-lib';
 import { describe, expect, it } from 'vitest';
 
 import { buildNovelPdfBuffer, CJKNotSupportedError } from '@/lib/exporters/pdf';
@@ -19,28 +24,64 @@ const baseChapters = [
   },
 ];
 
+const CJK_SAMPLE = {
+  novel: {
+    ...baseNovel,
+    title: '九州奇缘',
+    storySummary: '一个关于宿命与抉择的故事。',
+  },
+  chapters: [
+    {
+      chapterNumber: 1,
+      title: '第一章：风起',
+      content: '夜色如墨，长街无人。\n\n他提着灯笼缓缓走过石桥，桥下的河水映着一弯残月。',
+    },
+  ],
+};
+
 async function pageCount(buffer: Uint8Array): Promise<number> {
   const pdf = await PDFDocument.load(buffer);
   return pdf.getPageCount();
 }
 
+async function embeddedCffPrograms(buffer: Uint8Array): Promise<Uint8Array[]> {
+  const pdf = await PDFDocument.load(buffer);
+  const programs: Uint8Array[] = [];
+  for (const [, object] of pdf.context.enumerateIndirectObjects()) {
+    if (
+      object instanceof PDFRawStream &&
+      object.dict.lookup(PDFName.of('Subtype')) ===
+        PDFName.of('CIDFontType0C')
+    ) {
+      programs.push(decodePDFRawStream(object).decode());
+    }
+  }
+  return programs;
+}
+
 describe('PDF exporter', () => {
   it('renders CJK frontmatter and content via the bundled Unicode font', async () => {
-    const buffer = await buildNovelPdfBuffer(
-      {
-        ...baseNovel,
-        title: '九州奇缘',
-        storySummary: '一个关于宿命与抉择的故事。',
-      },
-      [
-        {
-          chapterNumber: 1,
-          title: '第一章：风起',
-          content: '夜色如墨，长街无人。\n\n他提着灯笼缓缓走过石桥，桥下的河水映着一弯残月。',
-        },
-      ]
-    );
+    const buffer = await buildNovelPdfBuffer(CJK_SAMPLE.novel, CJK_SAMPLE.chapters);
     expect(await pageCount(buffer)).toBeGreaterThan(0);
+  });
+
+  it('embeds a structurally valid subset CJK font', async () => {
+    const buffer = await buildNovelPdfBuffer(CJK_SAMPLE.novel, CJK_SAMPLE.chapters);
+    // Full-face embed (~19 MB) "works" around the old subsetter bug but is not
+    // the accepted fix — subset output for this sample must stay small.
+    expect(buffer.byteLength).toBeGreaterThan(10_000);
+    expect(buffer.byteLength).toBeLessThan(2_000_000);
+
+    const programs = await embeddedCffPrograms(buffer);
+    expect(programs).toHaveLength(1);
+
+    // A CFF header is [major, minor, hdrSize, offSize]. The old
+    // @pdf-lib/fontkit subsetter emitted offSize=28 for this fixture, which
+    // Poppler rejected and macOS Quick Look rendered as corrupt glyphs.
+    const [major, minor, headerSize, offsetSize] = programs[0];
+    expect([major, minor, headerSize]).toEqual([1, 0, 4]);
+    expect(offsetSize).toBeGreaterThanOrEqual(1);
+    expect(offsetSize).toBeLessThanOrEqual(4);
   });
 
   it.each([

@@ -11,7 +11,7 @@ contains production npm dependencies, normal Cargo dependencies linked for
 components, the bundled Node.js runtime, and the bundled llama.cpp engine.
 Development-only npm dependencies and Cargo build/dev dependencies are excluded.
 
-Inventory totals: 450 npm packages, 358 Cargo crates,
+Inventory totals: 459 npm packages, 358 Cargo crates,
 13 linked Swift packages, and 2 standalone
 runtime/engine entries.
 
@@ -462,7 +462,6 @@ requirement is retained.
 | npm | `@lexical/yjs` | 0.44.0 | [source](https://github.com/facebook/lexical) |
 | npm | `@next/env` | 16.2.11 | [source](https://github.com/vercel/next.js) |
 | npm | `@next/swc-darwin-arm64` | 16.2.11 | [source](https://github.com/vercel/next.js) |
-| npm | `@pdf-lib/fontkit` | 1.1.1 | [source](https://github.com/Hopding/fontkit) |
 | npm | `@pdf-lib/standard-fonts` | 1.0.0 | [source](https://github.com/Hopding/standard-fonts) |
 | npm | `@pdf-lib/upng` | 1.0.1 | [source](https://github.com/Hopding/upng) |
 | npm | `@preact/signals-core` | 1.14.3 | [source](https://github.com/preactjs/signals) |
@@ -611,6 +610,7 @@ requirement is retained.
 | npm | `bindings` | 1.5.0 | [source](https://github.com/TooTallNate/node-bindings) |
 | npm | `bl` | 4.1.0 | [source](https://github.com/rvagg/bl) |
 | npm | `bluebird` | 3.4.7 | [source](https://github.com/petkaantonov/bluebird) |
+| npm | `brotli` | 1.3.3 | [source](https://github.com/devongovett/brotli.js) |
 | npm | `browserslist` | 4.28.2 | [source](https://www.npmjs.com/package/browserslist/v/4.28.2) |
 | npm | `buffer` | 5.7.1 | [source](https://github.com/feross/buffer) |
 | npm | `ccount` | 2.0.1 | [source](https://www.npmjs.com/package/ccount/v/2.0.1) |
@@ -620,6 +620,7 @@ requirement is retained.
 | npm | `character-reference-invalid` | 2.0.1 | [source](https://www.npmjs.com/package/character-reference-invalid/v/2.0.1) |
 | npm | `classnames` | 2.5.1 | [source](https://github.com/JedWatson/classnames) |
 | npm | `client-only` | 0.0.1 | [source](https://reactjs.org/) |
+| npm | `clone` | 2.1.2 | [source](https://github.com/pvorb/node-clone) |
 | npm | `clsx` | 2.1.1 | [source](https://www.npmjs.com/package/clsx/v/2.1.1) |
 | npm | `cmdk` | 1.1.1 | [source](https://github.com/pacocoursey/cmdk) |
 | npm | `comma-separated-tokens` | 2.0.3 | [source](https://www.npmjs.com/package/comma-separated-tokens/v/2.0.3) |
@@ -633,6 +634,7 @@ requirement is retained.
 | npm | `dequal` | 2.0.3 | [source](https://www.npmjs.com/package/dequal/v/2.0.3) |
 | npm | `detect-node-es` | 1.1.0 | [source](https://github.com/thekashey/detect-node) |
 | npm | `devlop` | 1.1.0 | [source](https://www.npmjs.com/package/devlop/v/1.1.0) |
+| npm | `dfa` | 1.2.0 | [source](https://www.npmjs.com/package/dfa/v/1.2.0) |
 | npm | `docx` | 9.6.0 | [source](https://github.com/dolanmiu/docx) |
 | npm | `end-of-stream` | 1.4.5 | [source](https://github.com/mafintosh/end-of-stream) |
 | npm | `escalade` | 3.2.0 | [source](https://www.npmjs.com/package/escalade/v/3.2.0) |
@@ -640,8 +642,10 @@ requirement is retained.
 | npm | `estree-util-is-identifier-name` | 3.0.0 | [source](https://www.npmjs.com/package/estree-util-is-identifier-name/v/3.0.0) |
 | npm | `eventsource-parser` | 3.1.0 | [source](https://www.npmjs.com/package/eventsource-parser/v/3.1.0) |
 | npm | `extend` | 3.0.2 | [source](https://github.com/justmoon/node-extend) |
+| npm | `fast-deep-equal` | 3.1.3 | [source](https://github.com/epoberezkin/fast-deep-equal) |
 | npm | `fflate` | 0.8.2 | [source](https://github.com/101arrowz/fflate) |
 | npm | `file-uri-to-path` | 1.0.0 | [source](https://github.com/TooTallNate/file-uri-to-path) |
+| npm | `fontkit` | 2.0.4 | [source](https://github.com/foliojs/fontkit) |
 | npm | `fs-constants` | 1.0.0 | [source](https://github.com/mafintosh/fs-constants) |
 | npm | `gensync` | 1.0.0-beta.2 | [source](https://github.com/loganfsmyth/gensync) |
 | npm | `get-nonce` | 1.0.1 | [source](https://www.npmjs.com/package/get-nonce/v/1.0.1) |
@@ -721,6 +725,7 @@ requirement is retained.
 | npm | `node-abi` | 3.92.0 | [source](https://github.com/electron/node-abi) |
 | npm | `node-releases` | 2.0.48 | [source](https://github.com/chicoxyzzy/node-releases) |
 | npm | `page-flip` | 2.0.7 | [source](https://github.com/Nodlik/StPageFlip) |
+| npm | `pako` | 0.2.9 | [source](https://www.npmjs.com/package/pako/v/0.2.9) |
 | npm | `parse-entities` | 4.0.2 | [source](https://www.npmjs.com/package/parse-entities/v/4.0.2) |
 | npm | `path-is-absolute` | 1.0.1 | [source](https://www.npmjs.com/package/path-is-absolute/v/1.0.1) |
 | npm | `pdf-lib` | 1.17.1 | [source](https://github.com/Hopding/pdf-lib) |
@@ -747,6 +752,7 @@ requirement is retained.
 | npm | `remark-parse` | 11.0.0 | [source](https://github.com/remarkjs/remark/tree/main/packages/remark-parse) |
 | npm | `remark-rehype` | 11.1.2 | [source](https://www.npmjs.com/package/remark-rehype/v/11.1.2) |
 | npm | `remark-stringify` | 11.0.0 | [source](https://github.com/remarkjs/remark/tree/main/packages/remark-stringify) |
+| npm | `restructure` | 3.0.2 | [source](https://github.com/devongovett/restructure) |
 | npm | `safe-buffer` | 5.1.2 | [source](https://github.com/feross/safe-buffer) |
 | npm | `safe-buffer` | 5.2.1 | [source](https://github.com/feross/safe-buffer) |
 | npm | `safe-content-frame` | 0.0.21 | [source](https://github.com/assistant-ui/assistant-ui) |
@@ -769,11 +775,14 @@ requirement is retained.
 | npm | `tar-fs` | 2.1.4 | [source](https://github.com/mafintosh/tar-fs) |
 | npm | `tar-stream` | 2.2.0 | [source](https://github.com/mafintosh/tar-stream) |
 | npm | `throttleit` | 2.1.0 | [source](https://www.npmjs.com/package/throttleit/v/2.1.0) |
+| npm | `tiny-inflate` | 1.0.3 | [source](https://github.com/devongovett/tiny-inflate) |
 | npm | `trim-lines` | 3.0.1 | [source](https://www.npmjs.com/package/trim-lines/v/3.0.1) |
 | npm | `trough` | 2.2.0 | [source](https://www.npmjs.com/package/trough/v/2.2.0) |
 | npm | `underscore` | 1.13.8 | [source](https://github.com/jashkenas/underscore) |
 | npm | `undici-types` | 7.18.2 | [source](https://github.com/nodejs/undici) |
 | npm | `undici-types` | 7.24.6 | [source](https://github.com/nodejs/undici) |
+| npm | `unicode-properties` | 1.4.1 | [source](https://github.com/devongovett/unicode-properties) |
+| npm | `unicode-trie` | 2.0.0 | [source](https://github.com/devongovett/unicode-trie) |
 | npm | `unified` | 11.0.5 | [source](https://www.npmjs.com/package/unified/v/11.0.5) |
 | npm | `unist-util-is` | 6.0.1 | [source](https://www.npmjs.com/package/unist-util-is/v/6.0.1) |
 | npm | `unist-util-position` | 5.0.0 | [source](https://www.npmjs.com/package/unist-util-position/v/5.0.0) |
@@ -1235,7 +1244,6 @@ Applied to:
 - npm `@lexical/yjs` 0.44.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Meta Platforms, Inc. and affiliates.; The above copyright notice and this permission notice shall be included in all
 - npm `@next/env` 16.2.11 — Next.js Team <support@vercel.com>
 - npm `@next/swc-darwin-arm64` 16.2.11 — See linked source
-- npm `@pdf-lib/fontkit` 1.1.1 — Andrew Dillon <andrew.dillon.j@gmail.com>
 - npm `@pdf-lib/standard-fonts` 1.0.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2018 Andrew Dillon; The above copyright notice and this permission notice shall be included in all
 - npm `@pdf-lib/upng` 1.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2017 Photopea; The above copyright notice and this permission notice shall be included in all
 - npm `@preact/signals-core` 1.14.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2022-present Preact Team; The above copyright notice and this permission notice shall be included in all
@@ -1384,6 +1392,7 @@ Applied to:
 - npm `bindings` 1.5.0 — Copyright (c) 2012 Nathan Rajlich &lt;nathan@tootallnate.net&gt;; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `bl` 4.1.0 — Copyright (c) 2013-2019 bl contributors; The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 - npm `bluebird` 3.4.7 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2013-2015 Petka Antonov; The above copyright notice and this permission notice shall be included in
+- npm `brotli` 1.3.3 — Devon Govett <devongovett@gmail.com>
 - npm `browserslist` 4.28.2 — Copyright 2014 Andrey Sitnik <andrey@sitnik.es> and other contributors; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `buffer` 5.7.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Feross Aboukhadijeh, and other contributors.; The above copyright notice and this permission notice shall be included in
 - npm `ccount` 2.0.1 — Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
@@ -1393,6 +1402,7 @@ Applied to:
 - npm `character-reference-invalid` 2.0.1 — Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `classnames` 2.5.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2018 Jed Watson; The above copyright notice and this permission notice shall be included in all
 - npm `client-only` 0.0.1 — See linked source
+- npm `clone` 2.1.2 — Copyright © 2011-2015 Paul Vorbach <paul@vorba.ch>; COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER; The above copyright notice and this permission notice shall be included in all
 - npm `clsx` 2.1.1 — Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com); The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 - npm `cmdk` 1.1.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2022 Paco Coursey; The above copyright notice and this permission notice shall be included in all
 - npm `comma-separated-tokens` 2.0.3 — Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
@@ -1406,6 +1416,7 @@ Applied to:
 - npm `dequal` 2.0.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com); The above copyright notice and this permission notice shall be included in
 - npm `detect-node-es` 1.1.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2017 Ilya Kantor; The above copyright notice and this permission notice shall be included in all
 - npm `devlop` 1.1.0 — Copyright (c) 2023 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
+- npm `dfa` 1.2.0 — Devon Govett <devongovett@gmail.com>
 - npm `docx` 9.6.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2016 Dolan; The above copyright notice and this permission notice shall be included in all
 - npm `end-of-stream` 1.4.5 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2014 Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `escalade` 3.2.0 — Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com); The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
@@ -1414,8 +1425,10 @@ Applied to:
 - npm `eventsource-parser` 3.1.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2026 Espen Hovlandsdal <espen@hovlandsdal.com>; The above copyright notice and this permission notice shall be included in all
 - npm `expand-template` 2.0.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2018 Lars-Magnus Skog; The above copyright notice and this permission notice shall be included in
 - npm `extend` 3.0.2 — Copyright (c) 2014 Stefan Thomas; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE; The above copyright notice and this permission notice shall be
+- npm `fast-deep-equal` 3.1.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2017 Evgeny Poberezkin; The above copyright notice and this permission notice shall be included in all
 - npm `fflate` 0.8.2 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2023 Arjun Barrett; The above copyright notice and this permission notice shall be included in all
 - npm `file-uri-to-path` 1.0.0 — Copyright (c) 2014 Nathan Rajlich <nathan@tootallnate.net>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
+- npm `fontkit` 2.0.4 — Devon Govett <devongovett@gmail.com>
 - npm `fs-constants` 1.0.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2018 Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `gensync` 1.0.0-beta.2 — Copyright 2018 Logan Smyth <loganfsmyth@gmail.com>; The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 - npm `get-nonce` 1.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2020 Anton Korzunov; The above copyright notice and this permission notice shall be included in all
@@ -1496,6 +1509,7 @@ Applied to:
 - npm `node-abi` 3.92.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2016 Lukas Geiger; The above copyright notice and this permission notice shall be included in all
 - npm `node-releases` 2.0.48 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2017 Sergey Rubanov (https://github.com/chicoxyzzy); The above copyright notice and this permission notice shall be included in
 - npm `page-flip` 2.0.7 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2020 Nodlik; The above copyright notice and this permission notice shall be included in all
+- npm `pako` 0.2.9 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (C) 2014-2016 by Vitaly Puzrin; The above copyright notice and this permission notice shall be included in
 - npm `pako` 1.0.11 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (C) 2014-2017 by Vitaly Puzrin and Andrei Tuputcyn; The above copyright notice and this permission notice shall be included in
 - npm `parse-entities` 4.0.2 — Copyright (c) Titus Wormer <mailto:tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `path-is-absolute` 1.0.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (sindresorhus.com); The above copyright notice and this permission notice shall be included in
@@ -1523,6 +1537,7 @@ Applied to:
 - npm `remark-parse` 11.0.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2014 Titus Wormer <tituswormer@gmail.com>; The above copyright notice and this permission notice shall be included in
 - npm `remark-rehype` 11.1.2 — Copyright (c) Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `remark-stringify` 11.0.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2014 Titus Wormer <tituswormer@gmail.com>; The above copyright notice and this permission notice shall be included in
+- npm `restructure` 3.0.2 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2015-present Devon Govett; The above copyright notice and this permission notice shall be included in all
 - npm `safe-buffer` 5.1.2 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Feross Aboukhadijeh; The above copyright notice and this permission notice shall be included in
 - npm `safe-buffer` 5.2.1 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Feross Aboukhadijeh; The above copyright notice and this permission notice shall be included in
 - npm `safe-content-frame` 0.0.21 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2025 AgentbaseAI Inc.; The above copyright notice and this permission notice shall be included in all
@@ -1545,11 +1560,14 @@ Applied to:
 - npm `tar-fs` 2.1.4 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2014 Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `tar-stream` 2.2.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2014 Mathias Buus; The above copyright notice and this permission notice shall be included in
 - npm `throttleit` 2.1.0 — Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com); Copyright (c) TJ Holowaychuk <tj@tjholowaychuk.com>; The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+- npm `tiny-inflate` 1.0.3 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2015-present Devon Govett; The above copyright notice and this permission notice shall be included in all
 - npm `trim-lines` 3.0.1 — Copyright (c) 2015 Titus Wormer <mailto:tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `trough` 2.2.0 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>; The above copyright notice and this permission notice shall be included in
 - npm `underscore` 1.13.8 — Copyright (c) 2009-2022 Jeremy Ashkenas, Julian Gonggrijp, and DocumentCloud and Investigative Reporters & Editors; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT; The above copyright notice and this permission notice shall be
 - npm `undici-types` 7.18.2 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Matteo Collina and Undici contributors; The above copyright notice and this permission notice shall be included in all
 - npm `undici-types` 7.24.6 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) Matteo Collina and Undici contributors; The above copyright notice and this permission notice shall be included in all
+- npm `unicode-properties` 1.4.1 — Copyright 2018; The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+- npm `unicode-trie` 2.0.0 — Copyright 2018; The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 - npm `unified` 11.0.5 — AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER; Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>; The above copyright notice and this permission notice shall be included in
 - npm `unist-util-is` 6.0.1 — Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
 - npm `unist-util-position` 5.0.0 — Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>; IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY; The above copyright notice and this permission notice shall be
