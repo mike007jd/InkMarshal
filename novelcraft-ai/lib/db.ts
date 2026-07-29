@@ -100,6 +100,8 @@ export {
   addChatMessage,
   addChatMessagePair,
   addChatMessagePairSync,
+  commitTerminalEditChatPairSync,
+  editRunChangesKey,
   createChapterSnapshot,
   listChapterSnapshots,
   restoreChapterSnapshot,

@@ -1,5 +1,12 @@
-import { generateText, Output, type LanguageModel, type ModelMessage } from 'ai';
-import type { z } from 'zod';
+import {
+  generateText,
+  jsonSchema,
+  Output,
+  type LanguageModel,
+  type ModelMessage,
+  type Schema,
+} from 'ai';
+import { z } from 'zod';
 import type { OperationKind } from '@/lib/model-supply/types';
 import { resolvePreset, type CreativityLevel } from '@/lib/ai/generation-presets';
 
@@ -25,6 +32,48 @@ export interface GenerateStructuredObjectArgs<T> {
   abortSignal?: AbortSignal;
 }
 
+/**
+ * llama.cpp compiles response_format JSON Schema into a grammar. Large
+ * maxLength/maxItems values become huge bounded repetitions and can exceed its
+ * grammar safety limit, causing a silent fallback to unconstrained freeform.
+ *
+ * Strip only those wire hints for every structured operation. The original Zod
+ * schema remains the authoritative validator, so persisted/output business
+ * bounds are unchanged for hosted providers and local engines alike.
+ */
+export function grammarSafeStructuredSchema<T>(schema: z.ZodType<T>): Schema<T> {
+  const stripWireBounds = <Value>(value: Value): Value => {
+    if (Array.isArray(value)) return value.map(stripWireBounds) as Value;
+    if (!value || typeof value !== 'object') return value;
+
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'maxLength' || key === 'maxItems') continue;
+      out[key] = stripWireBounds(child);
+    }
+    return out as Value;
+  };
+
+  // Zod and AI SDK both emit draft-07-compatible objects, but their bundled
+  // JSONSchema type packages disagree on the legacy boolean form of
+  // exclusiveMaximum. Keep the cast isolated at this library boundary.
+  const wireSchema = stripWireBounds(
+    z.toJSONSchema(schema, { target: 'draft-7' }),
+  ) as unknown as Parameters<typeof jsonSchema>[0];
+
+  return jsonSchema<T>(
+    wireSchema,
+    {
+      validate: value => {
+        const result = schema.safeParse(value);
+        return result.success
+          ? { success: true, value: result.data }
+          : { success: false, error: result.error };
+      },
+    },
+  );
+}
+
 export async function generateStructuredObject<T>(
   args: GenerateStructuredObjectArgs<T>,
 ) {
@@ -40,7 +89,7 @@ export async function generateStructuredObject<T>(
     temperature: resolvedTemperature,
     maxOutputTokens,
     abortSignal,
-    output: Output.object({ schema }),
+    output: Output.object({ schema: grammarSafeStructuredSchema(schema) }),
   };
 
   const result = messages

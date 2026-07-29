@@ -30,9 +30,9 @@ describe('Manuscript AI edit scope guards', () => {
     expect(handleSendSource).toContain('const requestScope = {');
     expect(handleSendSource).toContain('chapterId: chapter.id,');
     expect(handleSendSource).toContain('if (!isCurrentEditingScope(requestScope)) return;');
-    expect(handleSendSource).toContain('if (isCurrentEditingScope(requestScope)) setChanges([...changesRef.current]);');
+    expect(handleSendSource).toContain('activeEditRunRef.current?.runId !== runId');
+    expect(handleSendSource).toContain('const ownsActiveRun = activeEditRunRef.current?.runId === runId;');
     expect(handleSendSource).toContain('if (editAbortRef.current === abort) editAbortRef.current = null;');
-    expect(handleSendSource).toContain('if (isCurrentEditingScope(requestScope)) {');
   });
 
   it('forwards the selected style id through freeform edit-chat headers', () => {
@@ -41,7 +41,9 @@ describe('Manuscript AI edit scope guards', () => {
     const handleStopStart = source.indexOf('const handleStopEdit = useCallback', handleSendStart);
     const handleSendSource = source.slice(handleSendStart, handleStopStart);
 
-    expect(handleSendSource).toContain("'polish',\n          { creativity, styleId: styleId ?? undefined },\n          { signal: abort.signal },");
+    expect(handleSendSource).toMatch(
+      /buildModelHeaders\(\s*'polish',\s*\{ creativity, styleId: styleId \?\? undefined \},\s*\{ signal: abort\.signal \},\s*\)/,
+    );
     expect(handleSendSource).toContain('[chapter, storageReady, creativity, styleId, novelId');
   });
 });

@@ -1,7 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { generateText, Output } from 'ai';
+import { z } from 'zod';
 
 import { OPERATION_ROLE, type OperationKind } from './types';
 import { AIUsageError } from '@/lib/ai-error';
+import { ChapterEditSchema } from '@/lib/ai/types';
 import {
   disableThinkingFetch,
   resolveBaseUrl,
@@ -342,5 +345,272 @@ describe('disableThinkingFetch (regression: BUG-5 empty local generation)', () =
     });
 
     expect(seenBody).toBe('not-json');
+  });
+});
+
+// ── Structured outputs wire contract (regression: edit Markdown / no schema) ─
+
+function chatCompletionResponse(content: string): Response {
+  return new Response(
+    JSON.stringify({
+      id: 'chatcmpl-test',
+      object: 'chat.completion',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
+}
+
+describe('openai-compatible structured outputs (supportsStructuredOutputs)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('loopback user-runtime sends response_format.json_schema and keeps enable_thinking=false', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse(
+          JSON.stringify({
+            changes: [{ original: '旧句', replacement: '新句' }],
+            summary: '替换一句',
+          }),
+        );
+      }),
+    );
+
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'rewrite',
+        'x-im-kind': 'local',
+        'x-im-engine-format': 'gguf',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'http://127.0.0.1:8000/v1',
+        'x-im-model': 'Qwen3.5-4B-Q4_K_M',
+      }),
+      'rewrite',
+    );
+    expect(resolved).not.toBeNull();
+    expect(
+      (resolved!.model as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs,
+    ).toBe(true);
+
+    const { output } = await generateText({
+      model: resolved!.model,
+      output: Output.object({ schema: ChapterEditSchema }),
+      prompt: 'edit',
+    });
+
+    expect(seenBody).toBeDefined();
+    expect(seenBody).toMatchObject({
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: expect.any(String),
+          strict: true,
+        },
+      },
+      chat_template_kwargs: { enable_thinking: false },
+    });
+    const responseFormat = seenBody!.response_format as {
+      type: string;
+      json_schema?: { schema?: unknown };
+    };
+    expect(responseFormat.type).toBe('json_schema');
+    expect(responseFormat.json_schema?.schema).toEqual(
+      expect.objectContaining({
+        type: 'object',
+        properties: expect.objectContaining({
+          changes: expect.any(Object),
+          summary: expect.any(Object),
+        }),
+      }),
+    );
+    // ChapterEdit keeps its 20k/100 business bounds as runtime refinements.
+    // Serializing them as maxLength/maxItems makes bundled llama.cpp reject
+    // the generated grammar and silently fall back to unconstrained output.
+    expect(JSON.stringify(responseFormat.json_schema?.schema)).not.toContain('maxLength');
+    expect(JSON.stringify(responseFormat.json_schema?.schema)).not.toContain('maxItems');
+    expect(output).toEqual({
+      changes: [{ original: '旧句', replacement: '新句' }],
+      summary: '替换一句',
+    });
+  });
+
+  it('hosted openai-compatible keeps default (no schema / no thinking kwargs)', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse(JSON.stringify({ ok: true }));
+      }),
+    );
+
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'draft',
+        'x-im-kind': 'provider',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'https://api.openai.com/v1',
+        'x-im-model': 'gpt-5.4-mini',
+        'x-im-secret': 'sk-hosted-test',
+      }),
+      'draft',
+    );
+    expect(resolved).not.toBeNull();
+    expect(
+      (resolved!.model as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs,
+    ).toBe(false);
+
+    await generateText({
+      model: resolved!.model,
+      output: Output.object({ schema: z.object({ ok: z.boolean() }) }),
+      prompt: 'x',
+    });
+
+    expect(seenBody).toMatchObject({
+      response_format: { type: 'json_object' },
+    });
+    expect(seenBody).not.toHaveProperty('chat_template_kwargs');
+    expect(
+      (seenBody!.response_format as { json_schema?: unknown }).json_schema,
+    ).toBeUndefined();
+  });
+
+  it('custom non-loopback HTTPS openai-compatible does not enable structured schema', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse(JSON.stringify({ ok: true }));
+      }),
+    );
+
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'draft',
+        'x-im-kind': 'custom',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'https://llm.example.com/v1',
+        'x-im-model': 'custom-model',
+        'x-im-secret': 'sk-custom-test',
+      }),
+      'draft',
+    );
+    expect(resolved).not.toBeNull();
+    expect(
+      (resolved!.model as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs,
+    ).toBe(false);
+
+    await generateText({
+      model: resolved!.model,
+      output: Output.object({ schema: z.object({ ok: z.boolean() }) }),
+      prompt: 'x',
+    });
+
+    expect(seenBody).toMatchObject({
+      response_format: { type: 'json_object' },
+    });
+    expect(seenBody).not.toHaveProperty('chat_template_kwargs');
+  });
+
+  it('custom loopback runtime does not claim json_schema support', async () => {
+    const headers: Record<string, string> = {
+      'x-im-role': 'rewrite',
+      'x-im-kind': 'custom',
+      'x-im-transport': 'openai-compatible',
+      'x-im-base-url': 'http://127.0.0.1:8000/v1',
+      'x-im-model': 'local-model',
+    };
+
+    const resolved = await resolveModelForRole(localRequest(headers), 'rewrite');
+    expect(resolved).not.toBeNull();
+    expect(
+      (resolved!.model as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs,
+    ).toBe(false);
+  });
+
+  it('authoritatively rejects bundled MLX for structured-output roles', async () => {
+    await expect(resolveModelForRole(
+      localRequest({
+        'x-im-role': 'rewrite',
+        'x-im-kind': 'local',
+        'x-im-engine-format': 'mlx',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'http://127.0.0.1:8000/v1',
+        'x-im-model': 'local-model',
+      }),
+      'rewrite',
+    )).rejects.toMatchObject({
+      name: 'AIUsageError',
+      status: 400,
+      category: 'local_engine',
+      message: expect.stringContaining('MLX local models currently support Draft only'),
+    });
+  });
+
+  it('keeps bundled MLX available for Draft text generation', async () => {
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'draft',
+        'x-im-kind': 'local',
+        'x-im-engine-format': 'mlx',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'http://127.0.0.1:8000/v1',
+        'x-im-model': 'local-model',
+      }),
+      'draft',
+    );
+    expect(resolved).not.toBeNull();
+    expect(
+      (resolved!.model as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs,
+    ).toBe(false);
+  });
+
+  it('secret/security gates still reject keyless hosted and non-loopback HTTP secrets', async () => {
+    await expect(
+      resolveModelForRole(
+        localRequest({
+          'x-im-role': 'draft',
+          'x-im-kind': 'provider',
+          'x-im-transport': 'openai-compatible',
+          'x-im-base-url': 'https://api.openai.com/v1',
+          'x-im-model': 'gpt-5.4-mini',
+        }),
+        'draft',
+      ),
+    ).rejects.toMatchObject({
+      name: 'AIUsageError',
+      status: 400,
+      category: 'invalid_credentials',
+    } satisfies Partial<AIUsageError>);
+
+    await expect(
+      resolveModelForRole(
+        localRequest({
+          'x-im-role': 'draft',
+          'x-im-transport': 'openai-compatible',
+          'x-im-base-url': 'http://192.0.2.10:8000/v1',
+          'x-im-model': 'remote-model',
+          'x-im-secret': 'sk-must-not-forward',
+        }),
+        'draft',
+      ),
+    ).rejects.toMatchObject({
+      name: 'AIUsageError',
+      status: 400,
+      category: 'invalid_credentials',
+    } satisfies Partial<AIUsageError>);
   });
 });

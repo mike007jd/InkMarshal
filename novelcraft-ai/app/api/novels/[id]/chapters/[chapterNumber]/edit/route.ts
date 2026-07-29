@@ -1,16 +1,18 @@
 import { NextResponse } from 'next/server';
 import {
   acquireWritingLock,
-  addChatMessagePairSync,
+  commitTerminalEditChatPairSync,
   getChapter,
+  getChatHistory,
   releaseWritingLock,
   setChapterOriginalContent,
 } from '@/lib/db';
 import { getDb } from '@/lib/db/connection';
 import { streamEdit, type ChapterEditChange } from '@/lib/ai';
 import { buildAIContext } from '@/lib/ai-context-builder';
+import { isEffectiveTextReplacement } from '@/lib/diff-utils';
 import { formatTokensHeader } from '@/lib/token-budget';
-import { detectLanguage, sanitizeError, safeParseJsonObject } from '@/lib/utils';
+import { detectLanguage, isUuid, sanitizeError, safeParseJsonObject } from '@/lib/utils';
 import { requireNovelOwner } from '@/lib/local-auth';
 import { aiUsageErrorResponse, createAIStreamLifecycle, createAIUsageSession, type ProviderUsage } from '@/lib/ai-usage';
 import { readCreativityHeader, resolvePreset } from '@/lib/ai/generation-presets';
@@ -25,6 +27,9 @@ export const maxDuration = 120;
 const VALID_ROLES = new Set(['user', 'assistant']);
 const SELECTED_TEXT_MAX_CHARS = 100_000;
 const FULL_TEXT_MAX_CHARS = 500_000;
+const INSTRUCTION_MAX_CHARS = 5_000;
+/** Client-localized Stop label bound; never invent server locale text. */
+export const STOPPED_LABEL_MAX_CHARS = 200;
 const LOCK_TTL_SEC = 180;
 
 interface EditPayload {
@@ -32,6 +37,13 @@ interface EditPayload {
   selectedText?: string;
   fullText?: string;
   chatHistory?: { role: string; content: string }[];
+  runId?: string;
+}
+
+interface EditStopPayload {
+  runId?: string;
+  instruction?: string;
+  stoppedLabel?: string;
 }
 
 type NormalizedEditChatMessage = { role: 'user' | 'assistant'; content: string };
@@ -77,6 +89,120 @@ export function normalizeEditChatHistory(value: unknown): NormalizedEditChatMess
   });
 }
 
+/** Client-localized Stop label; max ~200 chars; never invent server locale text. */
+export function normalizeEditStoppedLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > STOPPED_LABEL_MAX_CHARS) return undefined;
+  return trimmed;
+}
+
+export function normalizeEditRunId(value: unknown): string | undefined {
+  return isUuid(value) ? value : undefined;
+}
+
+export function normalizeEditInstruction(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > INSTRUCTION_MAX_CHARS) {
+    throw new Error('Instruction too long');
+  }
+  return trimmed;
+}
+
+/**
+ * GET — authenticated chapter-scoped durable edit transcript
+ * (`chapter_chat_history`) for reload hydration.
+ */
+export async function GET(
+  _request: Request,
+  { params }: { params: Promise<{ id: string; chapterNumber: string }> },
+) {
+  const { id, chapterNumber: chapterNumStr } = await params;
+  const chapterNumber = parsePositiveIntegerParam(chapterNumStr);
+  if (chapterNumber === null) {
+    return NextResponse.json({ error: 'Invalid chapter number' }, { status: 400 });
+  }
+
+  const ownerCheck = await requireNovelOwner(id);
+  if (ownerCheck instanceof NextResponse) return ownerCheck;
+
+  const chapter = await getChapter(id, chapterNumber);
+  if (!chapter) {
+    return NextResponse.json({ error: 'Chapter not found' }, { status: 404 });
+  }
+
+  const messages = await getChatHistory(id, chapterNumber);
+  return NextResponse.json(
+    { messages },
+    { headers: { 'Cache-Control': 'no-store' } },
+  );
+}
+
+/**
+ * PATCH — explicit user Stop acknowledgement.
+ * Idempotent by runId; races safely with successful completion. Generic POST
+ * abort/cancel must never call this path.
+ */
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ id: string; chapterNumber: string }> },
+) {
+  const { id, chapterNumber: chapterNumStr } = await params;
+  const chapterNumber = parsePositiveIntegerParam(chapterNumStr);
+  if (chapterNumber === null) {
+    return NextResponse.json({ error: 'Invalid chapter number' }, { status: 400 });
+  }
+
+  const ownerCheck = await requireNovelOwner(id);
+  if (ownerCheck instanceof NextResponse) return ownerCheck;
+
+  const chapter = await getChapter(id, chapterNumber);
+  if (!chapter) {
+    return NextResponse.json({ error: 'Chapter not found' }, { status: 404 });
+  }
+
+  const parsed = await safeParseJsonObject<Partial<EditStopPayload>>(request);
+  if (parsed.error) return parsed.error;
+
+  const runId = normalizeEditRunId(parsed.data.runId);
+  let instruction: string | undefined;
+  try {
+    instruction = normalizeEditInstruction(parsed.data.instruction);
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Invalid instruction' },
+      { status: 400 },
+    );
+  }
+  const stoppedLabel = normalizeEditStoppedLabel(parsed.data.stoppedLabel);
+
+  if (!runId) {
+    return NextResponse.json({ error: 'runId is required' }, { status: 400 });
+  }
+  if (!instruction) {
+    return NextResponse.json({ error: 'instruction is required' }, { status: 400 });
+  }
+  if (!stoppedLabel) {
+    return NextResponse.json({ error: 'stoppedLabel is required' }, { status: 400 });
+  }
+
+  const terminal = commitTerminalEditChatPairSync(
+    getDb(),
+    id,
+    chapterNumber,
+    runId,
+    { role: 'user', content: instruction, status: 'cancelled' },
+    { role: 'assistant', content: stoppedLabel, status: 'cancelled' },
+  );
+
+  return NextResponse.json(
+    { status: terminal.status, outcome: terminal.outcome },
+    { headers: { 'Cache-Control': 'no-store' } },
+  );
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string; chapterNumber: string }> },
@@ -94,7 +220,22 @@ export async function POST(
   const parsed = await safeParseJsonObject<Partial<EditPayload>>(request);
   if (parsed.error) return parsed.error;
   const body = parsed.data;
-  const instruction = body.instruction;
+  const runId = normalizeEditRunId(body.runId);
+  if (!runId) {
+    return Response.json({ error: 'runId is required' }, { status: 400 });
+  }
+  let instruction: string | undefined;
+  try {
+    instruction = normalizeEditInstruction(body.instruction);
+  } catch (error) {
+    return Response.json(
+      { error: error instanceof Error ? error.message : 'Invalid instruction' },
+      { status: 400 },
+    );
+  }
+  if (!instruction) {
+    return Response.json({ error: 'instruction is required' }, { status: 400 });
+  }
   let selectedText: string | undefined;
   let requestedFullText: string | undefined;
   try {
@@ -114,13 +255,6 @@ export async function POST(
       { error: error instanceof Error ? error.message : 'Chat history invalid' },
       { status: 400 },
     );
-  }
-
-  if (!instruction || typeof instruction !== 'string') {
-    return Response.json({ error: 'instruction is required' }, { status: 400 });
-  }
-  if (instruction.length > 5_000) {
-    return Response.json({ error: 'Instruction too long (max 5000 chars)' }, { status: 400 });
   }
 
   const lock = await acquireWritingLock(id, LOCK_TTL_SEC);
@@ -250,12 +384,19 @@ export async function POST(
           controller.enqueue(encoder.encode(JSON.stringify(data) + '\n'));
         };
 
-        let sentChanges = 0;
+        let processedChanges = 0;
+        let emittedChanges = 0;
         let lastObject: { changes?: ChapterEditChange[]; summary?: string } | null = null;
 
-        const emitChange = (i: number, change: ChapterEditChange) => {
-          send({ type: 'change', id: `c${i + 1}`, original: change.original, replacement: change.replacement });
-          sentChanges = i + 1;
+        const emitChange = (change: ChapterEditChange) => {
+          if (!isEffectiveTextReplacement(change)) return;
+          emittedChanges += 1;
+          send({
+            type: 'change',
+            id: `c${emittedChanges}`,
+            original: change.original,
+            replacement: change.replacement,
+          });
         };
 
         try {
@@ -269,14 +410,17 @@ export async function POST(
             // Stream the second-to-last entries as they become complete; the
             // tail entry can still be growing, so it's only emitted in the
             // post-stream flush below where result.output guarantees it's done.
-            for (let i = sentChanges; i < changes.length - 1; i++) {
+            for (let i = processedChanges; i < changes.length - 1; i++) {
               const change = changes[i];
               if (!change || typeof change.original !== 'string' || typeof change.replacement !== 'string') break;
-              emitChange(i, change);
+              emitChange(change);
+              processedChanges = i + 1;
             }
           }
 
           if (lifecycle.isCancelled()) {
+            // Generic abort/cancel must never persist Stopped — only explicit
+            // PATCH Stop acknowledgement writes a cancelled terminal pair.
             await cancelUsageOnce();
             return;
           }
@@ -288,31 +432,44 @@ export async function POST(
           }
 
           const finalChanges = (finalObject?.changes ?? []) as ChapterEditChange[];
-          for (let i = sentChanges; i < finalChanges.length; i++) {
+          for (let i = processedChanges; i < finalChanges.length; i++) {
             const change = finalChanges[i];
             if (!change || typeof change.original !== 'string' || typeof change.replacement !== 'string') continue;
-            emitChange(i, change);
+            emitChange(change);
           }
 
           const summary = (finalObject?.summary ?? lastObject?.summary ?? '') as string;
-          const buffer = JSON.stringify(finalObject ?? lastObject ?? {});
-          // Persist originalContent (first-edit baseline) AND the chat pair in
-          // ONE transaction so a crash can't leave originalContent set without
-          // the matching chat history (or vice versa). recordUsage is best-effort
-          // usage accounting and stays outside the txn (it is async).
+          const effectiveFinalObject = {
+            ...(finalObject ?? lastObject ?? {}),
+            changes: finalChanges.filter(isEffectiveTextReplacement),
+          };
+          const buffer = JSON.stringify(effectiveFinalObject);
+          // Persist originalContent (first-edit baseline) AND the successful
+          // chat pair in ONE transaction, keyed by runId so a cancelled
+          // terminal that already won blocks both writes and done emission.
+          // recordUsage stays outside the txn (async, best-effort).
           const db = getDb();
-          db.transaction(() => {
-            if (chapter.originalContent === null) {
-              setChapterOriginalContent(db, id, chapterNumber, chapter.content);
-            }
-            addChatMessagePairSync(
+          const terminal = db.transaction(() => {
+            const result = commitTerminalEditChatPairSync(
               db,
               id,
               chapterNumber,
+              runId,
               { role: 'user', content: instruction, status: 'done' },
               { role: 'assistant', content: buffer, status: 'done' },
             );
+            if (result.outcome === 'inserted' && result.status === 'done') {
+              if (chapter.originalContent === null) {
+                setChapterOriginalContent(db, id, chapterNumber, chapter.content);
+              }
+            }
+            return result;
           })();
+
+          if (terminal.status !== 'done') {
+            await cancelUsageOnce();
+            return;
+          }
 
           await aiUsage.recordUsage(pendingUsage);
           usageSettled = true;

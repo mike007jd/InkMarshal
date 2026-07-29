@@ -6,12 +6,20 @@ import path from 'node:path';
 const aiMocks = vi.hoisted(() => ({
   generateText: vi.fn(),
   streamText: vi.fn(),
+  jsonSchema: vi.fn((
+    schema: unknown | (() => unknown),
+    options?: { validate?: (value: unknown) => unknown },
+  ) => ({
+    jsonSchema: typeof schema === 'function' ? schema() : schema,
+    validate: options?.validate,
+  })),
   Output: { object: vi.fn((config: unknown) => ({ type: 'object-output', config })) },
 }));
 
 vi.mock('ai', () => ({
   generateText: aiMocks.generateText,
   streamText: aiMocks.streamText,
+  jsonSchema: aiMocks.jsonSchema,
   Output: aiMocks.Output,
 }));
 

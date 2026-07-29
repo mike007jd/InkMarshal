@@ -2,11 +2,19 @@ import { describe, expect, it, vi } from 'vitest';
 
 const aiMocks = vi.hoisted(() => ({
   streamText: vi.fn(),
+  jsonSchema: vi.fn((
+    schema: unknown | (() => unknown),
+    options?: { validate?: (value: unknown) => unknown },
+  ) => ({
+    jsonSchema: typeof schema === 'function' ? schema() : schema,
+    validate: options?.validate,
+  })),
   Output: { object: vi.fn((config: unknown) => ({ type: 'object-output', config })) },
 }));
 
 vi.mock('ai', () => ({
   streamText: aiMocks.streamText,
+  jsonSchema: aiMocks.jsonSchema,
   Output: aiMocks.Output,
 }));
 
@@ -84,5 +92,42 @@ describe('streamEdit', () => {
     // + usage.
     expect('partialOutputStream' in result).toBe(true);
     expect('usage' in result).toBe(true);
+  });
+
+  it('reads the SDK usage promise once so abort rejection stays observed', async () => {
+    const { streamEdit } = await import('@/lib/ai/editor');
+    const abortError = new DOMException('This operation was aborted', 'AbortError');
+    const usagePromises: Promise<never>[] = [];
+    let usageReads = 0;
+    const sdkResult = {
+      output: Promise.reject(abortError),
+      partialOutputStream: (async function* () {})(),
+    } as unknown as {
+      output: Promise<never>;
+      partialOutputStream: AsyncIterable<never>;
+      usage: Promise<never>;
+    };
+    Object.defineProperty(sdkResult, 'usage', {
+      get() {
+        usageReads += 1;
+        const promise = Promise.reject(abortError);
+        usagePromises.push(promise);
+        return promise;
+      },
+    });
+    aiMocks.streamText.mockReturnValueOnce(sdkResult);
+
+    const result = streamEdit({
+      model: {} as never,
+      novelContext: { title: 'Novel', genre: 'Fantasy' },
+      chapterText: 'Original chapter text.',
+      instruction: 'Tighten it.',
+      onFinish: vi.fn(),
+    });
+
+    await expect(result.output).rejects.toBe(abortError);
+    await expect(result.usage).rejects.toBe(abortError);
+    expect(usageReads).toBe(1);
+    expect(usagePromises).toHaveLength(1);
   });
 });

@@ -33,13 +33,20 @@ import {
 import {
   engineStatus,
   isTauriRuntime,
+  type EngineFormat,
   type EngineInfo,
 } from '@/lib/desktop-runtime';
 import {
   isLocalEngineConnectionId,
   localEngineConnectionId,
 } from './local-engine';
-import { OPERATION_ROLE, type CapabilityRole, type OperationKind, type RuntimeTransport } from './types';
+import {
+  MLX_DRAFT_ONLY_ERROR,
+  OPERATION_ROLE,
+  type CapabilityRole,
+  type OperationKind,
+  type RuntimeTransport,
+} from './types';
 import type { CapabilityBinding, RuntimeConnection } from './types';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
 import { normalizeStyleId } from '@/lib/style-id';
@@ -151,7 +158,7 @@ async function buildHeadersForBinding(
     return null;
   }
 
-  const runtime = await resolveVerifiedConnectionRuntime(connection);
+  const runtime = await resolveVerifiedConnectionRuntime(connection, role);
 
   const prefix = mode === 'single' ? 'x-im' : `x-im-${role}`;
   const headers: Record<string, string> = mode === 'single'
@@ -168,6 +175,9 @@ async function buildHeadersForBinding(
         [`${prefix}-base-url`]: runtime.baseUrl,
         [`${prefix}-model`]: binding.modelId,
       };
+  if (runtime.engineFormat) {
+    headers[`${prefix}-engine-format`] = runtime.engineFormat;
+  }
 
   // Resolve the secret for THIS connection only. Connections without a
   // configured secretRef do not need keychain access (local runtimes commonly
@@ -196,7 +206,13 @@ async function buildHeadersForBinding(
 
 async function resolveVerifiedConnectionRuntime(
   connection: Pick<RuntimeConnection, 'id' | 'label' | 'kind' | 'transport' | 'baseUrl'>,
-): Promise<{ kind: RuntimeConnection['kind']; transport: RuntimeTransport; baseUrl: string }> {
+  role: CapabilityRole,
+): Promise<{
+  kind: RuntimeConnection['kind'];
+  transport: RuntimeTransport;
+  baseUrl: string;
+  engineFormat?: EngineFormat;
+}> {
   if (!isLocalEngineConnectionId(connection.id)) {
     return { kind: connection.kind, transport: connection.transport, baseUrl: connection.baseUrl };
   }
@@ -217,10 +233,14 @@ async function resolveVerifiedConnectionRuntime(
       `Local model runtime "${connection.label}" is not running. Open Models, start the model again, or switch this task to a Standard (GGUF) model if it stops repeatedly.`,
     );
   }
+  if (engine.format === 'mlx' && role !== 'draft') {
+    throw new Error(MLX_DRAFT_ONLY_ERROR);
+  }
 
   return {
     kind: 'local',
     transport: 'openai-compatible',
     baseUrl: `http://127.0.0.1:${engine.port}/v1`,
+    engineFormat: engine.format,
   };
 }

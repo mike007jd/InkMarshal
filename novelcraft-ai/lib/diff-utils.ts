@@ -8,6 +8,21 @@ function normalizeForMatch(text: string): string {
     .replace(/\u3002\u3002\u3002/g, '...');
 }
 
+export interface TextReplacement {
+  original: string;
+  replacement: string;
+}
+
+/** Reject malformed and exact no-op replacements before they reach diff UI. */
+export function isEffectiveTextReplacement(value: unknown): value is TextReplacement {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { original?: unknown; replacement?: unknown };
+  return typeof candidate.original === 'string'
+    && typeof candidate.replacement === 'string'
+    && candidate.original.trim().length > 0
+    && candidate.original !== candidate.replacement;
+}
+
 export function locateOriginalText(
   fullText: string,
   original: string
