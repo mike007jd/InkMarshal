@@ -1,11 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type RefObject } from 'react';
 import { ArchiveRestore, Trash2 } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
+import { isUsableReturnFocusTarget } from '@/components/ui/focus-utils';
 import { Spinner } from '@/components/ui/spinner';
 import {
   Dialog,
@@ -29,10 +30,16 @@ export function TrashPanel({
   open,
   onOpenChange,
   onLibraryChange,
+  returnFocusRef,
+  fallbackFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onLibraryChange: () => void;
+  /** Stable opener (e.g. More tools). Avoids Radix restoring into a removed menu portal. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
+  /** Visible narrow-shell control used when the opener leaves the layout. */
+  fallbackFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const { t, locale } = useLanguage();
   const { toast } = useToast();
@@ -92,7 +99,22 @@ export function TrashPanel({
   return (
     <>
       <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent side="right" className="w-full border-book-border bg-book-bg-primary p-0 sm:max-w-lg">
+        <SheetContent
+          side="right"
+          className="w-full border-book-border bg-book-bg-primary p-0 sm:max-w-lg"
+          onCloseAutoFocus={event => {
+            const returnTarget = returnFocusRef?.current ?? null;
+            const fallbackTarget = fallbackFocusRef?.current ?? null;
+            const focusTarget = isUsableReturnFocusTarget(returnTarget)
+              ? returnTarget
+              : isUsableReturnFocusTarget(fallbackTarget)
+                ? fallbackTarget
+                : null;
+            if (!focusTarget) return;
+            event.preventDefault();
+            focusTarget.focus({ preventScroll: true });
+          }}
+        >
           <SheetHeader className="border-b border-book-border px-5 py-4 text-left">
             <SheetTitle className="font-serif text-xl">{t.trashTitle}</SheetTitle>
             <SheetDescription>{t.trashDescription}</SheetDescription>

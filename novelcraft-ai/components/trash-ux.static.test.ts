@@ -20,4 +20,18 @@ describe('Trash UX', () => {
     expect(trash).toContain("key={deleteTarget?.id ?? 'closed'}");
     expect(trash).toContain('trashDeleteConfirmDescription');
   });
+
+  it('restores sheet focus to a stable return target instead of a removed menu portal', () => {
+    const trash = source('components/TrashPanel.tsx');
+    const shell = source('components/DesktopShellLayout.tsx');
+    expect(trash).toContain('returnFocusRef');
+    expect(trash).toContain('fallbackFocusRef');
+    expect(trash).toContain('onCloseAutoFocus={event => {');
+    expect(trash).toContain('event.preventDefault()');
+    expect(trash).toContain('focusTarget.focus({ preventScroll: true })');
+    expect(shell).toContain('ref={moreToolsTriggerRef}');
+    expect(shell).toContain('returnFocusRef={moreToolsTriggerRef}');
+    expect(shell).toContain('fallbackFocusRef={mobileNavOpenButtonRef}');
+    expect(shell).toContain('if (showSettings || showTrash) return;');
+  });
 });

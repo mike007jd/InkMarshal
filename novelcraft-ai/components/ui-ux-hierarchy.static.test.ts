@@ -5,12 +5,32 @@ import { describe, expect, it } from 'vitest';
 const source = (path: string) => readFileSync(join(process.cwd(), path), 'utf8');
 
 describe('UI/UX hierarchy contracts', () => {
-  it('keeps low-frequency global tools discoverable but collapsed', () => {
+  it('keeps low-frequency global tools in a portaled More tools menu', () => {
     const shell = source('components/DesktopShellLayout.tsx');
-    expect(shell).toContain('<Collapsible>');
+    // Progressive disclosure must not expand inline (Collapsible reflows the
+    // sidebar/canvas). The overlay menu is portaled via DropdownMenuContent.
+    expect(shell).not.toContain("from '@/components/ui/collapsible'");
+    expect(shell).not.toContain('<Collapsible');
+    expect(shell).toContain('<DropdownMenu');
+    expect(shell).toContain('open={moreToolsOpen}');
+    expect(shell).toContain('onOpenChange={open => {');
+    expect(shell).toContain('<DropdownMenuTrigger asChild>');
+    expect(shell).toContain('<DropdownMenuContent');
+    expect(shell).toContain('side="right"');
     expect(shell).toContain('{t.moreTools}');
     expect(shell.indexOf('{t.settings}')).toBeLessThan(shell.indexOf('href="/desktop-studio/workflows"'));
+    expect(shell.indexOf('{t.settings}')).toBeLessThan(shell.indexOf('href="/desktop-studio/series"'));
     expect(shell).toContain("router.push('/desktop-studio/models')");
+    expect(shell).toContain('{developerTools && (');
+    expect(shell).toContain('href="/desktop-studio/series"');
+    expect(shell).toContain('href="/desktop-studio/usage"');
+    expect(shell).toContain('closeMoreTools(false);');
+    expect(shell).toContain('setShowTrash(true);');
+    expect(shell).toContain('ref={moreToolsTriggerRef}');
+    expect(shell).toContain('returnFocusRef={moreToolsTriggerRef}');
+    expect(shell).toContain('fallbackFocusRef={mobileNavOpenButtonRef}');
+    expect(shell).toContain("aria-current={pathname.startsWith('/desktop-studio/series') ? 'page' : undefined}");
+    expect(shell).toContain("aria-current={pathname.startsWith('/desktop-studio/usage') ? 'page' : undefined}");
   });
 
   it('keeps edit-chat options progressive and removes the abandoned variants chain', () => {

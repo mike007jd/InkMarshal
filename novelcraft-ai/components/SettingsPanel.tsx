@@ -32,6 +32,7 @@ import { BackupSettings } from '@/components/BackupSettings';
 import { ModelDownloadSourceSettings } from '@/components/ModelDownloadSourceSettings';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Spinner } from '@/components/ui/spinner';
+import { isUsableReturnFocusTarget } from '@/components/ui/focus-utils';
 import { onAppSettingsHydrated } from '@/lib/app-settings-client';
 import {
   DESKTOP_UPDATE_CHECK_RESULT_EVENT,
@@ -64,31 +65,6 @@ function isTheme(value: string): value is AppSettings['theme'] {
 
 function isFontSize(value: string): value is AppSettings['fontSize'] {
   return value === 'sm' || value === 'md' || value === 'lg';
-}
-
-function isUsableReturnFocusTarget(target: HTMLElement | null): target is HTMLElement {
-  if (
-    !target?.isConnected ||
-    target === document.body ||
-    target === document.documentElement ||
-    target.closest('[data-slot="sheet-content"]') ||
-    target.matches(':disabled')
-  ) {
-    return false;
-  }
-
-  for (let element: HTMLElement | null = target; element; element = element.parentElement) {
-    const style = window.getComputedStyle(element);
-    if (
-      element.inert ||
-      element.getAttribute('aria-hidden') === 'true' ||
-      style.display === 'none' ||
-      style.visibility === 'hidden'
-    ) {
-      return false;
-    }
-  }
-  return target.getClientRects().length > 0;
 }
 
 function isLineSpacing(value: string): value is AppSettings['lineSpacing'] {
