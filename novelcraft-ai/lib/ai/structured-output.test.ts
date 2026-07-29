@@ -8,11 +8,19 @@ import { z } from 'zod';
 // call resolves to, without hitting a provider.
 const aiMocks = vi.hoisted(() => ({
   generateText: vi.fn(),
+  jsonSchema: vi.fn((
+    schema: unknown | (() => unknown),
+    options?: { validate?: (value: unknown) => unknown },
+  ) => ({
+    jsonSchema: typeof schema === 'function' ? schema() : schema,
+    validate: options?.validate,
+  })),
   Output: { object: vi.fn((config: unknown) => ({ type: 'object-output', config })) },
 }));
 
 vi.mock('ai', () => ({
   generateText: aiMocks.generateText,
+  jsonSchema: aiMocks.jsonSchema,
   Output: aiMocks.Output,
 }));
 
@@ -88,6 +96,50 @@ describe('generateStructuredObject temperature resolution', () => {
     const { generateStructuredObject } = await import('@/lib/ai/structured-output');
     await generateStructuredObject({ model: {} as never, schema, prompt: 'x' });
     expect(lastTemperature()).toBeUndefined();
+  });
+});
+
+describe('grammar-safe structured schema transport', () => {
+  it('strips nested maxLength/maxItems from the wire but preserves Zod validation', async () => {
+    const { grammarSafeStructuredSchema } = await import('@/lib/ai/structured-output');
+    const schema = z.object({
+      edits: z.array(z.object({
+        original: z.string().max(20_000),
+        replacement: z.string().max(20_000),
+      })).max(1_000),
+      summary: z.string().max(4_000),
+    });
+
+    const safe = grammarSafeStructuredSchema(schema);
+    const wire = await safe.jsonSchema;
+    expect(JSON.stringify(wire)).not.toContain('maxLength');
+    expect(JSON.stringify(wire)).not.toContain('maxItems');
+    expect(wire).toMatchObject({
+      type: 'object',
+      properties: {
+        edits: {
+          type: 'array',
+          items: {
+            type: 'object',
+          },
+        },
+      },
+    });
+
+    expect(await safe.validate?.({
+      edits: [{ original: 'x'.repeat(20_001), replacement: 'ok' }],
+      summary: 'ok',
+    })).toMatchObject({ success: false });
+    expect(await safe.validate?.({
+      edits: [{ original: 'old', replacement: 'new' }],
+      summary: 'ok',
+    })).toEqual({
+      success: true,
+      value: {
+        edits: [{ original: 'old', replacement: 'new' }],
+        summary: 'ok',
+      },
+    });
   });
 });
 

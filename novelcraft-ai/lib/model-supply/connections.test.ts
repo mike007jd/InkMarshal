@@ -1321,7 +1321,65 @@ describe('capability profile', () => {
       'x-im-role': 'draft',
       'x-im-base-url': 'http://127.0.0.1:51000/v1',
       'x-im-model': 'live.gguf',
+      'x-im-engine-format': 'gguf',
     });
+  });
+
+  it('buildRoleAwareHeaders identifies bundled MLX without claiming GGUF capability', async () => {
+    const mod = await loadModule();
+    const headers = await import('./headers');
+    const dr = await import('@/lib/desktop-runtime');
+    const conn = mod.upsertConnection({
+      id: 'local-engine:mlx:/m/live-mlx',
+      label: 'Local engine · live-mlx',
+      kind: 'local',
+      transport: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:51001/v1',
+    });
+    mod.saveCapabilityBinding('draft', conn.id, 'live-mlx');
+    (dr.engineStatus as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      {
+        engineId: 'mlx:/m/live-mlx',
+        format: 'mlx',
+        modelPath: '/m/live-mlx',
+        port: 51001,
+        footprintBytes: 1,
+      },
+    ]);
+
+    await expect(headers.buildRoleAwareHeaders('chapter')).resolves.toMatchObject({
+      'x-im-role': 'draft',
+      'x-im-base-url': 'http://127.0.0.1:51001/v1',
+      'x-im-model': 'live-mlx',
+      'x-im-engine-format': 'mlx',
+    });
+  });
+
+  it('buildRoleAwareHeaders rejects bundled MLX for structured-output roles', async () => {
+    const mod = await loadModule();
+    const headers = await import('./headers');
+    const dr = await import('@/lib/desktop-runtime');
+    const conn = mod.upsertConnection({
+      id: 'local-engine:mlx:/m/live-mlx',
+      label: 'Local engine · live-mlx',
+      kind: 'local',
+      transport: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:51001/v1',
+    });
+    mod.saveCapabilityBinding('rewrite', conn.id, 'live-mlx');
+    (dr.engineStatus as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      {
+        engineId: 'mlx:/m/live-mlx',
+        format: 'mlx',
+        modelPath: '/m/live-mlx',
+        port: 51001,
+        footprintBytes: 1,
+      },
+    ]);
+
+    await expect(headers.buildRoleAwareHeaders('polish')).rejects.toThrow(
+      'MLX local models currently support Draft only',
+    );
   });
 
   it('buildRoleAwareHeaders trusts native engine status over persisted local-engine endpoint fields', async () => {

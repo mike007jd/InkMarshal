@@ -158,16 +158,43 @@ export const CHAPTER_EDIT_LIMITS = {
   summary: 1000,
 } as const;
 
+// Keep these business bounds in Zod's runtime validation without serializing
+// them as JSON Schema maxLength/maxItems. The bundled llama.cpp turns large
+// numeric bounds (for example char{0,20000}) into a grammar that exceeds its
+// repetition safety limit, then silently falls back to unconstrained output.
+// Refinements preserve the exact application contract while the wire schema
+// constrains the object shape that the model must emit.
+const maxLengthRefinement = (max: number) => (value: string) => value.length <= max;
+const maxItemsRefinement = (max: number) => (value: readonly unknown[]) => value.length <= max;
+
 export const ChapterEditChangeSchema = z.object({
   // Non-empty for the same reason as UnificationReportSchema.original — the
   // chapter-edit apply path runs the same verbatim find/replace. Preserve
   // boundary whitespace because it can disambiguate the exact target.
-  original: nonBlankVerbatimString(CHAPTER_EDIT_LIMITS.original).describe('exact verbatim substring from the chapter that should be replaced'),
-  replacement: z.string().max(CHAPTER_EDIT_LIMITS.replacement).describe('new text replacing the original'),
+  original: z.string()
+    .refine(maxLengthRefinement(CHAPTER_EDIT_LIMITS.original), {
+      message: `Must contain at most ${CHAPTER_EDIT_LIMITS.original} characters.`,
+    })
+    .refine(value => value.trim().length > 0, {
+      message: 'Must contain non-whitespace text.',
+    })
+    .describe('exact verbatim substring from the chapter that should be replaced'),
+  replacement: z.string()
+    .refine(maxLengthRefinement(CHAPTER_EDIT_LIMITS.replacement), {
+      message: `Must contain at most ${CHAPTER_EDIT_LIMITS.replacement} characters.`,
+    })
+    .describe('new text replacing the original'),
 });
 export const ChapterEditSchema = z.object({
-  changes: z.array(ChapterEditChangeSchema).max(CHAPTER_EDIT_LIMITS.changes),
-  summary: z.string().max(CHAPTER_EDIT_LIMITS.summary).describe('1-2 sentences describing what changed and why'),
+  changes: z.array(ChapterEditChangeSchema)
+    .refine(maxItemsRefinement(CHAPTER_EDIT_LIMITS.changes), {
+      message: `Must contain at most ${CHAPTER_EDIT_LIMITS.changes} changes.`,
+    }),
+  summary: z.string()
+    .refine(maxLengthRefinement(CHAPTER_EDIT_LIMITS.summary), {
+      message: `Must contain at most ${CHAPTER_EDIT_LIMITS.summary} characters.`,
+    })
+    .describe('1-2 sentences describing what changed and why'),
 });
 export type ChapterEdit = z.infer<typeof ChapterEditSchema>;
 export type ChapterEditChange = z.infer<typeof ChapterEditChangeSchema>;

@@ -1054,6 +1054,28 @@ describe('model-supply orchestrator — wave 4 multi-engine', () => {
     ]);
   });
 
+  it('startAndBindLocalEngine binds only Draft by default for MLX', async () => {
+    localEngineMocks.startAndRegisterLocalEngine.mockResolvedValueOnce(
+      fakeEngineStart('mlx:/m/qwen-mlx', '/m/qwen-mlx', 51009),
+    );
+
+    await startAndBindLocalEngine('/m/qwen-mlx', 'mlx', 'Qwen MLX');
+
+    expect(boundRolesFromDurableCalls()).toEqual(['draft']);
+  });
+
+  it('rejects MLX structured roles before estimating or starting an engine', async () => {
+    await expect(startEngineForRoles({
+      modelPath: '/m/qwen-mlx',
+      format: 'mlx',
+      modelLabel: 'Qwen MLX',
+      roles: ['rewrite'],
+    })).rejects.toThrow('MLX local models currently support Draft only');
+
+    expect(desktopMocks.engineEstimateFootprint).not.toHaveBeenCalled();
+    expect(localEngineMocks.startAndRegisterLocalEngine).not.toHaveBeenCalled();
+  });
+
   it('clearLocalEngineBindings clears every role bound to any local-engine id', async () => {
     connectionMocks.profile.draft = {
       connectionId: 'local-engine:gguf:/m/a.gguf',

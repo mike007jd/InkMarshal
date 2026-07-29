@@ -1,10 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { applyChanges, locateOriginalText } from '@/lib/diff-utils';
+import {
+  applyChanges,
+  isEffectiveTextReplacement,
+  locateOriginalText,
+} from '@/lib/diff-utils';
 
 describe('locateOriginalText', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('accepts only well-formed replacements that actually change text', () => {
+    expect(isEffectiveTextReplacement({ original: 'old', replacement: 'new' })).toBe(true);
+    expect(isEffectiveTextReplacement({ original: 'same', replacement: 'same' })).toBe(false);
+    expect(isEffectiveTextReplacement({ original: ' \n\t', replacement: 'new' })).toBe(false);
+    expect(isEffectiveTextReplacement({ original: 'old' })).toBe(false);
+    expect(isEffectiveTextReplacement(null)).toBe(false);
   });
 
   it('warns when the punctuation-normalized fallback hits the comparison cap', () => {

@@ -930,6 +930,7 @@ export async function getChatHistory(
     .prepare(
       `SELECT * FROM chapter_chat_history
        WHERE novel_id = ? AND chapter_number = ?
+         AND role IN ('user', 'assistant')
        ORDER BY created_at DESC, rowid DESC
        LIMIT ?`,
     )
@@ -953,47 +954,15 @@ export async function addChatMessage(
   message: { role: string; content: string; changes?: string; status?: string },
 ) {
   const db = getDb();
-  const id = crypto.randomUUID();
   const createdAt = nowIso();
+  const [row] = createChapterChatRows([message]);
 
   const tx = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO chapter_chat_history (
-         id, novel_id, chapter_number, role, content, changes, status, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      novelId,
-      chapterNumber,
-      message.role,
-      message.content,
-      message.changes ?? null,
-      message.status ?? 'pending',
-      createdAt,
-    );
-
-    const keepRows = db
-      .prepare(
-        `SELECT id FROM chapter_chat_history
-         WHERE novel_id = ? AND chapter_number = ?
-         ORDER BY created_at DESC, rowid DESC
-         LIMIT ?`,
-      )
-      .all(novelId, chapterNumber, CHAT_HISTORY_KEEP) as { id: string }[];
-
-    const keepIds = keepRows.map(r => r.id);
-    if (keepIds.length === CHAT_HISTORY_KEEP) {
-      const placeholders = keepIds.map(() => '?').join(',');
-      db.prepare(
-        `DELETE FROM chapter_chat_history
-         WHERE novel_id = ? AND chapter_number = ?
-           AND id NOT IN (${placeholders})`,
-      ).run(novelId, chapterNumber, ...keepIds);
-    }
+    insertChapterChatRows(db, novelId, chapterNumber, [row], createdAt);
   });
   tx();
 
-  return { id, createdAt: parseTimestamp(createdAt) };
+  return { id: row.id, createdAt: parseTimestamp(createdAt) };
 }
 
 export async function addChatMessagePair(
@@ -1021,48 +990,10 @@ export function addChatMessagePairSync(
   assistantMessage: { role: 'assistant'; content: string; changes?: string; status?: string },
 ) {
   const createdAt = nowIso();
-  const rows = [userMessage, assistantMessage].map(message => ({
-    ...message,
-    id: crypto.randomUUID(),
-  }));
+  const rows = createChapterChatRows([userMessage, assistantMessage]);
 
   const tx = db.transaction(() => {
-    const insert = db.prepare(
-      `INSERT INTO chapter_chat_history (
-         id, novel_id, chapter_number, role, content, changes, status, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const message of rows) {
-      insert.run(
-        message.id,
-        novelId,
-        chapterNumber,
-        message.role,
-        message.content,
-        message.changes ?? null,
-        message.status ?? 'pending',
-        createdAt,
-      );
-    }
-
-    const keepRows = db
-      .prepare(
-        `SELECT id FROM chapter_chat_history
-         WHERE novel_id = ? AND chapter_number = ?
-         ORDER BY created_at DESC, rowid DESC
-         LIMIT ?`,
-      )
-      .all(novelId, chapterNumber, CHAT_HISTORY_KEEP) as { id: string }[];
-
-    const keepIds = keepRows.map(r => r.id);
-    if (keepIds.length === CHAT_HISTORY_KEEP) {
-      const placeholders = keepIds.map(() => '?').join(',');
-      db.prepare(
-        `DELETE FROM chapter_chat_history
-         WHERE novel_id = ? AND chapter_number = ?
-           AND id NOT IN (${placeholders})`,
-      ).run(novelId, chapterNumber, ...keepIds);
-    }
+    insertChapterChatRows(db, novelId, chapterNumber, rows, createdAt);
   });
   tx();
 
@@ -1070,4 +1001,212 @@ export function addChatMessagePairSync(
     user: { id: rows[0].id, createdAt: parseTimestamp(createdAt) },
     assistant: { id: rows[1].id, createdAt: parseTimestamp(createdAt) },
   };
+}
+
+/** Opaque `changes` marker binding a chat pair to an edit runId (no schema migration). */
+export function editRunChangesKey(runId: string): string {
+  return `edit-run:${runId}`;
+}
+
+export type TerminalEditChatStatus = 'done' | 'cancelled';
+
+export type TerminalEditChatPairResult = {
+  outcome: 'inserted' | 'existing';
+  status: TerminalEditChatStatus;
+};
+
+const EDIT_TERMINAL_ROLE = 'edit_terminal';
+
+function trimChapterChatHistory(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  chapterNumber: number,
+) {
+  const keepRows = db
+    .prepare(
+      `SELECT id, changes FROM chapter_chat_history
+       WHERE novel_id = ? AND chapter_number = ?
+         AND role IN ('user', 'assistant')
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT ?`,
+    )
+    .all(novelId, chapterNumber, CHAT_HISTORY_KEEP) as Array<{
+      id: string;
+      changes: string | null;
+    }>;
+
+  if (keepRows.length < CHAT_HISTORY_KEEP) return;
+
+  // Never leave half of a terminal pair at the retention boundary. If only one
+  // row for a run is in the newest 50, drop that half too; the compact
+  // edit_terminal tombstone remains outside transcript retention and preserves
+  // the first-winner/idempotency decision indefinitely.
+  const runKeyCounts = new Map<string, number>();
+  for (const row of keepRows) {
+    if (row.changes?.startsWith('edit-run:')) {
+      runKeyCounts.set(row.changes, (runKeyCounts.get(row.changes) ?? 0) + 1);
+    }
+  }
+  const splitRunKeys = new Set(
+    [...runKeyCounts.entries()]
+      .filter(([, count]) => count === 1)
+      .map(([key]) => key),
+  );
+  const keepIds = keepRows
+    .filter(row => !row.changes || !splitRunKeys.has(row.changes))
+    .map(row => row.id);
+  const roleFilter = "role IN ('user', 'assistant')";
+  if (keepIds.length === 0) {
+    db.prepare(
+      `DELETE FROM chapter_chat_history
+       WHERE novel_id = ? AND chapter_number = ? AND ${roleFilter}`,
+    ).run(novelId, chapterNumber);
+    return;
+  }
+  const placeholders = keepIds.map(() => '?').join(',');
+  db.prepare(
+    `DELETE FROM chapter_chat_history
+     WHERE novel_id = ? AND chapter_number = ? AND ${roleFilter}
+       AND id NOT IN (${placeholders})`,
+  ).run(novelId, chapterNumber, ...keepIds);
+}
+
+type ChapterChatMessageInput = {
+  role: string;
+  content: string;
+  changes?: string;
+  status?: string;
+};
+
+type ChapterChatInsertRow = ChapterChatMessageInput & { id: string };
+
+function createChapterChatRows(
+  messages: readonly ChapterChatMessageInput[],
+  changes?: string,
+): ChapterChatInsertRow[] {
+  return messages.map(message => ({
+    ...message,
+    ...(changes === undefined ? {} : { changes }),
+    id: crypto.randomUUID(),
+  }));
+}
+
+function insertChapterChatRows(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  chapterNumber: number,
+  rows: readonly ChapterChatInsertRow[],
+  createdAt: string,
+) {
+  const insert = db.prepare(
+    `INSERT INTO chapter_chat_history (
+       id, novel_id, chapter_number, role, content, changes, status, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.id,
+      novelId,
+      chapterNumber,
+      row.role,
+      row.content,
+      row.changes ?? null,
+      row.status ?? 'pending',
+      createdAt,
+    );
+  }
+  trimChapterChatHistory(db, novelId, chapterNumber);
+}
+
+function readTerminalEditChatPairByRunId(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  chapterNumber: number,
+  runId: string,
+): TerminalEditChatPairResult | null {
+  const rows = db
+    .prepare(
+      `SELECT role, status
+       FROM chapter_chat_history
+       WHERE novel_id = ? AND chapter_number = ? AND changes = ?
+       ORDER BY created_at ASC, rowid ASC`,
+    )
+    .all(novelId, chapterNumber, editRunChangesKey(runId)) as Array<{
+      role: string;
+      status: string;
+    }>;
+
+  if (rows.length === 0) return null;
+  const markers = rows.filter(row => row.role === EDIT_TERMINAL_ROLE);
+  if (markers.length !== 1) {
+    throw new Error('Corrupt terminal edit marker');
+  }
+  const marker = markers[0];
+  if (marker.status !== 'done' && marker.status !== 'cancelled') {
+    throw new Error('Corrupt terminal edit marker status');
+  }
+
+  const messages = rows.filter(row => row.role === 'user' || row.role === 'assistant');
+  if (rows.length !== markers.length + messages.length) {
+    throw new Error('Corrupt terminal edit chat pair');
+  }
+
+  // Retention removes both transcript rows together, leaving the tombstone.
+  if (messages.length === 0) {
+    return { outcome: 'existing', status: marker.status };
+  }
+  if (messages.length !== 2) {
+    throw new Error('Corrupt terminal edit chat pair');
+  }
+  const users = messages.filter(row => row.role === 'user');
+  const assistants = messages.filter(row => row.role === 'assistant');
+  if (users.length !== 1 || assistants.length !== 1) {
+    throw new Error('Corrupt terminal edit chat pair roles');
+  }
+  const [user] = users;
+  const [assistant] = assistants;
+  if (
+    user.status !== marker.status
+    || assistant.status !== marker.status
+  ) {
+    throw new Error('Corrupt terminal edit chat pair status');
+  }
+  return { outcome: 'existing', status: marker.status };
+}
+
+/**
+ * Idempotent terminal edit-chat pair write keyed by runId.
+ * Successful (`done`) and cancelled pairs for the same run cannot both land —
+ * whichever durable terminal state commits first wins and is returned.
+ */
+export function commitTerminalEditChatPairSync(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  chapterNumber: number,
+  runId: string,
+  userMessage: { role: 'user'; content: string; status: TerminalEditChatStatus },
+  assistantMessage: { role: 'assistant'; content: string; status: TerminalEditChatStatus },
+): TerminalEditChatPairResult {
+  if (userMessage.status !== assistantMessage.status) {
+    throw new Error('Terminal edit chat pair status mismatch');
+  }
+  const tx = db.transaction(() => {
+    const existing = readTerminalEditChatPairByRunId(db, novelId, chapterNumber, runId);
+    if (existing) return existing;
+
+    const createdAt = nowIso();
+    const runKey = editRunChangesKey(runId);
+    const rows = createChapterChatRows([
+      { role: EDIT_TERMINAL_ROLE, content: '', status: userMessage.status },
+      userMessage,
+      assistantMessage,
+    ], runKey);
+    insertChapterChatRows(db, novelId, chapterNumber, rows, createdAt);
+
+    return {
+      outcome: 'inserted' as const,
+      status: userMessage.status,
+    };
+  });
+  return tx();
 }

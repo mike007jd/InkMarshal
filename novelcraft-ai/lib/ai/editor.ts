@@ -10,6 +10,7 @@ import {
   type UsageMeta,
 } from '@/lib/ai/types';
 import type { GenerationPreset } from '@/lib/ai/generation-presets';
+import { grammarSafeStructuredSchema } from '@/lib/ai/structured-output';
 import { renderTemplate } from '@/lib/prompt-template';
 import { resolveTemplate as tryResolveTemplate, variantForStage } from '@/lib/ai/prompt-runner';
 import type { NovelSettings } from '@/lib/db-types';
@@ -118,7 +119,7 @@ export function streamEdit(args: StreamEditArgs) {
 
   const result = streamText({
     model,
-    output: Output.object({ schema: ChapterEditSchema }),
+    output: Output.object({ schema: grammarSafeStructuredSchema(ChapterEditSchema) }),
     system,
     messages,
     temperature: 0.7,
@@ -129,8 +130,14 @@ export function streamEdit(args: StreamEditArgs) {
 
   // When onFinish is set, `output` resolves only AFTER onFinish settles, so usage
   // is recorded before the caller sees the final object.
+  // AI SDK getters create a fresh derived promise on every access. Read usage
+  // once and share that exact promise between the onFinish chain and our
+  // adapter; a second, unobserved getter promise rejects on abort and surfaces
+  // as a process-level unhandledRejection in the packaged Next server.
+  const usage = result.usage;
+  void Promise.resolve(usage).catch(() => undefined);
   const finalOutput = onFinish
-    ? Promise.all([result.output, result.usage]).then(async ([object, usage]) => {
+    ? Promise.all([result.output, usage]).then(async ([object, usage]) => {
       await onFinish({ object, usage });
       return object;
     })
@@ -146,7 +153,7 @@ export function streamEdit(args: StreamEditArgs) {
   return {
     partialOutputStream: result.partialOutputStream,
     output: finalOutput,
-    usage: result.usage,
+    usage,
   };
 }
 

@@ -18,6 +18,7 @@ import {
 } from '@/lib/model-supply/local-engine';
 import {
   CAPABILITY_ROLES,
+  MLX_DRAFT_ONLY_ERROR,
   type CapabilityBinding,
   type CapabilityRole,
   type RuntimeConnection,
@@ -326,6 +327,9 @@ async function compensateFailedNewEngine(
 async function startEngineForRolesNow(
   plan: EngineStartPlan,
 ): Promise<EngineStartResult> {
+  if (plan.format === 'mlx' && plan.roles.some(role => role !== 'draft')) {
+    throw new Error(MLX_DRAFT_ONLY_ERROR);
+  }
   const policy = plan.onConflict ?? 'cancel';
 
   // 1. Estimate footprint (best-effort). If estimation fails we proceed with
@@ -585,13 +589,13 @@ export async function startAndBindLocalEngine(
   modelPath: string,
   format: EngineFormat,
   modelLabel: string,
-  roles: readonly CapabilityRole[] = CAPABILITY_ROLES,
+  roles?: readonly CapabilityRole[],
 ): Promise<{ connection: RuntimeConnection; modelId: string }> {
   const result = await startEngineForRoles({
     modelPath,
     format,
     modelLabel,
-    roles,
+    roles: roles ?? (format === 'mlx' ? ['draft'] : CAPABILITY_ROLES),
     onConflict: 'reuse',
   });
   return { connection: result.connection, modelId: result.modelId };

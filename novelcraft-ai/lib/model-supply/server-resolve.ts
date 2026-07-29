@@ -32,6 +32,7 @@ import { requestLocale } from '@/lib/request-locale';
 import {
   isRuntimeConnectionKind,
   isRuntimeTransport,
+  MLX_DRAFT_ONLY_ERROR,
   type CapabilityRole,
   type RuntimeConnectionKind,
   type RuntimeTransport,
@@ -134,6 +135,7 @@ export async function resolveModelForRole(
     : 'openai-compatible';
   const rawKind = headerValue(req, `${prefix}-kind`);
   const kind = isRuntimeConnectionKind(rawKind) ? rawKind : null;
+  const engineFormat = headerValue(req, `${prefix}-engine-format`);
 
   const parsedBase = parseUserRuntimeBaseUrl(
     headerValue(req, `${prefix}-base-url`) ?? '',
@@ -142,6 +144,14 @@ export async function resolveModelForRole(
   if (!parsedBase || !modelId) return null;
 
   const baseURL = resolveBaseUrl(transport, parsedBase);
+  if (
+    kind === 'local'
+    && engineFormat === 'mlx'
+    && runtimeBaseUrlIsLoopback(baseURL)
+    && role !== 'draft'
+  ) {
+    throw new AIUsageError(MLX_DRAFT_ONLY_ERROR, 400, 'local_engine');
+  }
   // Read once; never log it.
   const secret = headerValue(req, `${prefix}-secret`);
   if (secret && !runtimeBaseUrlCanCarrySecret(baseURL)) {
@@ -180,15 +190,31 @@ export async function resolveModelForRole(
     }
     case 'openai-compatible':
     default: {
-      // Bundled llama-server (and other loopback self-hosted runtimes) reach
-      // this branch; disable model "thinking" so writing tasks emit prose
-      // instead of burning the budget on hidden reasoning (BUG-5).
+      // Bundled llama-server reaches this branch with an engine-format header
+      // derived from the live native engine record. Loopback runtimes disable
+      // thinking so writing tasks emit prose instead of burning the budget on
+      // hidden reasoning (BUG-5). Bundled GGUF additionally opts into
+      // supportsStructuredOutputs=true so AI SDK actually sends
+      //    response_format.json_schema (default false drops the schema and
+      //    local models return freeform Markdown → AI_NoObjectGeneratedError).
+      // URL locality alone is not a capability signal: custom loopback servers
+      // and the bundled MLX server may not implement response_format schemas.
+      // Those and hosted endpoints keep the SDK default (json_object without
+      // schema) until their capability is explicitly represented and proven.
       const loopback = runtimeBaseUrlIsLoopback(baseURL);
+      const bundledGguf = kind === 'local' && engineFormat === 'gguf' && loopback;
       model = createOpenAICompatible({
         name: 'user-runtime',
         apiKey: secret || 'user-owned-runtime',
         baseURL,
-        ...(loopback ? { fetch: disableThinkingFetch() } : {}),
+        ...(bundledGguf
+          ? {
+              supportsStructuredOutputs: true,
+              fetch: disableThinkingFetch(),
+            }
+          : loopback
+            ? { fetch: disableThinkingFetch() }
+          : {}),
       }).chatModel(modelId);
       break;
     }

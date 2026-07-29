@@ -47,6 +47,9 @@ export const CAPABILITY_ROLES: readonly CapabilityRole[] = [
   'recall',
 ] as const;
 
+export const MLX_DRAFT_ONLY_ERROR =
+  'MLX local models currently support Draft only. Use a Standard (GGUF) model for Rewrite, Planning, or Recall.';
+
 /**
  * The writing operations the runtime broker dispatches. These are the EXACT
  * keys of {@link OPERATION_ROLE}. B.3 may add operations later — adding one is
