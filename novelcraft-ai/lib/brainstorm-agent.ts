@@ -10,6 +10,7 @@ import {
 import { getDb } from '@/lib/db/connection';
 import {
   insertKnowledgeEntryWithIndexInTx,
+  readKnowledgeEntryByNormalizedIdentity,
   updateKnowledgeEntryWithIndexInTx,
 } from '@/lib/db/queries-knowledge';
 import { getKnowledgeVaultOutboxRow } from '@/lib/db/queries-knowledge-vault-outbox';
@@ -189,10 +190,6 @@ type PlannedStoryDeckWrite = {
   index: KnowledgeIndexInsert | null;
 };
 
-function entryKey(entry: Pick<{ type: string; title: string }, 'type' | 'title'>): string {
-  return knowledgeEntryIdentityKey(entry);
-}
-
 function storyDeckInputMatchesRow(
   entry: z.infer<typeof storyDeckEntrySchema>,
   row: KnowledgeEntryRow | undefined,
@@ -236,7 +233,7 @@ async function planStoryDeckWrites(
 ): Promise<PlannedStoryDeckWrite[]> {
   const plans: PlannedStoryDeckWrite[] = [];
   for (const entry of entries) {
-    const key = entryKey(entry);
+    const key = knowledgeEntryIdentityKey(entry);
     const before = beforeByKey.get(key);
     const title = entry.title.trim();
     const summaryInput = entry.summary.trim();
@@ -358,7 +355,12 @@ function upsertStoryDeckEntryInTx(
   const title = entry.title.trim();
   const tagsJson = JSON.stringify(plan.tags);
   const dataJson = JSON.stringify(plan.data);
-  const before = readStoryDeckRowByKey(db, novelId, entry.type, title) ?? null;
+  const before = readKnowledgeEntryByNormalizedIdentity(
+    db,
+    novelId,
+    entry.type,
+    title,
+  ) ?? null;
 
   if (plan.action === 'unchanged') {
     return { action: 'unchanged', before, after: before };
@@ -461,7 +463,7 @@ async function prepareApprovedStoryDeck(
   const plannedWrites = await planStoryDeckWrites(
     novelId,
     missingEntries,
-    new Map(scopedEntries.map(entry => [entryKey(entry), entry])),
+    new Map(scopedEntries.map(entry => [knowledgeEntryIdentityKey(entry), entry])),
     reservedPaths,
   );
   return {
@@ -723,21 +725,6 @@ function sameKnowledgeEntryRow(
     && left.updated_at === right.updated_at;
 }
 
-function readStoryDeckRowByKey(
-  db: ReturnType<typeof getDb>,
-  novelId: string,
-  type: string,
-  title: string,
-): KnowledgeEntryRow | undefined {
-  const targetKey = entryKey({ type, title });
-  return (db.prepare(
-    `SELECT * FROM knowledge_entries
-      WHERE novel_id = ? AND type = ?
-      ORDER BY updated_at DESC`,
-  ).all(novelId, type) as KnowledgeEntryRow[])
-    .find(row => entryKey(row) === targetKey);
-}
-
 /** Per-key fencing so concurrent same-name tool calls with different titles can commit. */
 function storyDeckKeysMatchPreparedBefore(
   db: ReturnType<typeof getDb>,
@@ -753,10 +740,15 @@ function storyDeckKeysMatchPreparedBefore(
     | undefined;
   if ((novelRow?.stage ?? null) !== prepared.beforeStage) return false;
   const beforeByKey = new Map(
-    prepared.beforeEntries.map(entry => [entryKey(entry), entry]),
+    prepared.beforeEntries.map(entry => [knowledgeEntryIdentityKey(entry), entry]),
   );
   for (const plan of prepared.plannedWrites) {
-    const current = readStoryDeckRowByKey(db, novelId, plan.type, plan.title);
+    const current = readKnowledgeEntryByNormalizedIdentity(
+      db,
+      novelId,
+      plan.type,
+      plan.title,
+    );
     const before = beforeByKey.get(plan.entryKey);
     if (plan.action === 'created') {
       if (current) return false;
@@ -810,6 +802,25 @@ function profileAfterSnapshot(
   update: Record<string, unknown>,
 ): BrainstormProfileSnapshot {
   return { ...before, ...update };
+}
+
+function isRecoveredProfileNoop(
+  prepared: {
+    beforeProfile: BrainstormProfileSnapshot | null;
+    result: { ok: boolean };
+  },
+  current: Novel | null | undefined,
+  novelUpdate: Record<string, unknown>,
+): boolean {
+  if (!prepared.result.ok || !prepared.beforeProfile) {
+    return (
+      (!current && !prepared.beforeProfile)
+      || sameBrainstormProfile(current, prepared.beforeProfile)
+    );
+  }
+  const expectedAfter = profileAfterSnapshot(prepared.beforeProfile, novelUpdate);
+  return sameJsonValue(expectedAfter, prepared.beforeProfile)
+    && sameBrainstormProfile(current, prepared.beforeProfile);
 }
 
 interface KnowledgeSnapshotReference {
@@ -912,48 +923,21 @@ export function createBrainstormTools(
           execute: executeSync,
           validateRecovered: (prepared, result) => {
             const current = readBrainstormNovel(getDb(), novelId);
-            if (!result.ok || !prepared.beforeProfile) {
-              if (
-                (!current && !prepared.beforeProfile)
-                || sameBrainstormProfile(current, prepared.beforeProfile)
-              ) {
-                return;
-              }
-              throw new Error('Durable brainstorm tool state conflict');
-            }
-            const expectedAfter = profileAfterSnapshot(
-              prepared.beforeProfile,
-              novelUpdate,
-            );
-            if (
-              sameJsonValue(expectedAfter, prepared.beforeProfile)
-              && sameBrainstormProfile(current, prepared.beforeProfile)
-            ) {
+            if (isRecoveredProfileNoop({ ...prepared, result }, current, novelUpdate)) {
               return;
             }
             throw new Error('Durable brainstorm tool state conflict');
           },
           recover: async prepared => {
             const current = await getNovel(novelId);
-            if (!prepared.result.ok || !prepared.beforeProfile) {
-              return (
-                (!current && !prepared.beforeProfile)
-                || sameBrainstormProfile(current, prepared.beforeProfile)
-              )
-                ? { state: 'already_after', result: prepared.result }
-                : { state: 'conflict' };
-            }
-            const expectedAfter = profileAfterSnapshot(
-              prepared.beforeProfile,
-              novelUpdate,
-            );
-            if (
-              sameJsonValue(expectedAfter, prepared.beforeProfile)
-              && sameBrainstormProfile(current, prepared.beforeProfile)
-            ) {
+            if (isRecoveredProfileNoop(prepared, current, novelUpdate)) {
               return { state: 'already_after', result: prepared.result };
             }
-            if (sameBrainstormProfile(current, prepared.beforeProfile)) {
+            if (
+              prepared.result.ok
+              && prepared.beforeProfile
+              && sameBrainstormProfile(current, prepared.beforeProfile)
+            ) {
               return { state: 'safe_to_execute' };
             }
             return { state: 'conflict' };
@@ -969,7 +953,7 @@ export function createBrainstormTools(
       execute: async input => {
         const uniqueEntries = Array.from(
           new Map(input.entries.map(entry => [
-            entryKey(entry),
+            knowledgeEntryIdentityKey(entry),
             entry,
           ])).values(),
         );
@@ -987,9 +971,9 @@ export function createBrainstormTools(
             type => getKnowledgeEntries(novelId, { type }),
           ))).flat();
           const beforeEntries = uniqueEntries.map(entry =>
-            scopedEntries.find(row => entryKey(row) === entryKey(entry))
+            scopedEntries.find(row => knowledgeEntryIdentityKey(row) === knowledgeEntryIdentityKey(entry))
           ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
-          const beforeByKey = new Map(beforeEntries.map(entry => [entryKey(entry), entry]));
+          const beforeByKey = new Map(beforeEntries.map(entry => [knowledgeEntryIdentityKey(entry), entry]));
           const plannedWrites = await planStoryDeckWrites(novelId, uniqueEntries, beforeByKey);
           if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
             return {
@@ -1030,7 +1014,7 @@ export function createBrainstormTools(
             prepared.plannedWrites.map(plan => [plan.entryKey, plan]),
           );
           const mutations = uniqueEntries.map(entry => {
-            const plan = planByKey.get(entryKey(entry));
+            const plan = planByKey.get(knowledgeEntryIdentityKey(entry));
             if (!plan) throw new Error('Durable brainstorm tool missing planned write');
             return upsertStoryDeckEntryInTx(db, novelId, entry, plan);
           });
@@ -1097,7 +1081,7 @@ export function createBrainstormTools(
           const afterEntries = (await Promise.all(touchedTypes.map(
             type => getKnowledgeEntries(novelId, { type }),
           ))).flat().filter(entry =>
-            uniqueEntries.some(input => entryKey(input) === entryKey(entry)),
+            uniqueEntries.some(input => knowledgeEntryIdentityKey(input) === knowledgeEntryIdentityKey(entry)),
           );
           await drainCommittedBrainstormEntryEffects(novelId, afterEntries);
         }
@@ -1109,7 +1093,7 @@ export function createBrainstormTools(
       inputSchema: finalizeBrainstormSchema,
       execute: async input => {
         const uniqueEntries = Array.from(new Map(input.entries.map(entry => [
-          entryKey(entry),
+          knowledgeEntryIdentityKey(entry),
           entry,
         ])).values());
         const semanticInput = {
@@ -1132,9 +1116,9 @@ export function createBrainstormTools(
             type => getKnowledgeEntries(novelId, { type }),
           ))).flat();
           const beforeEntries = uniqueEntries.map(entry =>
-            scopedEntries.find(row => entryKey(row) === entryKey(entry))
+            scopedEntries.find(row => knowledgeEntryIdentityKey(row) === knowledgeEntryIdentityKey(entry))
           ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
-          const beforeByKey = new Map(beforeEntries.map(entry => [entryKey(entry), entry]));
+          const beforeByKey = new Map(beforeEntries.map(entry => [knowledgeEntryIdentityKey(entry), entry]));
           const plannedWrites = await planStoryDeckWrites(novelId, uniqueEntries, beforeByKey);
           const coverage = uniqueEntries.reduce<Record<StoryDeckType, number>>(
             (counts, entry) => {

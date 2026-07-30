@@ -8,6 +8,15 @@ import {
   enqueueKnowledgeVaultDelete,
   enqueueKnowledgeVaultUpsert,
 } from '@/lib/db/queries-knowledge-vault-outbox';
+import { knowledgeEntryIdentityKey } from '@/lib/knowledge/entry-identity';
+
+/**
+ * Deterministic ordering for normalized Story Deck identity resolution.
+ * Prepare (`getKnowledgeEntries`), fence, and finalization must share this
+ * so legacy title-case duplicates select the same canonical row.
+ */
+const KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL =
+  'sort_order ASC, updated_at DESC, id ASC';
 
 // `ke.`-aliased variant of SAFE_DATA_JSON (see json-columns.ts) for JOINs where
 // the knowledge table is aliased `ke`.
@@ -74,9 +83,25 @@ export async function getKnowledgeEntries(
     sql += ' AND (title LIKE ? OR summary LIKE ?)';
     params.push(like, like);
   }
-  sql += ' ORDER BY sort_order ASC, updated_at DESC';
+  sql += ` ORDER BY ${KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}`;
 
   return db.prepare(sql).all(...params) as KnowledgeEntryRow[];
+}
+
+/** First matching row under {@link KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}. */
+export function readKnowledgeEntryByNormalizedIdentity(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  type: string,
+  title: string,
+): KnowledgeEntryRow | undefined {
+  const targetKey = knowledgeEntryIdentityKey({ type, title });
+  return (db.prepare(
+    `SELECT * FROM knowledge_entries
+      WHERE novel_id = ? AND type = ?
+      ORDER BY ${KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}`,
+  ).all(novelId, type) as KnowledgeEntryRow[])
+    .find(row => knowledgeEntryIdentityKey(row) === targetKey);
 }
 
 export async function getKnowledgeEntry(

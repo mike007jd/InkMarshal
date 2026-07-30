@@ -1,4 +1,4 @@
-export function normalizeKnowledgeEntryTitle(title: string): string {
+function normalizeKnowledgeEntryTitle(title: string): string {
   return title.trim().normalize('NFC').toLowerCase();
 }
 

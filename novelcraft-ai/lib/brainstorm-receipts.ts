@@ -94,7 +94,7 @@ type BrainstormMutationFaultPoint =
 
 type RegistryGlobal = typeof globalThis & {
   __inkmarshalBrainstormToolExecutions?: Map<string, Promise<unknown>>;
-  __inkmarshalBrainstormToolQueues?: Map<string, Promise<void>>;
+  __inkmarshalBrainstormToolQueues?: Map<string, Promise<boolean>>;
   __inkmarshalBrainstormUndoFault?: (() => void) | null;
   __inkmarshalBrainstormMutationFault?: {
     point: BrainstormMutationFaultPoint;
@@ -107,7 +107,7 @@ const registryGlobal = globalThis as RegistryGlobal;
 const toolExecutions = registryGlobal.__inkmarshalBrainstormToolExecutions
   ?? (registryGlobal.__inkmarshalBrainstormToolExecutions = new Map<string, Promise<unknown>>());
 const toolQueues = registryGlobal.__inkmarshalBrainstormToolQueues
-  ?? (registryGlobal.__inkmarshalBrainstormToolQueues = new Map<string, Promise<void>>());
+  ?? (registryGlobal.__inkmarshalBrainstormToolQueues = new Map<string, Promise<boolean>>());
 
 /** Test-only: throw inside the undo transaction after the first inverse op. */
 export function __setBrainstormUndoFaultForTest(hook: (() => void) | null): void {
@@ -171,12 +171,15 @@ function canonicalJson(value: unknown): string {
   ).join(',')}}`;
 }
 
+class EarlierPreparedToolPendingError extends Error {}
+
 /**
  * Execute one semantic tool mutation exactly once for a durable chat turn.
  * Claim validation, the semantic mutation, receipt persistence, and ledger
  * completion share one SQLite transaction. The in-process promise only
- * coalesces exact duplicates; different inputs for the same tool serialize so
- * each prepare step sees paths and rows committed by the previous call.
+ * coalesces exact duplicates. All tools in one turn serialize so each prepare
+ * sees prior commits, and a failed intent blocks mutations already queued
+ * behind it instead of invalidating that intent's recovery snapshot.
  */
 export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
   novelId: string;
@@ -230,12 +233,13 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
     args.novelId,
     args.context.userMessageId,
     args.context.claimToken,
-    args.toolName,
   ].join(':');
-  const previous = toolQueues.get(queueKey) ?? Promise.resolve();
+  const previous = toolQueues.get(queueKey) ?? Promise.resolve(true);
 
   const execution = (async (): Promise<TResult> => {
-    await previous;
+    if (!await previous) {
+      throw new Error('Durable brainstorm tool queue stopped after prior failure');
+    }
     const proposedPrepared = await args.prepare();
     const externalized = args.externalizePrepared?.(proposedPrepared) ?? {
       preparedData: proposedPrepared,
@@ -253,6 +257,11 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
     });
     if (ledger.kind === 'lost_claim') {
       throw new Error('Chat turn claim lost before brainstorm tool execution');
+    }
+    if (ledger.kind === 'blocked_by_prepared') {
+      throw new EarlierPreparedToolPendingError(
+        'Durable brainstorm tool waiting for earlier prepared intent',
+      );
     }
     maybeThrowMutationFault('after_prepare');
     const hydrate = (preparedData: unknown): TPrepared => {
@@ -273,16 +282,9 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
     }
 
     const prepared = hydrate(ledger.preparedData);
-    let shouldExecute = false;
-    let alreadyAfter: TResult | undefined;
     const recovery = await args.recover(prepared);
     if (recovery.state === 'conflict') {
       throw new Error('Durable brainstorm tool state conflict');
-    }
-    if (recovery.state === 'already_after') {
-      alreadyAfter = recovery.result;
-    } else {
-      shouldExecute = true;
     }
     maybeThrowMutationFault('after_recover');
 
@@ -294,13 +296,10 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
       toolName: args.toolName,
       argsHash,
       mutate: () => {
-        if (alreadyAfter !== undefined) {
-          args.validateRecovered(prepared, alreadyAfter);
+        if (recovery.state === 'already_after') {
+          args.validateRecovered(prepared, recovery.result);
           maybeThrowMutationFault('during_receipt_persist');
-          return alreadyAfter;
-        }
-        if (!shouldExecute) {
-          throw new Error('Durable brainstorm tool reached mutate without work');
+          return recovery.result;
         }
         return args.execute(prepared);
       },
@@ -310,7 +309,10 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
     }
     return completed.result as TResult;
   })();
-  const queueTail = execution.then(() => undefined, () => undefined);
+  const queueTail = execution.then(
+    () => true,
+    error => error instanceof EarlierPreparedToolPendingError,
+  );
   toolExecutions.set(executionKey, execution);
   toolQueues.set(queueKey, queueTail);
   try {
@@ -732,19 +734,20 @@ function mapReceiptRow(row: ReceiptRow): DurableReceipt {
   };
 }
 
-function selectReceiptRow(receiptId: string): ReceiptRow | undefined {
-  return getDb()
-    .prepare(
-      `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
-              undo_expires_at_ms, undone, profile_json, entries_json
-         FROM brainstorm_receipts
-        WHERE id = ?`,
-    )
-    .get(receiptId) as ReceiptRow | undefined;
+function selectReceiptRow(
+  db: ReturnType<typeof getDb>,
+  receiptId: string,
+): ReceiptRow | undefined {
+  return db.prepare(
+    `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
+            undo_expires_at_ms, undone, profile_json, entries_json
+       FROM brainstorm_receipts
+      WHERE id = ?`,
+  ).get(receiptId) as ReceiptRow | undefined;
 }
 
 function loadReceiptResult(receiptId: string): LoadReceiptResult {
-  const row = selectReceiptRow(receiptId);
+  const row = selectReceiptRow(getDb(), receiptId);
   if (!row) return { status: 'missing' };
   try {
     return { status: 'ok', receipt: mapReceiptRow(row) };
@@ -752,11 +755,6 @@ function loadReceiptResult(receiptId: string): LoadReceiptResult {
     if (error instanceof CorruptReceiptError) return { status: 'corrupt' };
     throw error;
   }
-}
-
-function loadReceipt(receiptId: string): DurableReceipt | null {
-  const loaded = loadReceiptResult(receiptId);
-  return loaded.status === 'ok' ? loaded.receipt : null;
 }
 
 /** Persist only when the row is absent or already owned by the same novel. */
@@ -1045,12 +1043,7 @@ function loadReceiptInTx(
   db: ReturnType<typeof getDb>,
   receiptId: string,
 ): DurableReceipt | null {
-  const row = db.prepare(
-    `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
-            undo_expires_at_ms, undone, profile_json, entries_json
-       FROM brainstorm_receipts
-      WHERE id = ?`,
-  ).get(receiptId) as ReceiptRow | undefined;
+  const row = selectReceiptRow(db, receiptId);
   if (!row) return null;
   return mapReceiptRow(row);
 }

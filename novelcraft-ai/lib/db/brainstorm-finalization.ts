@@ -4,12 +4,12 @@ import { applyNovelUpdate, hydrateNovelRow } from '@/lib/db/queries-novel';
 import {
   insertKnowledgeEntryWithIndexInTx,
   type KnowledgeEntryRow,
+  readKnowledgeEntryByNormalizedIdentity,
   updateKnowledgeEntryWithIndexInTx,
   upsertKnowledgeIndexAndVaultOutboxInTx,
 } from '@/lib/db/queries-knowledge';
 import type { KnowledgeIndexInsert } from '@/lib/db/queries-vault';
 import { toJsonb, type InterviewState } from '@/lib/interview-state';
-import { normalizeKnowledgeEntryTitle } from '@/lib/knowledge/entry-identity';
 
 const EDITABLE_STAGES = new Set(['discovery_interview', 'ready_for_greenlight']);
 const STORY_DECK_TYPES = ['character', 'world', 'outline'] as const;
@@ -160,26 +160,6 @@ export function approveExistingBrainstormAtomicSync(
   return tx();
 }
 
-export async function approveExistingBrainstormAtomic(
-  novelId: string,
-): Promise<ApproveExistingBrainstormResult> {
-  return approveExistingBrainstormAtomicSync(novelId);
-}
-
-function findStoryDeckEntry(
-  db: ReturnType<typeof getDb>,
-  novelId: string,
-  type: BrainstormFinalizationEntry['type'],
-  title: string,
-): KnowledgeEntryRow | undefined {
-  const normalized = normalizeKnowledgeEntryTitle(title);
-  return (db.prepare(
-    `SELECT * FROM knowledge_entries
-      WHERE novel_id = ? AND type = ?
-      ORDER BY updated_at DESC`,
-  ).all(novelId, type) as KnowledgeEntryRow[])
-    .find(row => normalizeKnowledgeEntryTitle(row.title) === normalized);
-}
 function sameEntry(
   row: KnowledgeEntryRow,
   entry: BrainstormFinalizationEntry,
@@ -240,16 +220,9 @@ export function finalizeBrainstormAtomicSync(args: {
       return { ok: false, reason: 'not_editable' };
     }
 
-    const existingCoverage = { character: 0, world: 0, outline: 0 };
-    if (args.preserveExistingStoryDeck) {
-      const rows = db.prepare(
-        `SELECT type, COUNT(*) AS count
-           FROM knowledge_entries
-          WHERE novel_id = ? AND type IN ('character', 'world', 'outline')
-          GROUP BY type`,
-      ).all(args.novelId) as { type: BrainstormFinalizationEntry['type']; count: number }[];
-      for (const row of rows) existingCoverage[row.type] = row.count;
-    }
+    const existingCoverage = args.preserveExistingStoryDeck
+      ? storyDeckCoverage(db, args.novelId)
+      : { character: 0, world: 0, outline: 0 };
     const entriesToApply = args.preserveExistingStoryDeck
       ? args.entries.filter(entry => existingCoverage[entry.type] === 0)
       : args.entries;
@@ -289,7 +262,12 @@ export function finalizeBrainstormAtomicSync(args: {
 
     const mutations: BrainstormEntryMutation[] = [];
     for (const entry of entriesToApply) {
-      const before = findStoryDeckEntry(db, args.novelId, entry.type, entry.title);
+      const before = readKnowledgeEntryByNormalizedIdentity(
+        db,
+        args.novelId,
+        entry.type,
+        entry.title,
+      );
       let action: BrainstormEntryMutation['action'];
       if (before) {
         if (entry.id !== before.id) {

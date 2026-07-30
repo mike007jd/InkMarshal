@@ -71,6 +71,7 @@ interface ChatToolLedger {
 
 export type PrepareChatTurnToolCallResult =
   | { kind: 'lost_claim' }
+  | { kind: 'blocked_by_prepared' }
   | {
       kind: 'prepared' | 'completed';
       preparedData: unknown;
@@ -620,10 +621,17 @@ export function prepareChatTurnToolCall(args: {
     }
 
     const ledger = parseChatToolLedger(row.response_text);
+    // A recovered turn must finish its oldest prepared intent before admitting
+    // another semantic mutation, regardless of provider retry call order.
+    const firstPreparedKey = Object.entries(ledger.entries)
+      .find(([, entry]) => entry.status === 'prepared')?.[0];
     const existing = ledger.entries[args.toolKey];
     if (existing) {
       if (existing.toolName !== args.toolName || existing.argsHash !== args.argsHash) {
         throw new Error('Durable chat tool ledger key collision');
+      }
+      if (existing.status === 'prepared' && firstPreparedKey !== args.toolKey) {
+        return { kind: 'blocked_by_prepared' };
       }
       return {
         kind: existing.status,
@@ -631,6 +639,9 @@ export function prepareChatTurnToolCall(args: {
         result: existing.result,
         newlyPrepared: false,
       };
+    }
+    if (firstPreparedKey) {
+      return { kind: 'blocked_by_prepared' };
     }
 
     ledger.entries[args.toolKey] = {
