@@ -1272,8 +1272,9 @@ describe('novel messages API', () => {
       ]);
 
       // Let both handlers race through beginChatTurn before the provider resumes.
-      await new Promise(resolve => setTimeout(resolve, 30));
-      expect(callCount.value).toBe(1);
+      await vi.waitFor(() => {
+        expect(callCount.value).toBe(1);
+      });
       expect(getChatTurn(novel.id, userMessageId)?.status).toBe('running');
 
       release();
@@ -1527,9 +1528,11 @@ describe('novel messages API', () => {
       const actual = await importOriginal<typeof import('@/lib/brainstorm-agent')>();
       return {
         ...actual,
-        finalizeApprovedStoryDeck: vi.fn(async (...args: Parameters<typeof actual.finalizeApprovedStoryDeck>) => {
+        finalizeApprovedStoryDeckForClaim: vi.fn(async (
+          ...args: Parameters<typeof actual.finalizeApprovedStoryDeckForClaim>
+        ) => {
           finalizeCount.value += 1;
-          return actual.finalizeApprovedStoryDeck(...args);
+          return actual.finalizeApprovedStoryDeckForClaim(...args);
         }),
       };
     });
@@ -1592,7 +1595,7 @@ describe('novel messages API', () => {
     }
   });
 
-  it('reuses brainstorm_receipt_id after provider failure and after in-memory restart', async () => {
+  it('reuses brainstorm_receipt_id after provider failure and across durable restart', async () => {
     mockUsage();
     mockContext();
     vi.doMock('ai', async importOriginal => {
@@ -1646,10 +1649,13 @@ describe('novel messages API', () => {
       expect(failedTurn?.brainstormReceiptId).toBeTruthy();
       const receiptId = failedTurn!.brainstormReceiptId!;
 
-      const registry = (globalThis as typeof globalThis & {
-        __inkmarshalBrainstormReceipts?: Map<string, unknown>;
-      }).__inkmarshalBrainstormReceipts;
-      registry?.clear();
+      // Receipts are SQLite-durable: a process restart must still see the row so
+      // retries reuse the same chat_turns.brainstorm_receipt_id.
+      const { getDb } = await import('@/lib/db/connection');
+      const durableBeforeRetry = getDb()
+        .prepare('SELECT id, novel_id FROM brainstorm_receipts WHERE id = ?')
+        .get(receiptId) as { id: string; novel_id: string } | undefined;
+      expect(durableBeforeRetry).toEqual({ id: receiptId, novel_id: novel.id });
 
       const retried = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
         method: 'POST',
@@ -1661,7 +1667,11 @@ describe('novel messages API', () => {
         status: 'succeeded',
         brainstormReceiptId: receiptId,
       });
-      expect(registry?.has(receiptId)).toBe(true);
+      expect(
+        getDb()
+          .prepare('SELECT id FROM brainstorm_receipts WHERE id = ?')
+          .get(receiptId),
+      ).toEqual({ id: receiptId });
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }
@@ -1726,6 +1736,101 @@ describe('novel messages API', () => {
         assistantMessageId,
       ]);
     } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('does not stale-reclaim an active deferred provider stream into a second paid call', async () => {
+    mockUsage();
+    mockContext();
+    let release!: () => void;
+    const gate = {
+      promise: new Promise<void>(resolve => {
+        release = resolve;
+      }),
+    };
+    const streamOptions: unknown[] = [];
+    const callCount = { value: 0 };
+    mockDeferredStream({ optionsLog: streamOptions, gate, callCount, text: 'live lease reply' });
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { CHAT_TURN_STALE_LEASE_MS } = await import('@/lib/db/queries-chat-turns');
+    const { __tickChatTurnClaimLeasesForTest } = await import('@/lib/chat-turn-lease');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Active Claim Lease Race' });
+    const userMessageId = 'active-lease-race-user';
+    const body = {
+      language: 'en',
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'keep me alive' }],
+      }],
+    };
+
+    try {
+      const firstPromise = POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+
+      await vi.waitFor(() => {
+        expect(callCount.value).toBe(1);
+      });
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('running');
+
+      // Backdate past the previous stale threshold while the first worker is
+      // still mid-flight. Without heartbeat renewal this would be reclaimable.
+      getDb()
+        .prepare(
+          `UPDATE chat_turns
+              SET updated_at = ?
+            WHERE novel_id = ? AND user_message_id = ?`,
+        )
+        .run(
+          new Date(Date.now() - CHAT_TURN_STALE_LEASE_MS - 5_000).toISOString(),
+          novel.id,
+          userMessageId,
+        );
+
+      // Deterministic heartbeat: renew the live claim without waiting minutes.
+      __tickChatTurnClaimLeasesForTest();
+      expect(getChatTurn(novel.id, userMessageId)?.updatedAt).not.toBe(
+        new Date(Date.now() - CHAT_TURN_STALE_LEASE_MS - 5_000).toISOString(),
+      );
+
+      const duplicate = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toMatchObject({ code: 'CHAT_TURN_IN_PROGRESS' });
+      expect(callCount.value).toBe(1);
+
+      release();
+      const first = await firstPromise;
+      expect(first.status).toBe(200);
+      expect(await first.text()).toContain('live lease reply');
+      expect(callCount.value).toBe(1);
+      expect(streamOptions).toHaveLength(1);
+
+      const replay = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toContain('live lease reply');
+      expect(callCount.value).toBe(1);
+      expect((await getMessages(novel.id)).map(m => m.id)).toEqual([
+        userMessageId,
+        deterministicAssistantMessageId(userMessageId),
+      ]);
+    } finally {
+      release();
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });

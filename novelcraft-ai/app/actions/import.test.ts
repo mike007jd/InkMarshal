@@ -190,6 +190,28 @@ describe('opaque import session pipeline', () => {
   });
 });
 
+async function consentForChapter(
+  novelId: string,
+  chapterNumber: number,
+) {
+  const { consentContentFingerprint } = await import('@/lib/import/dedupe');
+  const { getDb } = await import('@/lib/db/connection');
+  const row = getDb()
+    .prepare(
+      `SELECT id, version, content FROM chapters
+        WHERE novel_id = ? AND chapter_number = ?`,
+    )
+    .get(novelId, chapterNumber) as
+    | { id: string; version: number; content: string }
+    | undefined;
+  if (!row) throw new Error(`missing chapter ${chapterNumber}`);
+  return {
+    matchedChapterId: row.id,
+    matchedVersion: row.version,
+    matchedContentFingerprint: consentContentFingerprint(row.content),
+  };
+}
+
 describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
   it('rejects a missing dedupe report before mutating chapters and leaves the target unchanged', async () => {
     const { createNovel, getChapters, deleteNovelCascade } = await import('@/lib/db');
@@ -258,6 +280,7 @@ describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
           chapterNumber: 1,
           action: 'overwrite',
           matchedChapterNumber: 10,
+          consent: await consentForChapter(novel.id, 10),
         }],
       });
 
@@ -268,6 +291,108 @@ describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
           content: 'Replacement body',
         }),
       ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('atomically clears stale derived AI metadata on merge overwrite', async () => {
+    const { createNovel, getChapter, deleteNovelCascade } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { JSON_COLUMN_VERSIONS } = await import('@/lib/db/json-columns');
+    const { confirmImportSessionAction } = await import('@/app/actions/import');
+
+    const novel = await createNovel({ userId: 'local-user', title: 'Metadata target' });
+    const chapterId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const snapshots = JSON.stringify([{
+      id: 'snap-1',
+      createdAt: Date.parse(now),
+      label: 'keep me',
+      content: 'snapshot body',
+    }]);
+    getDb().prepare(
+      `INSERT INTO chapters (
+         id, novel_id, chapter_number, title, content, original_content,
+         word_count, version, summary, key_facts, key_facts_v,
+         quality_issues, quality_issues_v, generation_meta, generation_meta_v,
+         snapshots, processing_status, created_at
+       ) VALUES (?, ?, 1, 'Shared title', 'Original body', 'original baseline',
+         2, 3, 'Old AI summary', ?, ?, ?, ?, ?, ?, ?, 'complete', ?)`,
+    ).run(
+      chapterId,
+      novel.id,
+      JSON.stringify({
+        characters: ['Old'],
+        locations: ['Castle'],
+        items: [],
+        plotMoves: ['twist'],
+      }),
+      JSON_COLUMN_VERSIONS.key_facts,
+      JSON.stringify([{ type: 'other', severity: 'minor', description: 'stale' }]),
+      JSON_COLUMN_VERSIONS.quality_issues,
+      JSON.stringify({
+        targetWords: 1000,
+        actualWords: 2,
+        attempts: 1,
+        modelId: 'stale-model',
+        generatedAt: now,
+      }),
+      JSON_COLUMN_VERSIONS.generation_meta,
+      snapshots,
+      now,
+    );
+
+    const opened = await stageAndOpen(
+      '第一章 Shared title\n\nImported replacement body\n',
+      'meta-overwrite.txt',
+    );
+
+    try {
+      await confirmImportSessionAction({
+        mode: 'merge',
+        targetNovelId: novel.id,
+        sessionToken: opened.sessionToken,
+        novelTitle: 'Incoming',
+        chapters: opened.chapters.map(c => ({ title: 'Shared title', parts: c.parts })),
+        dedupeDecisions: [{
+          chapterNumber: 1,
+          action: 'overwrite',
+          matchedChapterNumber: 1,
+          consent: await consentForChapter(novel.id, 1),
+        }],
+      });
+
+      const chapter = await getChapter(novel.id, 1);
+      expect(chapter).toMatchObject({
+        id: chapterId,
+        content: 'Imported replacement body',
+        version: 4,
+        summary: '',
+        keyFacts: null,
+        qualityIssues: null,
+        generationMeta: null,
+        processingStatus: 'complete',
+      });
+      expect(chapter?.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'snap-1', label: 'keep me' }),
+        expect.objectContaining({ label: '(before import)' }),
+      ]));
+      const row = getDb().prepare(
+        `SELECT key_facts_v, quality_issues_v, generation_meta_v, original_content
+           FROM chapters WHERE id = ?`,
+      ).get(chapterId) as {
+        key_facts_v: number | null;
+        quality_issues_v: number | null;
+        generation_meta_v: number | null;
+        original_content: string | null;
+      };
+      expect(row).toEqual({
+        key_facts_v: null,
+        quality_issues_v: null,
+        generation_meta_v: null,
+        original_content: null,
+      });
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }
@@ -291,6 +416,7 @@ describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
     );
 
     try {
+      const consent = await consentForChapter(novel.id, 10);
       await expect(confirmImportSessionAction({
         mode: 'merge',
         targetNovelId: novel.id,
@@ -298,8 +424,8 @@ describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
         novelTitle: 'Incoming',
         chapters: opened.chapters.map(c => ({ title: 'Shared title', parts: c.parts })),
         dedupeDecisions: [
-          { chapterNumber: 1, action: 'overwrite', matchedChapterNumber: 10 },
-          { chapterNumber: 2, action: 'overwrite', matchedChapterNumber: 10 },
+          { chapterNumber: 1, action: 'overwrite', matchedChapterNumber: 10, consent },
+          { chapterNumber: 2, action: 'overwrite', matchedChapterNumber: 10, consent },
         ],
       })).rejects.toThrow(/same target chapter twice/);
 
@@ -342,14 +468,159 @@ describe('importPlanToNovel merge dedupe fail-closed (session confirm)', () => {
           chapterNumber: 1,
           action: 'overwrite',
           matchedChapterNumber: 3, // forged — server report has no match
+          consent: await consentForChapter(novel.id, 3),
         }],
-      })).rejects.toThrow(/stale|does not match/i);
+      })).rejects.toThrow(/stale|does not match|consent/i);
 
       expect(await getChapters(novel.id)).toEqual([
         expect.objectContaining({ chapterNumber: 3, content: 'Keep' }),
       ]);
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+});
+
+describe('import durability fencing (adversarial)', () => {
+  it('returns a typed conflict when an active writer owns the novel lock', async () => {
+    const {
+      acquireWritingLock,
+      createNovel,
+      deleteNovelCascade,
+      getChapters,
+      releaseWritingLock,
+    } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { confirmImportSessionAction } = await import('@/app/actions/import');
+    const { ImportConfirmConflictError } = await import('@/lib/import/session-confirm');
+
+    const novel = await createNovel({ userId: 'local-user', title: 'Locked target' });
+    getDb().prepare(
+      `INSERT INTO chapters
+         (id, novel_id, chapter_number, title, content, word_count, version, created_at)
+       VALUES (?, ?, 1, 'Existing', 'Keep me', 2, 0, ?)`,
+    ).run(crypto.randomUUID(), novel.id, new Date().toISOString());
+    const lock = await acquireWritingLock(novel.id, 300);
+    expect(lock).not.toBeNull();
+
+    const opened = await stageAndOpen(
+      '第一章 Existing\n\nIncoming overwrite body\n',
+      'locked.txt',
+    );
+
+    try {
+      await expect(confirmImportSessionAction({
+        mode: 'merge',
+        targetNovelId: novel.id,
+        sessionToken: opened.sessionToken,
+        novelTitle: 'Incoming',
+        chapters: opened.chapters.map(c => ({ title: 'Existing', parts: c.parts })),
+        dedupeDecisions: [{
+          chapterNumber: 1,
+          action: 'overwrite',
+          matchedChapterNumber: 1,
+          consent: await consentForChapter(novel.id, 1),
+        }],
+      })).rejects.toMatchObject({
+        name: ImportConfirmConflictError.name,
+        code: 'WRITING_IN_PROGRESS',
+      });
+
+      expect(await getChapters(novel.id)).toEqual([
+        expect.objectContaining({ content: 'Keep me', version: 0 }),
+      ]);
+    } finally {
+      if (lock) await releaseWritingLock(novel.id, lock.token);
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('rejects stale consent after a manual chapter edit without overwriting', async () => {
+    const { createNovel, deleteNovelCascade, getChapters, updateChapterContent } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { confirmImportSessionAction } = await import('@/app/actions/import');
+
+    const novel = await createNovel({ userId: 'local-user', title: 'Edited target' });
+    getDb().prepare(
+      `INSERT INTO chapters
+         (id, novel_id, chapter_number, title, content, word_count, version, created_at)
+       VALUES (?, ?, 1, 'Shared title', 'Original body', 2, 0, ?)`,
+    ).run(crypto.randomUUID(), novel.id, new Date().toISOString());
+
+    const opened = await stageAndOpen(
+      '第一章 Shared title\n\nReplacement body\n',
+      'stale-consent.txt',
+    );
+    const staleConsent = await consentForChapter(novel.id, 1);
+    await updateChapterContent(novel.id, 1, 'Later user edit that must be preserved', 0);
+
+    try {
+      await expect(confirmImportSessionAction({
+        mode: 'merge',
+        targetNovelId: novel.id,
+        sessionToken: opened.sessionToken,
+        novelTitle: 'Incoming',
+        chapters: opened.chapters.map(c => ({ title: 'Shared title', parts: c.parts })),
+        dedupeDecisions: [{
+          chapterNumber: 1,
+          action: 'overwrite',
+          matchedChapterNumber: 1,
+          consent: staleConsent,
+        }],
+      })).rejects.toMatchObject({ code: 'STALE_DEDUPE_CONSENT' });
+
+      expect(await getChapters(novel.id)).toEqual([
+        expect.objectContaining({
+          content: 'Later user edit that must be preserved',
+          version: 1,
+        }),
+      ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('replays the same confirm hash exactly once and rejects a token collision', async () => {
+    const { confirmImportSessionAction } = await import('@/app/actions/import');
+    const { getChapters, getNovel, deleteNovelCascade } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { removeImportSession, sessionDirForToken } = await import('@/lib/import/session-store');
+    const { existsSync } = await import('node:fs');
+
+    const opened = await stageAndOpen(
+      '第一章 One\n\nBody one.\n\n第二章 Two\n\nBody two.\n',
+      'once.txt',
+    );
+    const input = {
+      sessionToken: opened.sessionToken,
+      mode: 'new' as const,
+      novelTitle: 'Exactly Once',
+      chapters: opened.chapters.map(c => ({ title: c.title, parts: c.parts })),
+    };
+
+    const first = await confirmImportSessionAction(input);
+    try {
+      // Simulate cleanup failure: restore session dir is unnecessary; replay must
+      // still return the stored result even if filesystem session is gone.
+      expect(existsSync(sessionDirForToken(opened.sessionToken))).toBe(false);
+      removeImportSession(opened.sessionToken); // best-effort no-op when absent
+
+      const replay = await confirmImportSessionAction(input);
+      expect(replay).toEqual(first);
+      expect(await getNovel(first.novelId)).toMatchObject({ title: 'Exactly Once' });
+      expect(await getChapters(first.novelId)).toHaveLength(2);
+
+      const novels = (
+        getDb().prepare('SELECT COUNT(*) AS n FROM novels WHERE title = ?').get('Exactly Once') as { n: number }
+      ).n;
+      expect(novels).toBe(1);
+
+      await expect(confirmImportSessionAction({
+        ...input,
+        novelTitle: 'Different Request Same Token',
+      })).rejects.toMatchObject({ code: 'CONFIRMATION_COLLISION' });
+    } finally {
+      await deleteNovelCascade(first.novelId, 'local-user');
     }
   });
 });

@@ -181,10 +181,21 @@ export async function executeWritingChapterBatch(args: {
       chapterNumber: chapterPlan.chapterNumber,
       log,
     }),
-    upsertChapter: (chapterNumber, title, content, options) =>
-      upsertChapter(novelId, chapterNumber, title, content, options),
-    updateChapterMeta: (chapterNumber, meta) =>
-      updateChapterMeta(novelId, chapterNumber, meta),
+    upsertChapter: (chapterNumber, title, content, options) => {
+      const existing = existingByNumber.get(chapterNumber);
+      return upsertChapter(novelId, chapterNumber, title, content, {
+        ...options,
+        writingLockToken: lease.token,
+        expectedVersion: options?.expectedVersion ?? existing?.version,
+      });
+    },
+    updateChapterMeta: (chapterNumber, meta) => {
+      const { expectedVersion, ...chapterMeta } = meta;
+      return updateChapterMeta(novelId, chapterNumber, chapterMeta, {
+        writingLockToken: lease.token,
+        expectedVersion,
+      });
+    },
     renewLock: () => lease.renew(),
     emit: frame => sink.emit(frame),
     isCancelled: () => lifecycle.isCancelled(),

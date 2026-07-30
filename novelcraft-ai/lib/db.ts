@@ -111,6 +111,7 @@ export {
   createChapterSnapshot,
   listChapterSnapshots,
   restoreChapterSnapshot,
+  ChapterWriteFenceError,
   type UpsertChapterOptions,
 } from '@/lib/db/queries-chapter';
 

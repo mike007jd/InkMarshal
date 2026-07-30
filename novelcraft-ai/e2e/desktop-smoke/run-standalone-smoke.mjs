@@ -79,7 +79,7 @@ function resolveServerActionId(runtime, exportedName) {
   return match[0];
 }
 
-function desktopRuntimeEnv(homeDir, port, token) {
+function baseRuntimeEnv(homeDir, port) {
   const env = {};
   for (const key of RUNTIME_ENV_PASSTHROUGH) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -91,9 +91,21 @@ function desktopRuntimeEnv(homeDir, port, token) {
     NODE_ENV: 'production',
     NEXT_TELEMETRY_DISABLED: '1',
     INKMARSHAL_HOME: homeDir,
+  };
+}
+
+function desktopRuntimeEnv(homeDir, port, token) {
+  return {
+    ...baseRuntimeEnv(homeDir, port),
     INKMARSHAL_RUNTIME: 'desktop',
     INKMARSHAL_DESKTOP_SESSION: token,
   };
+}
+
+function productionWebRuntimeEnv(homeDir, port) {
+  // Intentionally omit INKMARSHAL_RUNTIME / DESKTOP_SESSION so the process is
+  // a production non-desktop (web) runtime.
+  return baseRuntimeEnv(homeDir, port);
 }
 
 function freePort() {
@@ -439,6 +451,67 @@ async function stopChild(child) {
   if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
 }
 
+/**
+ * Production non-desktop regression: a real action id POSTed to `/` without
+ * desktop credentials must 404 and must not create/mutate SQLite.
+ */
+async function runProductionWebServerActionFailClosed(resolved, createConversationActionId) {
+  const homeDir = mkdtempSync(path.join(tmpdir(), 'inkmarshal-web-action-smoke-'));
+  const port = await freePort();
+  const dbPath = path.join(homeDir, 'app', 'inkmarshal.db');
+  const base = `http://${HOST}:${port}`;
+
+  log(`booting production web runtime on ${HOST}:${port} (home ${homeDir})`);
+  const child = spawn(resolved.nodeBinary, [resolved.serverJs], {
+    cwd: resolved.cwd,
+    env: productionWebRuntimeEnv(homeDir, port),
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+
+  try {
+    const body = await Promise.race([fetchHealth(port), failIfChildExits(child)]);
+    if (body?.ok !== true) throw new Error(`web health payload not ok: ${JSON.stringify(body)}`);
+    if (body.runtime !== 'web') throw new Error(`expected runtime "web", got "${body.runtime}"`);
+
+    const rootResponse = await fetch(`${base}/`, { redirect: 'manual' });
+    if (rootResponse.status < 300 || rootResponse.status >= 400) {
+      throw new Error(`ordinary public root: expected redirect, got HTTP ${rootResponse.status}`);
+    }
+
+    if (existsSync(dbPath)) {
+      throw new Error('production web runtime created SQLite before the Action probe');
+    }
+
+    await expectStatus(
+      await fetch(`${base}/`, {
+        method: 'POST',
+        headers: {
+          accept: 'text/x-component',
+          'content-type': 'text/plain;charset=UTF-8',
+          'next-action': createConversationActionId,
+        },
+        body: JSON.stringify([
+          'smoke-novel-id',
+          {
+            topic: 'plot',
+            title: 'Must Not Persist',
+            parentMessageId: null,
+          },
+        ]),
+      }),
+      404,
+      'production web root-path Next-Action',
+    );
+
+    if (existsSync(dbPath)) {
+      throw new Error('production web root-path Next-Action mutated SQLite');
+    }
+  } finally {
+    await stopChild(child);
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const resolved = resolveServerJs();
   const createConversationActionId = resolveServerActionId(resolved, 'createConversation');
@@ -471,7 +544,9 @@ async function main() {
       openImportSessionActionId,
       confirmImportSessionActionId,
     );
-    log('PASS: copied runtime readiness + API/Action auth + create → backup → restore + 2/10/25 MiB TXT/MD/DOCX import');
+    await stopChild(child);
+    await runProductionWebServerActionFailClosed(resolved, createConversationActionId);
+    log('PASS: copied runtime readiness + API/Action auth + create → backup → restore + 2/10/25 MiB TXT/MD/DOCX import + production web Next-Action fail-closed');
   } catch (err) {
     failed = err;
     log(`FAIL: ${err.message}`);

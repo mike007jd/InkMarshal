@@ -94,6 +94,16 @@ export async function getChaptersLite(novelId: string): Promise<ChapterLite[]> {
   );
 }
 
+/** Token/version fence rejected a late writer chapter mutation. */
+export class ChapterWriteFenceError extends Error {
+  readonly code = 'CHAPTER_WRITE_FENCE' as const;
+
+  constructor(message = 'Chapter write rejected: writing lock or version fence lost.') {
+    super(message);
+    this.name = 'ChapterWriteFenceError';
+  }
+}
+
 export interface UpsertChapterOptions {
   /**
    * AI generation must pass `content_saved` so resume can finish metadata
@@ -101,6 +111,13 @@ export interface UpsertChapterOptions {
    * `complete`.
    */
   processingStatus?: ChapterProcessingStatus;
+  /**
+   * When set, the write is fenced: the same SQL mutation requires this token
+   * to still own the novel writing lock (and `expectedVersion` when overwriting).
+   */
+  writingLockToken?: string;
+  /** Required with `writingLockToken` when the chapter row already exists. */
+  expectedVersion?: number;
 }
 
 export async function upsertChapter(
@@ -114,42 +131,115 @@ export async function upsertChapter(
   const wordCount = countWords(content);
   const now = nowIso();
   const processingStatus: ChapterProcessingStatus = options?.processingStatus ?? 'complete';
+  const lockToken = options?.writingLockToken;
+  const expectedVersion = options?.expectedVersion;
 
   // Capture prior length before the upsert so the AI word delta on a
   // re-generation is net (new − old), not the full new length.
   const prev = db
-    .prepare('SELECT word_count FROM chapters WHERE novel_id = ? AND chapter_number = ?')
-    .get(novelId, chapterNumber) as { word_count: number } | undefined;
+    .prepare('SELECT word_count, version FROM chapters WHERE novel_id = ? AND chapter_number = ?')
+    .get(novelId, chapterNumber) as { word_count: number; version: number } | undefined;
   const prevWords = prev?.word_count ?? 0;
 
   const write = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO chapters (
-         id, novel_id, chapter_number, title, content, original_content,
-         word_count, version, processing_status, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(novel_id, chapter_number) DO UPDATE SET
-         title = excluded.title,
-         content = excluded.content,
-         -- An upsert-on-conflict is a fresh generation: clear any stale
-         -- revert-baseline so a later revertChapterToOriginalContent can't
-         -- restore content from a previous draft lineage.
-         original_content = NULL,
-         word_count = excluded.word_count,
-         version = COALESCE(chapters.version, 0) + 1,
-         processing_status = excluded.processing_status`,
-    ).run(
-      crypto.randomUUID(),
-      novelId,
-      chapterNumber,
-      title,
-      content,
-      null,
-      wordCount,
-      0,
-      processingStatus,
-      now,
-    );
+    if (lockToken) {
+      if (prev) {
+        if (expectedVersion === undefined) {
+          throw new ChapterWriteFenceError(
+            'Fenced chapter overwrite requires an expected version.',
+          );
+        }
+        const info = db.prepare(
+          `UPDATE chapters SET
+             title = ?,
+             content = ?,
+             original_content = NULL,
+             word_count = ?,
+             version = ?,
+             processing_status = ?
+           WHERE novel_id = ?
+             AND chapter_number = ?
+             AND version = ?
+             AND EXISTS (
+               SELECT 1 FROM novels n
+                WHERE n.id = chapters.novel_id
+                  AND n.writing_lock_token = ?
+                  AND n.writing_lock_expires_at >= ?
+             )`,
+        ).run(
+          title,
+          content,
+          wordCount,
+          expectedVersion + 1,
+          processingStatus,
+          novelId,
+          chapterNumber,
+          expectedVersion,
+          lockToken,
+          now,
+        );
+        if (info.changes === 0) {
+          throw new ChapterWriteFenceError();
+        }
+      } else {
+        const info = db.prepare(
+          `INSERT INTO chapters (
+             id, novel_id, chapter_number, title, content, original_content,
+             word_count, version, processing_status, created_at
+           )
+           SELECT ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?
+            WHERE EXISTS (
+              SELECT 1 FROM novels n
+               WHERE n.id = ?
+                 AND n.writing_lock_token = ?
+                 AND n.writing_lock_expires_at >= ?
+            )`,
+        ).run(
+          crypto.randomUUID(),
+          novelId,
+          chapterNumber,
+          title,
+          content,
+          wordCount,
+          processingStatus,
+          now,
+          novelId,
+          lockToken,
+          now,
+        );
+        if (info.changes === 0) {
+          throw new ChapterWriteFenceError();
+        }
+      }
+    } else {
+      db.prepare(
+        `INSERT INTO chapters (
+           id, novel_id, chapter_number, title, content, original_content,
+           word_count, version, processing_status, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(novel_id, chapter_number) DO UPDATE SET
+           title = excluded.title,
+           content = excluded.content,
+           -- An upsert-on-conflict is a fresh generation: clear any stale
+           -- revert-baseline so a later revertChapterToOriginalContent can't
+           -- restore content from a previous draft lineage.
+           original_content = NULL,
+           word_count = excluded.word_count,
+           version = COALESCE(chapters.version, 0) + 1,
+           processing_status = excluded.processing_status`,
+      ).run(
+        crypto.randomUUID(),
+        novelId,
+        chapterNumber,
+        title,
+        content,
+        null,
+        wordCount,
+        0,
+        processingStatus,
+        now,
+      );
+    }
     touchNovelUpdatedAt(db, novelId);
     try {
       recordActivityEvent(db, {
@@ -436,6 +526,7 @@ export async function updateChapterMeta(
   novelId: string,
   chapterNumber: number,
   meta: ChapterMetaUpdate,
+  options?: { writingLockToken?: string; expectedVersion?: number },
 ): Promise<void> {
   const db = getDb();
   const setParts: string[] = [];
@@ -469,9 +560,27 @@ export async function updateChapterMeta(
   if (setParts.length === 0) return;
 
   values.push(novelId, chapterNumber);
-  const info = db.prepare(
-    `UPDATE chapters SET ${setParts.join(', ')} WHERE novel_id = ? AND chapter_number = ?`,
-  ).run(...values);
+  let sql = `UPDATE chapters SET ${setParts.join(', ')} WHERE novel_id = ? AND chapter_number = ?`;
+  if (options?.writingLockToken) {
+    if (options.expectedVersion === undefined) {
+      throw new ChapterWriteFenceError(
+        'Fenced chapter metadata write requires an expected version.',
+      );
+    }
+    sql += ` AND version = ? AND EXISTS (
+      SELECT 1 FROM novels n
+       WHERE n.id = chapters.novel_id
+         AND n.writing_lock_token = ?
+         AND n.writing_lock_expires_at >= ?
+    )`;
+    values.push(options.expectedVersion, options.writingLockToken, nowIso());
+  }
+  const info = db.prepare(sql).run(...values);
+  if (options?.writingLockToken && info.changes === 0) {
+    throw new ChapterWriteFenceError(
+      'Chapter metadata write rejected: writing lock or version fence lost.',
+    );
+  }
   if (info.changes > 0) touchNovelUpdatedAt(db, novelId);
 }
 

@@ -60,6 +60,7 @@ interface ChatToolLedgerEntry {
   status: 'prepared' | 'completed';
   preparedData: unknown;
   result?: unknown;
+  completionData?: unknown;
 }
 
 interface ChatToolLedger {
@@ -73,6 +74,7 @@ export type PrepareChatTurnToolCallResult =
       kind: 'prepared' | 'completed';
       preparedData: unknown;
       result?: unknown;
+      completionData?: unknown;
       newlyPrepared: boolean;
     };
 
@@ -243,6 +245,28 @@ export function beginChatTurn(args: {
   }
 
   return { kind: 'collision', turn };
+}
+
+/**
+ * Heartbeat for a live provider worker: bumps `updated_at` only while this
+ * claim still owns the running row. Returns false when the claim was lost so
+ * the worker can abort before another paid provider call is started.
+ */
+export function renewChatTurnClaim(args: {
+  novelId: string;
+  userMessageId: string;
+  claimToken: string;
+}): boolean {
+  const write = getDb()
+    .prepare(
+      `UPDATE chat_turns
+          SET updated_at = ?
+        WHERE novel_id = ? AND user_message_id = ?
+          AND status = 'running'
+          AND error_code = ?`,
+    )
+    .run(nowIso(), args.novelId, args.userMessageId, args.claimToken);
+  return write.changes > 0;
 }
 
 export function attachChatTurnBrainstormReceipt(
@@ -541,6 +565,7 @@ export function prepareChatTurnToolCall(args: {
         kind: existing.status,
         preparedData: existing.preparedData,
         result: existing.result,
+        completionData: existing.completionData,
         newlyPrepared: false,
       };
     }
@@ -643,18 +668,53 @@ export function readChatTurnToolSnapshot<T>(args: {
   return JSON.parse(row.payload) as T;
 }
 
-/** Stamp a cached tool result only if the caller still owns this generation. */
-export function completeChatTurnToolCall(args: {
+export type MutateAndCompleteChatTurnToolCallResult<T> =
+  | { kind: 'completed'; result: T }
+  | { kind: 'already_completed'; result: unknown }
+  | { kind: 'lost_claim' };
+
+export type MutateClaimedChatTurnResult<T> =
+  | { kind: 'mutated'; result: T }
+  | { kind: 'lost_claim' };
+
+/** Run a synchronous special-branch mutation under the active chat claim. */
+export function mutateClaimedChatTurn<T>(args: {
+  novelId: string;
+  userMessageId: string;
+  claimToken: string;
+  mutate: (db: ReturnType<typeof getDb>) => T;
+}): MutateClaimedChatTurnResult<T> {
+  const db = getDb();
+  return db.transaction((): MutateClaimedChatTurnResult<T> => {
+    const owner = db.prepare(
+      `SELECT 1
+         FROM chat_turns
+        WHERE novel_id = ? AND user_message_id = ?
+          AND status = 'running' AND error_code = ?`,
+    ).get(args.novelId, args.userMessageId, args.claimToken);
+    if (!owner) return { kind: 'lost_claim' };
+    return { kind: 'mutated', result: args.mutate(db) };
+  })();
+}
+
+/**
+ * Claim-fence a semantic mutation and ledger completion in one SQLite
+ * transaction. `mutate` must be synchronous; any throw rolls back the
+ * mutation, receipt writes performed inside it, and the ledger stamp.
+ */
+export function mutateAndCompleteChatTurnToolCall<T>(args: {
   novelId: string;
   userMessageId: string;
   claimToken: string;
   toolKey: string;
   toolName: string;
   argsHash: string;
-  result: unknown;
-}): boolean {
+  mutate: () => T;
+  captureCompletionData?: (result: T) => unknown;
+  onAlreadyCompleted?: (result: unknown, completionData: unknown) => void;
+}): MutateAndCompleteChatTurnToolCallResult<T> {
   const db = getDb();
-  return db.transaction((): boolean => {
+  return db.transaction((): MutateAndCompleteChatTurnToolCallResult<T> => {
     const row = db.prepare(
       `SELECT status, error_code, response_text
          FROM chat_turns
@@ -667,7 +727,7 @@ export function completeChatTurnToolCall(args: {
       || row.status !== 'running'
       || row.error_code !== args.claimToken
     ) {
-      return false;
+      return { kind: 'lost_claim' };
     }
     const ledger = parseChatToolLedger(row.response_text);
     const entry = ledger.entries[args.toolKey];
@@ -679,10 +739,15 @@ export function completeChatTurnToolCall(args: {
       throw new Error('Durable chat tool intent missing or mismatched');
     }
     if (entry.status === 'completed') {
-      return JSON.stringify(entry.result) === JSON.stringify(args.result);
+      args.onAlreadyCompleted?.(entry.result, entry.completionData);
+      return { kind: 'already_completed', result: entry.result };
     }
+
+    const result = args.mutate();
+    const completionData = args.captureCompletionData?.(result);
     entry.status = 'completed';
-    entry.result = args.result;
+    entry.result = result;
+    entry.completionData = completionData;
     const write = db.prepare(
       `UPDATE chat_turns
           SET response_text = ?, updated_at = ?
@@ -695,7 +760,11 @@ export function completeChatTurnToolCall(args: {
       args.userMessageId,
       args.claimToken,
     );
-    return write.changes === 1;
+    if (write.changes !== 1) {
+      // Throw so the surrounding transaction rolls back mutate() side effects.
+      throw new Error('Chat turn claim lost during brainstorm tool mutation');
+    }
+    return { kind: 'completed', result };
   })();
 }
 

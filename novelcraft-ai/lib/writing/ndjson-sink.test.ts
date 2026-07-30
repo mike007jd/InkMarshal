@@ -12,6 +12,7 @@ describe('createNdjsonWritingStream', () => {
     const stream = createNdjsonWritingStream({
       signal: abort.signal,
       lease: {
+        token: 'test-lock-token',
         renew: vi.fn(async () => true),
         renewQuietly: vi.fn(),
         hasLost: vi.fn(() => false),

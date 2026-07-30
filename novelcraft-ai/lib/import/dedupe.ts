@@ -18,9 +18,12 @@
 // The DECISION is always the user's — this only proposes. The server action's
 // merge path captures a safety snapshot before any overwrite (see import.ts).
 
+import { createHash } from 'node:crypto';
+
 import type {
   ChapterCandidate,
   DedupeAction,
+  DedupeConsent,
   DedupeResult,
   DedupeStatus,
   ExistingChapterRef,
@@ -72,6 +75,27 @@ export function fingerprintBody(content: string): string {
     .replace(/[\s　]+/g, '')
     .replace(/[.,;:!?'"`~@#$%^&*()\[\]{}<>/\\|+=_\-—–。，、；：！？「」『』（）【】《》·~]/g, '')
     .slice(0, FINGERPRINT_CHARS);
+}
+
+/**
+ * Immutable content fingerprint for merge consent. Any edit to the target
+ * chapter body invalidates a previously granted overwrite/skip decision.
+ */
+export function consentContentFingerprint(content: string): string {
+  return createHash('sha256')
+    .update('inkmarshal.import-consent-content:v1:')
+    .update(content)
+    .digest('hex');
+}
+
+function consentForMatch(ref: ExistingChapterRef): DedupeConsent | null {
+  if (typeof ref.id !== 'string' || !ref.id) return null;
+  if (!Number.isInteger(ref.version) || (ref.version as number) < 0) return null;
+  return {
+    matchedChapterId: ref.id,
+    matchedVersion: ref.version as number,
+    matchedContentFingerprint: consentContentFingerprint(ref.content),
+  };
 }
 
 /**
@@ -181,6 +205,7 @@ export function dedupeCandidates(
       matchedChapterNumber: matched?.ref.chapterNumber ?? null,
       matchedTitle: matched?.ref.title ?? null,
       defaultAction: ACTION_FOR_STATUS[status],
+      consent: matched ? consentForMatch(matched.ref) : null,
     } satisfies DedupeResult;
   });
 }

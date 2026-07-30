@@ -25,15 +25,12 @@ import { readCreativityHeader, resolvePreset } from '@/lib/ai/generation-presets
 import { resolveEmbeddingEndpointFromRequest } from '@/lib/knowledge/embedding';
 import { parseRequiredMessageContent } from '@/lib/message-content';
 import {
-  approveExplicitWritingPlan,
+  approveExplicitWritingPlanForClaim,
   brainstormAgentSystemAddon,
   createBrainstormTools,
-  finalizeApprovedStoryDeck,
+  finalizeApprovedStoryDeckForClaim,
   isExplicitWritingApproval,
 } from '@/lib/brainstorm-agent';
-import {
-  recordBrainstormProfileMutation,
-} from '@/lib/brainstorm-receipts';
 import { buildUserMessageContentWithAttachments } from '@/lib/chat-attachments.server';
 import {
   findLatestUserMessage,
@@ -172,7 +169,13 @@ export async function POST(
     try {
       await addMessageWithId(id, userMessage.id, 'user', content);
       const receiptId = bindChatTurnBrainstormReceipt(id, userMessage.id, turn);
-      const result = await finalizeApprovedStoryDeck(id, locale, receiptId);
+      const result = await finalizeApprovedStoryDeckForClaim({
+        novelId: id,
+        locale,
+        receiptId,
+        userMessageId: userMessage.id,
+        claimToken,
+      });
       if (!result.ok) {
         failChatTurn({
           novelId: id,
@@ -216,7 +219,13 @@ export async function POST(
     try {
       // Validate/persist the immutable request before changing the novel stage.
       await addMessageWithId(id, userMessage.id, 'user', content);
-      const result = await approveExplicitWritingPlan(id);
+      const receiptId = bindChatTurnBrainstormReceipt(id, userMessage.id, turn);
+      const result = await approveExplicitWritingPlanForClaim({
+        novelId: id,
+        receiptId,
+        userMessageId: userMessage.id,
+        claimToken,
+      });
       if (!result.ok) {
         if (result.reason === 'incomplete') {
           return persistOrReplayDeterministicAssistantText({
@@ -238,11 +247,6 @@ export async function POST(
           error: 'The approved brainstorm could not be finalized.',
           reason: result.reason,
         }, { status: 409 });
-      }
-      // Receipt only for a real stage transition — never for incomplete/ready CTA.
-      if (!result.alreadyReady) {
-        const receiptId = bindChatTurnBrainstormReceipt(id, userMessage.id, turn);
-        recordBrainstormProfileMutation(receiptId, result.beforeNovel, result.novel);
       }
       return persistOrReplayDeterministicAssistantText({
         novelId: id,
@@ -338,6 +342,11 @@ export async function POST(
     originalMessages,
     submittedUserMessage: userMessage,
     responseMessageId,
+    activeClaim: {
+      novelId: id,
+      userMessageId: userMessage.id,
+      claimToken,
+    },
     stoppedLabel,
     persistence: {
       persistUser: messageId => addMessageWithId(id, messageId, 'user', content),

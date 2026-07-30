@@ -21,7 +21,8 @@ export {
  * status). Some already-distributed interim builds incorrectly stamped the
  * pre-status outbox table set as schema 1; those are accepted and promoted.
  * Schema 20 adds an explicit chapter `processing_status` lifecycle.
- * Schema 21 adds durable ordinary-chat turn receipts (`chat_turns`).
+ * Schema 21 adds durable ordinary-chat turn receipts (`chat_turns`),
+ * import confirmation receipts, and durable brainstorm undo receipts.
  */
 /** Exact published v0.1.0 / v0.1.1 schema marker. */
 export const PUBLISHED_SCHEMA_18_VERSION = 18;
@@ -63,11 +64,13 @@ export const CURRENT_SCHEMA_TABLES = [
   'activity_events',
   'ai_runs',
   'app_settings',
+  'brainstorm_receipts',
   'chapter_chat_history',
   'chapters',
   'chat_turn_tool_snapshots',
   'chat_turns',
   'conversations',
+  'import_confirmations',
   'knowledge_embeddings',
   'knowledge_entries',
   'knowledge_index',
@@ -143,7 +146,8 @@ ALTER TABLE chapters
 
 /**
  * Additive DDL for schema 20 → 21. Ordinary-chat turns gain a durable receipt
- * so concurrent/sequential retries cannot invoke the model twice.
+ * so concurrent/sequential retries cannot invoke the model twice. Import
+ * confirmation and brainstorm undo receipts are also durable SQLite state.
  */
 export const SCHEMA_21_CHAT_TURNS_DDL = `
 CREATE TABLE IF NOT EXISTS chat_turns (
@@ -175,6 +179,33 @@ CREATE TABLE IF NOT EXISTS chat_turn_tool_snapshots (
   FOREIGN KEY (novel_id, user_message_id)
     REFERENCES chat_turns(novel_id, user_message_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS import_confirmations (
+  session_token TEXT PRIMARY KEY,
+  request_hash  TEXT NOT NULL,
+  status        TEXT NOT NULL
+                CHECK (status IN ('pending', 'succeeded')),
+  result_json   TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS brainstorm_receipts (
+  id                 TEXT PRIMARY KEY,
+  novel_id           TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  created_at_ms      INTEGER NOT NULL,
+  expires_at_ms      INTEGER NOT NULL,
+  consumed_at_ms     INTEGER,
+  undo_expires_at_ms INTEGER,
+  undone             INTEGER NOT NULL DEFAULT 0
+                     CHECK (undone IN (0, 1)),
+  profile_json       TEXT,
+  entries_json       TEXT NOT NULL DEFAULT '[]',
+  updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brainstorm_receipts_novel
+  ON brainstorm_receipts(novel_id, created_at_ms DESC);
 `;
 
 export {

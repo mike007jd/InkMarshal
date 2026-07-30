@@ -24,7 +24,13 @@ import {
 export type { LocalUser };
 
 async function requireDesktopSession(): Promise<void> {
-  if (process.env.INKMARSHAL_RUNTIME !== 'desktop') return;
+  const isDesktop = process.env.INKMARSHAL_RUNTIME === 'desktop';
+  // Production non-desktop: fail closed even if the proxy matcher changes.
+  // Non-production local development stays open (no desktop token).
+  if (process.env.NODE_ENV === 'production' && !isDesktop) {
+    notFound();
+  }
+  if (!isDesktop) return;
   const [requestHeaders, requestCookies] = await Promise.all([headers(), cookies()]);
   if (hasValidDesktopSessionCredential({
     header: requestHeaders.get('x-inkmarshal-desktop-session') ?? undefined,

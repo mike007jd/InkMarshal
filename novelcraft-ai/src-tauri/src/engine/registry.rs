@@ -20,20 +20,79 @@ pub(super) struct RunningEngine {
     pub(super) job: WindowsJob,
 }
 
+/// Opaque per-admission identity. Concurrent admissions for the same
+/// `engine_id` each receive a distinct id so dropping one RAII guard cannot
+/// remove another admission's reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ReservationId(u64);
+
+/// In-flight admission reservations keyed by [`ReservationId`] (never by
+/// `engine_id`). Aggregation uses saturating arithmetic so adversarial
+/// footprints cannot overflow the reserved sum.
+#[derive(Default)]
+pub(super) struct AdmissionReservations {
+    next_id: u64,
+    by_id: HashMap<ReservationId, u64>,
+}
+
+impl AdmissionReservations {
+    pub(super) fn insert(&mut self, footprint_bytes: u64) -> ReservationId {
+        // Skip 0 so a Default-zeroed / unset id never collides with a real entry.
+        let mut id = ReservationId(self.next_id.wrapping_add(1));
+        self.next_id = id.0;
+        // Pathologically full map (2^64 entries) is unreachable; if an id is
+        // somehow still occupied, advance until a free slot is found.
+        while self.by_id.contains_key(&id) {
+            id = ReservationId(id.0.wrapping_add(1));
+            self.next_id = id.0;
+        }
+        self.by_id.insert(id, footprint_bytes);
+        id
+    }
+
+    pub(super) fn remove(&mut self, id: ReservationId) {
+        self.by_id.remove(&id);
+    }
+
+    pub(super) fn reserved_sum(&self) -> u64 {
+        self.by_id
+            .values()
+            .fold(0u64, |acc, &bytes| acc.saturating_add(bytes))
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn footprints(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_id.values().copied()
+    }
+}
+
 /// Engine registry. `.0` is the live running-engine map; `.1` is the admission
-/// reservation map (engine_id → footprint bytes) holding footprints that have
-/// passed budget admission but aren't yet in the running map (spawn + cold load
-/// in flight). Counting it closes the budget TOCTOU so two concurrent starts
-/// can't double-spend the same free RAM. See `admit_engine`.
+/// reservation map ([`ReservationId`] → footprint bytes) holding footprints that
+/// have passed budget admission but aren't yet fully resident (spawn + cold
+/// load in flight). Entries are keyed by a unique per-admission id — not
+/// `engine_id` — so two concurrent starts of the same model keep independent
+/// reservations and each guard drops only its own entry. Counting reservations
+/// closes the budget TOCTOU so concurrent starts can't double-spend free RAM.
+/// See `admit_engine`.
 ///
-/// Lock order, to stay deadlock-free: `admit_engine` is the ONLY place that
-/// holds both locks, and it takes `.1` (admission) THEN `.0` (running). Every
-/// other path either takes a single lock or takes them strictly sequentially
-/// (acquire-release-acquire), never `.0`-then-`.1` while still holding `.0`.
+/// Lock discipline: admission paths take `.1` alone; registration / stop /
+/// status take `.0` alone. Paths that need both acquire-release-acquire
+/// sequentially and never nest `.0` then `.1` (or the reverse) while still
+/// holding the first lock.
 #[derive(Default)]
 pub struct EngineRegistry(
     pub(super) Mutex<HashMap<String, RunningEngine>>,
-    pub(super) Mutex<HashMap<String, u64>>,
+    pub(super) Mutex<AdmissionReservations>,
 );
 
 pub(super) enum RegisterEngineResult {

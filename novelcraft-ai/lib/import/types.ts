@@ -108,6 +108,16 @@ export type DedupeStatus = 'new' | 'duplicate' | 'conflict';
  * - `conflict`   — same normalized title but DIFFERENT body, OR same body under
  *                  a different title → the user must choose what to do.
  */
+/** Consent binding generated at review time for a matched target chapter. */
+export interface DedupeConsent {
+  /** Immutable chapters.id of the matched target. */
+  matchedChapterId: string;
+  /** chapters.version observed during review. */
+  matchedVersion: number;
+  /** sha256 of target content at review time. */
+  matchedContentFingerprint: string;
+}
+
 export interface DedupeResult {
   candidateId: string;
   status: DedupeStatus;
@@ -116,6 +126,8 @@ export interface DedupeResult {
   matchedTitle: string | null;
   /** Default action proposed for this row (user can override). */
   defaultAction: DedupeAction;
+  /** Present when a target chapter was matched and identity is known. */
+  consent: DedupeConsent | null;
 }
 
 /** A chapter the target novel already has, used as the dedupe comparison set. */
@@ -124,6 +136,10 @@ export interface ExistingChapterRef {
   title: string;
   /** Body content (used to build the fingerprint). */
   content: string;
+  /** Immutable chapters.id when available (required for merge consent). */
+  id?: string;
+  /** chapters.version when available (required for merge consent). */
+  version?: number;
 }
 
 /** Internal reconstruction shape after the server expands compact refs to prose. */
@@ -139,4 +155,9 @@ export interface DedupeDecision {
   action: DedupeAction;
   /** Existing target reported by server dedupe; null when no match exists. */
   matchedChapterNumber: number | null;
+  /**
+   * Version-bound consent for the matched target. Required whenever
+   * `matchedChapterNumber` is non-null; must match the review-time report.
+   */
+  consent?: DedupeConsent | null;
 }

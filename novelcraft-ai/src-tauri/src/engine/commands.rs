@@ -3,8 +3,9 @@
 //! queries / stop verbs over the registry.
 
 use super::budget::{
-    admit_estimated_footprint, budget_available_bytes, estimate_footprint_inner,
-    normalize_engine_model_path_for_match, validate_engine_model_path, RESERVED_FOR_OS_BYTES,
+    admit_estimated_footprint, budget_available_bytes, engine_memory_unavailable_error,
+    estimate_footprint_inner, host_headroom_bytes, normalize_engine_model_path_for_match,
+    validate_engine_model_path,
 };
 use super::log::{
     engine_log_dir, engine_log_path, engine_log_targets, read_log_tail, MAX_ENGINE_LOG_TAIL_BYTES,
@@ -82,11 +83,11 @@ pub async fn engine_start(
 
     // Measure footprint then admit atomically. Estimation failure is fail-closed
     // (`ENGINE_FOOTPRINT_UNKNOWN`) — never coerce unknown size to 0 and admit.
-    // A genuinely measured zero may still be admitted (contributes 0). The
-    // reservation is released the instant the engine enters the running map
-    // (below); on every failing exit path — duplicate, spawn failure, or
-    // readiness timeout — the guard frees it on drop. The TS-side budget check
-    // remains an advisory UX fast-path only.
+    // Memory-snapshot failure is likewise fail-closed (`ENGINE_MEMORY_UNAVAILABLE`)
+    // and never reaches spawn. A genuinely measured zero may still be admitted
+    // (contributes 0). The reservation stays held through cold load until
+    // readiness succeeds (released exactly once below) or any failing exit path
+    // drops the guard. The TS-side budget check remains an advisory UX fast-path.
     let (footprint, reservation) =
         admit_estimated_footprint(&registry, &model_path, args.format, &engine_id)?;
 
@@ -166,13 +167,15 @@ pub async fn engine_start(
     };
     match register_running_engine(&registry, engine_id.clone(), running)? {
         RegisterEngineResult::Inserted => {
-            // Now counted in the running map — release the reservation at once so
-            // the cold-load window doesn't double-count this footprint and falsely
-            // reject a concurrent start. Failure paths below still drop the guard.
-            drop(reservation);
+            // Keep the reservation through cold load. OS available may not yet
+            // reflect pages still on disk; the reservation protects concurrent
+            // starts until readiness succeeds and we release it exactly once.
         }
         RegisterEngineResult::Duplicate { existing, rejected } => {
             terminate_running_engine(*rejected);
+            // Our spawn lost the race — free our reservation immediately so it
+            // cannot block siblings while we wait on the winner.
+            drop(reservation);
             // The existing engine won the race; it may still be on its cold
             // load, so give it the full ceiling — but the try_wait fast-fail
             // inside wait_engine_ready bails early if it has already died.
@@ -208,7 +211,12 @@ pub async fn engine_start(
     // try_wait fast-fail inside wait_engine_ready means a process that dies on
     // startup (bad model, OOM, wrong arch) fails in <1s, not after 180s.
     match wait_engine_ready(&registry, &engine_id, port, Duration::from_secs(180)).await {
-        Ok(true) => return Ok(info),
+        Ok(true) => {
+            // Ready and resident — OS available now reflects usage; release the
+            // cold-load reservation exactly once. Failure paths rely on Drop.
+            drop(reservation);
+            return Ok(info);
+        }
         Err(error) => {
             stop_engine_inner(&registry, &engine_id);
             return Err(format!(
@@ -218,7 +226,7 @@ pub async fn engine_start(
         Ok(false) => {}
     }
     // stop_engine_inner polls + waits, so on return the child is reaped and
-    // the registry slot is free — no zombie lingers.
+    // the registry slot is free — no zombie lingers. Reservation frees on Drop.
     stop_engine_inner(&registry, &engine_id);
     Err(format!(
         "Engine '{engine_id}' did not become ready within 180s — process cleaned up"
@@ -286,7 +294,8 @@ pub fn engine_estimate_footprint(
 pub fn engine_resource_budget(
     registry: tauri::State<EngineRegistry>,
 ) -> Result<EngineBudget, String> {
-    let total = crate::system_memory_bytes().unwrap_or(0);
+    let memory =
+        crate::system_memory().map_err(|reason| engine_memory_unavailable_error(&reason))?;
     let running: Vec<RunningEngineSummary> = registry
         .0
         .lock()
@@ -302,18 +311,19 @@ pub fn engine_resource_budget(
         })
         .unwrap_or_default();
 
-    let running_sum: u64 = running.iter().map(|r| r.footprint_bytes).sum();
-    // Count in-flight reservations too (engines admitted but not yet in the
-    // running map during spawn/cold-load) so a poll mid-load reflects the pending
-    // commitment instead of briefly showing it as free RAM. saturating_sub keeps
-    // the math honest on an over-committed box (available=0, never a wrap-around).
-    let reserved_sum: u64 = registry.1.lock().map(|r| r.values().sum()).unwrap_or(0);
-    let available = budget_available_bytes(total, running_sum, reserved_sum);
+    // Count in-flight reservations (admitted / cold-loading) so a poll mid-load
+    // reflects the pending commitment. Do not subtract running footprints —
+    // OS available already includes their resident usage. saturating_add on the
+    // reservation sum (and saturating_sub below) keeps the math honest on an
+    // over-committed or adversarially large box (never panic / wrap-around).
+    let reserved_sum: u64 = registry.1.lock().map(|r| r.reserved_sum()).unwrap_or(0);
+    let headroom = host_headroom_bytes(memory.total_bytes);
+    let available = budget_available_bytes(memory.available_bytes, headroom, reserved_sum);
 
     Ok(EngineBudget {
-        total_ram_bytes: total,
+        total_ram_bytes: memory.total_bytes,
         available_ram_bytes: available,
-        reserved_for_os_bytes: RESERVED_FOR_OS_BYTES,
+        reserved_for_os_bytes: headroom,
         running,
     })
 }

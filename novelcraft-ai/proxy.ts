@@ -69,15 +69,24 @@ export function isDesktopRequestAuthorized(
 export function productionWebBlockKind(
   pathname: string,
   env: Record<string, string | undefined> = process.env,
+  headers?: Pick<Headers, 'get'>,
 ): 'api' | 'page' | null {
   if (!isProductionWebRuntime(env)) return null
+  // Server Actions POST to whatever page route they were imported from
+  // (including the otherwise-public root). Fail closed with the same
+  // non-revealing 404 as blocked local APIs, regardless of pathname.
+  if (headers?.get('next-action') != null) return 'api'
   if (DESKTOP_ONLY_PAGE_RE.test(pathname)) return 'page'
   if (pathname.startsWith('/api/') && !PUBLIC_WEB_API_RE.test(pathname)) return 'api'
   return null
 }
 
 export async function proxy(request: NextRequest) {
-  const blockKind = productionWebBlockKind(request.nextUrl.pathname)
+  const blockKind = productionWebBlockKind(
+    request.nextUrl.pathname,
+    process.env,
+    request.headers,
+  )
   if (blockKind === 'api') {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }

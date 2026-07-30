@@ -27,6 +27,7 @@ import type {
   ChapterQualityIssue,
   NovelBlueprint,
 } from '@/lib/db';
+import { ChapterWriteFenceError } from '@/lib/db/queries-chapter';
 import type { AIUsageSession } from '@/lib/ai-usage';
 
 // ── Tuning constants (were inline in the route) ─────────────────────────────
@@ -154,7 +155,10 @@ export interface WriteChapterDeps {
     chapterNumber: number,
     title: string,
     content: string,
-    options?: { processingStatus?: 'content_saved' | 'complete' },
+    options?: {
+      processingStatus?: 'content_saved' | 'complete';
+      expectedVersion?: number;
+    },
   ) => Promise<Chapter>;
   updateChapterMeta: (
     chapterNumber: number,
@@ -164,6 +168,8 @@ export interface WriteChapterDeps {
       qualityIssues: ChapterQualityIssue[] | null;
       generationMeta: ChapterGenerationMeta;
       processingStatus?: 'content_saved' | 'complete';
+      /** Content version that must still match when finalizing AI metadata. */
+      expectedVersion: number;
     },
   ) => Promise<void>;
   /** Renew the writing lock; false ⇒ another session took over. */
@@ -425,6 +431,14 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
     });
   } catch (error) {
     await failChapterUsageOnce();
+    if (error instanceof ChapterWriteFenceError) {
+      return buildOutcome('lock_failed', {
+        content: chapterContent,
+        actualWords,
+        generationMeta,
+        errorMessage: 'Writing lock lost before saving the chapter.',
+      });
+    }
     throw error;
   }
   try {
@@ -569,9 +583,20 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
       try {
         savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent, {
           processingStatus: 'content_saved',
+          expectedVersion: savedChapter.version,
         });
       } catch (error) {
         await failDeferredPostChapterUsages();
+        if (error instanceof ChapterWriteFenceError) {
+          return buildOutcome('lock_failed', {
+            content: chapterContent,
+            actualWords,
+            qualityIssues: chapterQualityIssues,
+            generationMeta,
+            savedChapter,
+            errorMessage: 'Writing lock lost while saving Ralph revision.',
+          });
+        }
         throw error;
       }
 
@@ -629,11 +654,22 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
       qualityIssues: chapterQualityIssues,
       generationMeta,
       processingStatus: 'complete',
+      expectedVersion: savedChapter.version,
     });
     savedChapter = { ...savedChapter, processingStatus: 'complete', summary: chapterSummary, keyFacts: chapterKeyFacts, qualityIssues: chapterQualityIssues, generationMeta };
   } catch (error) {
     await failDeferredPostChapterUsages();
     await failSettledUsages(summarizeOutcome, validateOutcome);
+    if (error instanceof ChapterWriteFenceError) {
+      return buildOutcome('lock_failed', {
+        content: chapterContent,
+        actualWords,
+        qualityIssues: chapterQualityIssues,
+        generationMeta,
+        savedChapter,
+        errorMessage: 'Writing lock lost before completing chapter metadata.',
+      });
+    }
     throw error;
   }
   const usagesToSettle = [
@@ -776,9 +812,15 @@ export async function completeSavedChapterPostProcessing(
       qualityIssues: chapterQualityIssues,
       generationMeta,
       processingStatus: 'complete',
+      expectedVersion: savedChapter.version,
     });
   } catch (error) {
     await failSettledUsages(summarizeOutcome, validateOutcome);
+    if (error instanceof ChapterWriteFenceError) {
+      return buildOutcome('lock_failed', {
+        errorMessage: 'Writing lock lost before completing repaired chapter metadata.',
+      });
+    }
     throw error;
   }
 

@@ -200,6 +200,12 @@ describe('current schema epoch 21', () => {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turn_tool_snapshots'",
       ).get(),
     ).toEqual({ name: 'chat_turn_tool_snapshots' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_confirmations'").get(),
+    ).toEqual({ name: 'import_confirmations' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'brainstorm_receipts'").get(),
+    ).toEqual({ name: 'brainstorm_receipts' });
   });
 
   it('opens a current-schema database without DDL and idempotently provisions seed rows', () => {
@@ -437,6 +443,12 @@ describe('schema 20 → 21', () => {
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
     ).toEqual({ name: 'chat_turns' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_confirmations'").get(),
+    ).toEqual({ name: 'import_confirmations' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'brainstorm_receipts'").get(),
+    ).toEqual({ name: 'brainstorm_receipts' });
     const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v20-') && name.endsWith('.bak'));
     expect(backups.length).toBe(1);
   });
@@ -572,8 +584,13 @@ describe('frozen DDL independence', () => {
     expect(currentSchemaSql).toContain('chat_turns');
     expect(currentSchemaSql).toContain('chat_turn_tool_snapshots');
     expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('chat_turn_tool_snapshots');
+    expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('import_confirmations');
+    expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('brainstorm_receipts');
+    expect(currentSchemaSql).toContain('import_confirmations');
+    expect(currentSchemaSql).toContain('brainstorm_receipts');
     expect(SCHEMA_20_DDL).toContain('processing_status');
     expect(SCHEMA_20_DDL).not.toContain('chat_turns');
+    expect(SCHEMA_20_DDL).not.toContain('import_confirmations');
     expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('knowledge_vault_outbox');
     expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('intent_revision');
   });

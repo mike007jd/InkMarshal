@@ -22,6 +22,8 @@ export interface KnowledgeEntryRow {
   title: string;
   summary: string;
   data: string;
+  /** Published schema data version; null means the legacy/unversioned payload. */
+  data_v?: number | null;
   sort_order: number;
   tags: string;
   created_at: string;

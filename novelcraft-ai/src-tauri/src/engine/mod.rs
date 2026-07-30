@@ -109,22 +109,24 @@ pub use registry::{stop_all, EngineRegistry};
 #[cfg(test)]
 mod tests {
     use super::budget::{
-        admit_engine, admit_estimated_footprint, budget_available_bytes, estimate_footprint_inner,
-        footprint_for_admission, normalize_engine_model_path_for_match, validate_engine_model_path,
-        GGUF_FOOTPRINT_MULTIPLIER, MLX_FOOTPRINT_MULTIPLIER, RESERVED_FOR_OS_BYTES,
+        admit_engine, admit_engine_from_memory_result, admit_engine_with_snapshot,
+        admit_estimated_footprint, budget_available_bytes, estimate_footprint_inner,
+        footprint_for_admission, host_headroom_bytes, normalize_engine_model_path_for_match,
+        validate_engine_model_path, GGUF_FOOTPRINT_MULTIPLIER, MLX_FOOTPRINT_MULTIPLIER,
     };
     use super::log::{
         engine_log_file_name, read_log_tail, rotate_engine_log_if_large, MAX_ENGINE_LOG_BYTES,
     };
     use super::registry::{
         prune_exited_engines, register_running_engine, terminate_running_engine,
-        RegisterEngineResult, RunningEngine,
+        AdmissionReservations, RegisterEngineResult, RunningEngine,
     };
     use super::spawn::{
         engine_env_allows, engine_loader_env, make_engine_id, normalize_engine_label,
         pick_free_port, MAX_ENGINE_LABEL_BYTES,
     };
     use super::*;
+    use crate::SystemMemory;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -159,19 +161,143 @@ mod tests {
         assert!("bogus".parse::<EngineFormat>().is_err());
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
     #[test]
-    fn budget_available_subtracts_os_running_and_reserved() {
-        let total = 16 * 1024 * 1024 * 1024u64;
-        let running = 2 * 1024 * 1024 * 1024u64;
-        let reserved = 1024 * 1024 * 1024u64;
-        let expected = total - RESERVED_FOR_OS_BYTES - running - reserved;
-        assert_eq!(budget_available_bytes(total, running, reserved), expected);
+    fn host_headroom_scales_with_total_and_clamps() {
+        // total/8 below the 2 GiB floor → floor.
+        assert_eq!(host_headroom_bytes(8 * GIB), 2 * GIB);
+        // 32 GiB → 4 GiB (total/8).
+        assert_eq!(host_headroom_bytes(32 * GIB), 4 * GIB);
+        // Above the 8 GiB cap → cap.
+        assert_eq!(host_headroom_bytes(128 * GIB), 8 * GIB);
+    }
+
+    #[test]
+    fn budget_available_subtracts_headroom_and_reserved_only() {
+        let available = 16 * GIB;
+        let headroom = host_headroom_bytes(32 * GIB); // 4 GiB
+        let reserved = GIB;
+        let expected = available - headroom - reserved;
+        assert_eq!(
+            budget_available_bytes(available, headroom, reserved),
+            expected
+        );
     }
 
     #[test]
     fn budget_available_saturates_when_overcommitted() {
-        // running alone exceeds total → available clamps to 0, no wrap-around.
-        assert_eq!(budget_available_bytes(1024, u64::MAX, 0), 0);
+        // reserved alone exceeds available → usable clamps to 0, no wrap-around.
+        assert_eq!(budget_available_bytes(1024, 50, u64::MAX), 0);
+        assert_eq!(budget_available_bytes(100, u64::MAX, 0), 0);
+    }
+
+    #[test]
+    fn admit_rejects_large_total_when_available_is_low() {
+        // Classic failure mode: 32 GiB host with only 8 GiB currently free must
+        // reject a 7.6 GiB engine (usable = 8 - 4 headroom = 4 GiB).
+        let registry = EngineRegistry::default();
+        let memory = SystemMemory {
+            total_bytes: 32 * GIB,
+            available_bytes: 8 * GIB,
+        };
+        let footprint = (7.6 * GIB as f64) as u64;
+        let err = admit_engine_with_snapshot(&registry, footprint, "fmt:/m/huge.gguf", memory)
+            .err()
+            .expect("low-available start rejected");
+        assert!(err.starts_with("ENGINE_BUDGET_EXCEEDED:"), "got: {err}");
+        let json = &err["ENGINE_BUDGET_EXCEEDED:".len()..];
+        let payload: serde_json::Value =
+            serde_json::from_str(json).expect("ENGINE_BUDGET_EXCEEDED payload must be JSON");
+        assert_eq!(payload["totalBytes"].as_u64(), Some(32 * GIB));
+        assert_eq!(payload["reservedForOsBytes"].as_u64(), Some(4 * GIB));
+        assert_eq!(payload["availableBytes"].as_u64(), Some(4 * GIB));
+        assert!(registry.1.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn linux_meminfo_parse_requires_total_and_available() {
+        let ok = crate::parse_linux_meminfo(
+            "MemTotal:       32768000 kB\nMemAvailable:    8192000 kB\n",
+        )
+        .expect("both fields present");
+        assert_eq!(ok.total_bytes, 32768000 * 1024);
+        assert_eq!(ok.available_bytes, 8192000 * 1024);
+
+        let err =
+            crate::parse_linux_meminfo("MemTotal: 1024 kB\n").expect_err("MemAvailable required");
+        assert!(err.contains("MemAvailable"), "got: {err}");
+    }
+
+    #[test]
+    fn memory_query_failure_rejects_without_reservation() {
+        let registry = EngineRegistry::default();
+        let err = admit_engine_from_memory_result(
+            &registry,
+            GIB,
+            "fmt:/m/query-fail.gguf",
+            Err("host_statistics64 failed".into()),
+        )
+        .err()
+        .expect("memory query failure must fail closed");
+        assert!(err.starts_with("ENGINE_MEMORY_UNAVAILABLE:"), "got: {err}");
+        let json = &err["ENGINE_MEMORY_UNAVAILABLE:".len()..];
+        let payload: serde_json::Value =
+            serde_json::from_str(json).expect("ENGINE_MEMORY_UNAVAILABLE payload must be JSON");
+        let reason = payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .expect("reason field");
+        assert!(reason.contains("host_statistics64"));
+        assert!(
+            registry.1.lock().unwrap().is_empty(),
+            "must not reserve when memory snapshot fails"
+        );
+    }
+
+    #[test]
+    fn admit_does_not_double_subtract_running_footprints() {
+        // OS available already reflects resident usage. A bookkeeping footprint
+        // on a running engine must not shrink usable a second time.
+        let registry = EngineRegistry::default();
+        let child = stub_running_child();
+        #[cfg(unix)]
+        let pgid = child.id() as i32;
+        #[cfg(windows)]
+        let job = test_job_for_child(&child);
+        {
+            let mut map = registry.0.lock().expect("lock");
+            map.insert(
+                "fmt:/m/resident.gguf".into(),
+                RunningEngine {
+                    info: EngineInfo {
+                        engine_id: "fmt:/m/resident.gguf".into(),
+                        format: EngineFormat::Gguf,
+                        model_path: "/m/resident.gguf".into(),
+                        port: 40010,
+                        // Inflated bookkeeping value — if subtracted again,
+                        // admission below would falsely reject.
+                        footprint_bytes: 20 * GIB,
+                        engine_label: None,
+                    },
+                    child,
+                    #[cfg(unix)]
+                    pgid,
+                    #[cfg(windows)]
+                    job,
+                },
+            );
+        }
+
+        let memory = SystemMemory {
+            total_bytes: 32 * GIB,
+            available_bytes: 10 * GIB,
+        };
+        // usable = 10 - 4 headroom - 0 reserved = 6 GiB; 5 GiB must admit.
+        let _guard = admit_engine_with_snapshot(&registry, 5 * GIB, "fmt:/m/new.gguf", memory)
+            .expect("running footprint must not be subtracted from OS-available a second time");
+        assert_eq!(registry.1.lock().unwrap().len(), 1);
+        stop_all(&registry);
     }
 
     #[test]
@@ -237,6 +363,113 @@ mod tests {
             assert_eq!(registry.1.lock().unwrap().len(), 1);
         }
         assert_eq!(registry.1.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn cold_load_reservation_stays_until_guard_drops_exactly_once() {
+        // Simulates the engine_start lifecycle: reservation held while the
+        // engine is also registered (cold load), then released exactly once.
+        let registry = EngineRegistry::default();
+        let memory = SystemMemory {
+            total_bytes: 32 * GIB,
+            available_bytes: 16 * GIB,
+        };
+        let guard = admit_engine_with_snapshot(&registry, 3 * GIB, "fmt:/m/cold.gguf", memory)
+            .expect("admit");
+        {
+            let reserved = registry.1.lock().unwrap();
+            assert_eq!(reserved.len(), 1);
+            assert_eq!(reserved.reserved_sum(), 3 * GIB);
+        }
+        // Concurrent sibling sees the reservation (usable shrinks by 3 GiB).
+        let sibling_usable = {
+            let reserved_sum = registry.1.lock().unwrap().reserved_sum();
+            budget_available_bytes(
+                memory.available_bytes,
+                host_headroom_bytes(memory.total_bytes),
+                reserved_sum,
+            )
+        };
+        assert_eq!(sibling_usable, 16 * GIB - 4 * GIB - 3 * GIB);
+        drop(guard);
+        assert!(
+            registry.1.lock().unwrap().is_empty(),
+            "reservation must release exactly once on drop"
+        );
+    }
+
+    #[test]
+    fn same_engine_id_reservations_drop_independently() {
+        // Race regression: two admissions for the same engine_id must create
+        // two protected entries. Dropping either guard removes only its own
+        // reservation — never the sibling's cold-load footprint.
+        let registry = EngineRegistry::default();
+        let memory = SystemMemory {
+            total_bytes: 64 * GIB,
+            available_bytes: 32 * GIB,
+        };
+        let engine_id = "gguf:v2:/m/same.gguf";
+        let guard_a =
+            admit_engine_with_snapshot(&registry, 3 * GIB, engine_id, memory).expect("admit a");
+        let guard_b =
+            admit_engine_with_snapshot(&registry, 5 * GIB, engine_id, memory).expect("admit b");
+
+        {
+            let reserved = registry.1.lock().unwrap();
+            assert_eq!(
+                reserved.len(),
+                2,
+                "two same-engine admissions → two entries"
+            );
+            let mut footprints: Vec<u64> = reserved.footprints().collect();
+            footprints.sort_unstable();
+            assert_eq!(footprints, vec![3 * GIB, 5 * GIB]);
+            assert_eq!(reserved.reserved_sum(), 8 * GIB);
+        }
+
+        drop(guard_a);
+        {
+            let reserved = registry.1.lock().unwrap();
+            assert_eq!(reserved.len(), 1, "dropping A must not remove B");
+            assert_eq!(
+                reserved.reserved_sum(),
+                5 * GIB,
+                "surviving reservation keeps its full footprint"
+            );
+        }
+
+        drop(guard_b);
+        assert!(
+            registry.1.lock().unwrap().is_empty(),
+            "second drop clears the last reservation"
+        );
+    }
+
+    #[test]
+    fn reservation_aggregation_saturates_instead_of_overflowing() {
+        let mut reserved = AdmissionReservations::default();
+        let _a = reserved.insert(u64::MAX);
+        let _b = reserved.insert(1);
+        assert_eq!(reserved.len(), 2);
+        assert_eq!(reserved.reserved_sum(), u64::MAX);
+
+        // Admission path uses the same saturating sum when deciding usable bytes.
+        let registry = EngineRegistry::default();
+        {
+            let mut map = registry.1.lock().unwrap();
+            let _ = map.insert(u64::MAX / 2 + 1);
+            let _ = map.insert(u64::MAX / 2 + 1);
+            assert_eq!(map.reserved_sum(), u64::MAX);
+        }
+        let memory = SystemMemory {
+            total_bytes: 32 * GIB,
+            available_bytes: 16 * GIB,
+        };
+        // reserved_sum saturates to u64::MAX → usable = 0 → any positive footprint rejects.
+        let err = admit_engine_with_snapshot(&registry, 1, "fmt:/m/overflow.gguf", memory)
+            .err()
+            .expect("saturated reserved sum must reject");
+        assert!(err.starts_with("ENGINE_BUDGET_EXCEEDED:"), "got: {err}");
     }
 
     #[test]

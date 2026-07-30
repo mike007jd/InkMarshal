@@ -103,6 +103,32 @@ CREATE TABLE IF NOT EXISTS chat_turn_tool_snapshots (
     REFERENCES chat_turns(novel_id, user_message_id) ON DELETE CASCADE
 );
 
+-- Exactly-once import confirmation receipt keyed by opaque session token.
+CREATE TABLE IF NOT EXISTS import_confirmations (
+  session_token TEXT PRIMARY KEY,
+  request_hash  TEXT NOT NULL,
+  status        TEXT NOT NULL
+                CHECK (status IN ('pending', 'succeeded')),
+  result_json   TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+-- Durable brainstorm undo receipt (profile + knowledge inverse payload).
+CREATE TABLE IF NOT EXISTS brainstorm_receipts (
+  id                 TEXT PRIMARY KEY,
+  novel_id           TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  created_at_ms      INTEGER NOT NULL,
+  expires_at_ms      INTEGER NOT NULL,
+  consumed_at_ms     INTEGER,
+  undo_expires_at_ms INTEGER,
+  undone             INTEGER NOT NULL DEFAULT 0
+                     CHECK (undone IN (0, 1)),
+  profile_json       TEXT,
+  entries_json       TEXT NOT NULL DEFAULT '[]',
+  updated_at         TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chapters (
   id                TEXT PRIMARY KEY,
   novel_id          TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
@@ -305,6 +331,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_relations_unique
   ON knowledge_relations(source_id, target_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_messages_novel_id ON messages(novel_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_turns_novel_status ON chat_turns(novel_id, status);
+CREATE INDEX IF NOT EXISTS idx_brainstorm_receipts_novel
+  ON brainstorm_receipts(novel_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_novels_series ON novels(series_id);
 CREATE INDEX IF NOT EXISTS idx_novels_updated_at ON novels(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_novels_user_id ON novels(user_id);

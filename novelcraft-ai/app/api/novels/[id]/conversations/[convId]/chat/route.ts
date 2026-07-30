@@ -177,6 +177,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     originalMessages,
     submittedUserMessage: userMessage,
     responseMessageId,
+    activeClaim: {
+      novelId,
+      userMessageId: userMessage.id,
+      claimToken,
+    },
     stoppedLabel,
     persistence: {
       persistUser: messageId => addMessageWithId(novelId, messageId, 'user', content, convId),

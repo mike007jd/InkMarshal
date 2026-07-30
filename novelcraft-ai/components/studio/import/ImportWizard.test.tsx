@@ -60,6 +60,11 @@ function dedupeReport(action: 'skip' | 'overwrite' | 'append'): DedupeResult[] {
     matchedChapterNumber: action === 'append' ? null : c.chapterNumber,
     matchedTitle: action === 'append' ? null : `Existing ${c.title}`,
     defaultAction: action,
+    consent: action === 'append' ? null : {
+      matchedChapterId: `ch-${c.chapterNumber}`,
+      matchedVersion: 0,
+      matchedContentFingerprint: 'a'.repeat(64),
+    },
   }));
 }
 
@@ -171,8 +176,26 @@ describe('ImportWizard merge dedupe state machine', () => {
     ]);
     expect(JSON.stringify(input)).not.toContain('Body of');
     expect(input.dedupeDecisions).toEqual([
-      { chapterNumber: 1, action: 'skip', matchedChapterNumber: 1 },
-      { chapterNumber: 2, action: 'skip', matchedChapterNumber: 2 },
+      {
+        chapterNumber: 1,
+        action: 'skip',
+        matchedChapterNumber: 1,
+        consent: {
+          matchedChapterId: 'ch-1',
+          matchedVersion: 0,
+          matchedContentFingerprint: 'a'.repeat(64),
+        },
+      },
+      {
+        chapterNumber: 2,
+        action: 'skip',
+        matchedChapterNumber: 2,
+        consent: {
+          matchedChapterId: 'ch-2',
+          matchedVersion: 0,
+          matchedContentFingerprint: 'a'.repeat(64),
+        },
+      },
     ]);
   });
 

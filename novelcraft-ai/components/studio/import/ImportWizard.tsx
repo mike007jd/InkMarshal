@@ -297,6 +297,7 @@ function ImportWizardBody({
                   chapterNumber: cand?.chapterNumber ?? 0,
                   action: actions[d.candidateId] ?? d.defaultAction,
                   matchedChapterNumber: d.matchedChapterNumber,
+                  consent: d.consent,
                 };
               })
             : undefined,
@@ -590,16 +591,22 @@ async function fetchDedupeReport(
     }
     const matchedChapterNumber = row.matchedChapterNumber;
     const matchedTitle = row.matchedTitle;
+    const consent = row.consent;
     const expectedDefaultAction = status === 'new'
       ? 'append'
       : status === 'duplicate'
         ? 'skip'
         : 'overwrite';
     const matchIsValid = status === 'new'
-      ? matchedChapterNumber === null && matchedTitle === null
+      ? matchedChapterNumber === null && matchedTitle === null && consent == null
       : Number.isInteger(matchedChapterNumber)
         && Number(matchedChapterNumber) > 0
-        && typeof matchedTitle === 'string';
+        && typeof matchedTitle === 'string'
+        && !!consent
+        && typeof consent === 'object'
+        && typeof (consent as { matchedChapterId?: unknown }).matchedChapterId === 'string'
+        && Number.isInteger((consent as { matchedVersion?: unknown }).matchedVersion)
+        && typeof (consent as { matchedContentFingerprint?: unknown }).matchedContentFingerprint === 'string';
     if (!matchIsValid || defaultAction !== expectedDefaultAction) {
       throw new Error('invalid dedupe match');
     }

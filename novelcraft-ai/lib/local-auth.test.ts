@@ -73,6 +73,10 @@ describe('requireNovelOwner', () => {
 });
 
 describe('request-local desktop session gate', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('rejects a direct Server Action invocation before returning the local user', async () => {
     process.env.INKMARSHAL_RUNTIME = 'desktop';
     process.env.INKMARSHAL_DESKTOP_SESSION = 'a'.repeat(64);
@@ -91,6 +95,24 @@ describe('request-local desktop session gate', () => {
         ? { value: token }
         : undefined,
     });
+    const { getUser } = await import('@/lib/local-auth');
+
+    await expect(getUser()).resolves.toMatchObject({ id: 'local-user' });
+    expect(requestContext.notFound).not.toHaveBeenCalled();
+  });
+
+  it('rejects getUser in production non-desktop even without a proxy match', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('INKMARSHAL_RUNTIME', '');
+    const { getUser } = await import('@/lib/local-auth');
+
+    await expect(getUser()).rejects.toThrow('NEXT_NOT_FOUND');
+    expect(requestContext.notFound).toHaveBeenCalledOnce();
+  });
+
+  it('keeps non-production local development open without a desktop token', async () => {
+    vi.stubEnv('NODE_ENV', 'test');
+    vi.stubEnv('INKMARSHAL_RUNTIME', '');
     const { getUser } = await import('@/lib/local-auth');
 
     await expect(getUser()).resolves.toMatchObject({ id: 'local-user' });

@@ -317,8 +317,9 @@ describe('conversation chat API', () => {
         }), { params: Promise.resolve({ id: novel.id, convId: conversation.id }) }),
       ]);
 
-      await new Promise(resolve => setTimeout(resolve, 30));
-      expect(callCount.value).toBe(1);
+      await vi.waitFor(() => {
+        expect(callCount.value).toBe(1);
+      });
       expect(getChatTurn(novel.id, userMessageId)?.status).toBe('running');
 
       release();
@@ -425,6 +426,93 @@ describe('conversation chat API', () => {
         'first reply',
       ]);
     } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('does not stale-reclaim an active deferred conversation stream into a second paid call', async () => {
+    mockUsage();
+    mockContext();
+    let release!: () => void;
+    const gate = {
+      promise: new Promise<void>(resolve => {
+        release = resolve;
+      }),
+    };
+    const callCount = { value: 0 };
+    mockDeferredStream({ gate, callCount, text: 'live conversation lease' });
+
+    const { deleteNovelCascade, getChatTurn, getMessagesForNovel } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { CHAT_TURN_STALE_LEASE_MS } = await import('@/lib/db/queries-chat-turns');
+    const { __tickChatTurnClaimLeasesForTest } = await import('@/lib/chat-turn-lease');
+    const { deterministicAssistantMessageId } = await import('@/lib/chat-turn-helpers');
+    const { POST } = await import('./route');
+    const { novel, conversation } = await createNovelConversation('Conversation Active Lease Race');
+    const userMessageId = 'conv-active-lease-user';
+    const body = {
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'keep conversation alive' }],
+      }],
+    };
+
+    try {
+      const firstPromise = POST(new Request(`http://localhost/api/novels/${novel.id}/conversations/${conversation.id}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id, convId: conversation.id }) });
+
+      await vi.waitFor(() => {
+        expect(callCount.value).toBe(1);
+      });
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('running');
+
+      getDb()
+        .prepare(
+          `UPDATE chat_turns
+              SET updated_at = ?
+            WHERE novel_id = ? AND user_message_id = ?`,
+        )
+        .run(
+          new Date(Date.now() - CHAT_TURN_STALE_LEASE_MS - 5_000).toISOString(),
+          novel.id,
+          userMessageId,
+        );
+
+      __tickChatTurnClaimLeasesForTest();
+
+      const duplicate = await POST(new Request(`http://localhost/api/novels/${novel.id}/conversations/${conversation.id}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id, convId: conversation.id }) });
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toMatchObject({ code: 'CHAT_TURN_IN_PROGRESS' });
+      expect(callCount.value).toBe(1);
+
+      release();
+      const first = await firstPromise;
+      expect(first.status).toBe(200);
+      expect(await first.text()).toContain('live conversation lease');
+      expect(callCount.value).toBe(1);
+
+      const replay = await POST(new Request(`http://localhost/api/novels/${novel.id}/conversations/${conversation.id}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id, convId: conversation.id }) });
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toContain('live conversation lease');
+      expect(callCount.value).toBe(1);
+      expect((await getMessagesForNovel(novel.id)).map(m => m.id)).toEqual([
+        userMessageId,
+        deterministicAssistantMessageId(userMessageId),
+      ]);
+    } finally {
+      release();
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });

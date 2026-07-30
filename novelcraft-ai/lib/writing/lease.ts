@@ -18,6 +18,8 @@ export const WRITING_LOCK_RENEW_MS = (WRITING_LOCK_TTL_SEC * 1000) / 3;
 type Logger = (event: string, fields?: Record<string, string | number | boolean | undefined>) => void;
 
 export interface WritingLease {
+  /** Opaque lock token used to fence chapter persistence SQL. */
+  token: string;
   /** Boundary renewal: false means another session took the lock — caller stops. */
   renew(): Promise<boolean>;
   /** Background timer renewal (never throws); calls onLost if the lock is gone. */
@@ -32,6 +34,7 @@ export function createWritingLease(novelId: string, token: string, log: Logger):
   let releasePromise: Promise<void> | null = null;
   let lost = false;
   return {
+    token,
     async renew() {
       const newExpiry = await renewWritingLock(novelId, token, WRITING_LOCK_TTL_SEC);
       if (newExpiry) {
