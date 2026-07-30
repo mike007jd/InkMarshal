@@ -668,6 +668,30 @@ function writeUpdateManifest(outputPath, signaturePath) {
   writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
+function assessGatekeeper(dmgPath) {
+  const args = ['-a', '-vv', '-t', 'install', dmgPath];
+  const maxAttempts = 6;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const result = runCaptureResult('spctl', args);
+    const output = commandOutput(result);
+    if (result.status === 0) return output;
+    // A real rejection is diagnostic and must fail immediately. macOS can
+    // briefly return no output just after stapling while syspolicyd catches up.
+    if (output) {
+      throw new Error(`spctl ${args.join(' ')} failed: ${output}`);
+    }
+    if (attempt < maxAttempts) {
+      console.log(
+        `[verify] Gatekeeper returned no assessment (${attempt}/${maxAttempts}); retrying in 5s...`,
+      );
+      sleepMs(5_000);
+    }
+  }
+  throw new Error(
+    `spctl ${args.join(' ')} failed without a diagnostic after ${maxAttempts} attempts`,
+  );
+}
+
 function assertReleaseGrade(appPath, dmgPath, expectedTeamId, signedMachOBinaries) {
   console.log('[verify] running release-grade checks...');
   runCapture('codesign', ['--verify', '--deep', '--strict', '--verbose=4', appPath]);
@@ -679,7 +703,7 @@ function assertReleaseGrade(appPath, dmgPath, expectedTeamId, signedMachOBinarie
     throw new Error('The app is not signed with a Developer ID identity.');
   }
 
-  const spctlOutput = runCapture('spctl', ['-a', '-vv', '-t', 'install', dmgPath]);
+  const spctlOutput = assessGatekeeper(dmgPath);
   if (/no usable signature|source=Unnotarized Developer ID|rejected/i.test(spctlOutput)) {
     throw new Error(`Gatekeeper assessment is not release-grade: ${spctlOutput}`);
   }
