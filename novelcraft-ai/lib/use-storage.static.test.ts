@@ -38,9 +38,18 @@ describe('useNovel active-scope guards', () => {
     const studio = source('components/DesktopStudioShell.tsx');
 
     expect(storage).toContain('const [error, setError] = useState<Error | null>(null)');
-    expect(storage).toContain('return { novels, loading, error, refresh, create, remove }');
-    expect(shell).toContain('!novelsLoading && novelsError && novels.length === 0');
-    expect(shell).toContain('!novelsLoading && !novelsError && novels.length === 0');
+    expect(storage).toContain('const [databaseIssue, setDatabaseIssue] = useState<LocalDatabaseIssueCode | null>(null)');
+    expect(storage).toContain('return { novels, loading, error, databaseIssue, refresh, create, remove }');
+    expect(shell).toContain('!novelsLoading && databaseIssueCopy && novels.length === 0');
+    expect(shell).toContain('!novelsLoading && !databaseIssueCopy && novelsError && novels.length === 0');
+    expect(shell).toContain('!novelsLoading && !databaseIssueCopy && !novelsError && novels.length === 0');
+    expect(studio).toContain('localDatabaseIssueCopy');
+    expect(studio).toContain('result.databaseIssue');
+    expect(studio).toContain('setCreateIssue(result.databaseIssue)');
+    expect(studio).toContain('const handleRetry = async () =>');
+    expect(studio).toContain('setCreateIssue(null)');
+    expect(studio).toContain('disabled={Boolean(activeIssue)}');
+    expect(shell).toContain('{t.toastRetry}');
     expect(shell).not.toContain('useEffect(() => {\n    refresh();\n  }, [refresh]);');
     expect(studio).not.toContain('useEffect(() => {\n    refresh();\n  }, [refresh]);');
   });

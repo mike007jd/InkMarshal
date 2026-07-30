@@ -30,6 +30,8 @@ interface ImportManuscriptEntryProps {
   variant?: React.ComponentProps<typeof Button>['variant'];
   /** Render only the icon (for compact menu placements). */
   iconOnly?: boolean;
+  /** Disable import when the local database is unavailable or incompatible. */
+  disabled?: boolean;
   /** Called after a successful import (host may refresh its own list). */
   onImported?: (novelId: string) => void;
 }
@@ -38,6 +40,7 @@ export function ImportManuscriptEntry({
   targetNovelId,
   variant = 'outline',
   iconOnly,
+  disabled,
   onImported,
 }: ImportManuscriptEntryProps) {
   const { locale } = useLanguage();
@@ -55,6 +58,7 @@ export function ImportManuscriptEntry({
       <Button
         type="button"
         variant={variant}
+        disabled={disabled}
         onClick={() => setOpen(true)}
         className="h-auto px-4 py-2"
         title={copy.entryLabel}

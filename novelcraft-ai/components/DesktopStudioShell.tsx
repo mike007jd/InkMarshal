@@ -8,15 +8,28 @@ import { ImportManuscriptEntry } from '@/components/studio/import/ImportManuscri
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
-import { useNovels } from '@/lib/use-storage';
+import {
+  localDatabaseIssueCopy,
+  useNovels,
+  type LocalDatabaseIssueCode,
+} from '@/lib/use-storage';
 
 export default function DesktopStudioShell() {
   const { t } = useLanguage();
   const { toast } = useToast();
   const router = useRouter();
-  const { create } = useNovels();
+  const { create, databaseIssue, refresh } = useNovels();
   const [creating, setCreating] = useState(false);
+  const [createIssue, setCreateIssue] = useState<LocalDatabaseIssueCode | null>(null);
   const creatingRef = useRef(false);
+
+  const activeIssue = createIssue ?? databaseIssue;
+  const issueCopy = activeIssue ? localDatabaseIssueCopy(t, activeIssue) : null;
+
+  const handleRetry = async () => {
+    setCreateIssue(null);
+    await refresh();
+  };
 
   const handleCreateNovel = async (mode: 'idea' | 'blank') => {
     if (creating) return;
@@ -24,7 +37,7 @@ export default function DesktopStudioShell() {
     creatingRef.current = true;
     setCreating(true);
     try {
-      const novel = await create(mode === 'blank'
+      const result = await create(mode === 'blank'
         ? {
             title: t.untitledNovel,
             genre: '',
@@ -36,13 +49,20 @@ export default function DesktopStudioShell() {
             genre: '',
             openingAssistantMessage: t.agentOpeningMessage,
           });
-      if (!novel?.id) {
+      if (!result.novel?.id) {
+        // Typed local-database failures stay inline so repeated create clicks
+        // do not accumulate identical generic toasts.
+        if (result.databaseIssue) {
+          setCreateIssue(result.databaseIssue);
+          return;
+        }
         toast(t.errorCreateNovel, 'error');
         return;
       }
+      setCreateIssue(null);
       router.push(mode === 'blank'
-        ? `/novel/${novel.id}?view=read-edit&chapter=1&edit=1`
-        : `/novel/${novel.id}?view=agent`);
+        ? `/novel/${result.novel.id}?view=read-edit&chapter=1&edit=1`
+        : `/novel/${result.novel.id}?view=agent`);
     } finally {
       creatingRef.current = false;
       setCreating(false);
@@ -56,12 +76,30 @@ export default function DesktopStudioShell() {
           <h1 className="font-serif text-2xl leading-tight text-book-ink-primary md:text-3xl">
             {t.agentNewChatTitle}
           </h1>
+          {issueCopy && (
+            <div
+              role="alert"
+              className="mt-6 w-full rounded-md border border-book-danger/40 bg-book-danger/5 px-4 py-3 text-left"
+            >
+              <p className="text-sm font-medium text-book-danger">{issueCopy.title}</p>
+              <p className="mt-1 text-sm text-book-ink-secondary">{issueCopy.body}</p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-3"
+                onClick={() => void handleRetry()}
+              >
+                {t.toastRetry}
+              </Button>
+            </div>
+          )}
           <div className="mt-8 flex flex-wrap justify-center gap-3">
             <Button
               type="button"
               variant="book"
               size="md"
-              disabled={creating}
+              disabled={creating || Boolean(activeIssue)}
               onClick={() => void handleCreateNovel('idea')}
               className="h-auto px-5 py-2.5"
             >
@@ -72,7 +110,7 @@ export default function DesktopStudioShell() {
               type="button"
               variant="outline"
               size="md"
-              disabled={creating}
+              disabled={creating || Boolean(activeIssue)}
               onClick={() => void handleCreateNovel('blank')}
               className="h-auto px-5 py-2.5"
             >
@@ -81,6 +119,7 @@ export default function DesktopStudioShell() {
             </Button>
             <ImportManuscriptEntry
               variant="outline"
+              disabled={Boolean(activeIssue)}
             />
           </div>
         </div>

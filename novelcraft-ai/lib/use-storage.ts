@@ -6,6 +6,60 @@ import type { CreateNovelRequest } from '@/lib/types/novel';
 import { getExampleById } from '@/lib/examples';
 import { isExampleNovelId } from '@/lib/examples/prefix';
 
+/** Stable local-database failure codes returned by authenticated desktop novel APIs. */
+export type LocalDatabaseIssueCode =
+  | 'DATABASE_BACKUP_REQUIRED'
+  | 'DATABASE_INCOMPATIBLE'
+  | 'DATABASE_NEWER_VERSION'
+  | 'DATABASE_UNAVAILABLE';
+
+const LOCAL_DATABASE_ISSUE_CODES = new Set<LocalDatabaseIssueCode>([
+  'DATABASE_BACKUP_REQUIRED',
+  'DATABASE_INCOMPATIBLE',
+  'DATABASE_NEWER_VERSION',
+  'DATABASE_UNAVAILABLE',
+]);
+
+function parseLocalDatabaseIssue(payload: unknown): LocalDatabaseIssueCode | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const code = (payload as { code?: unknown }).code;
+  if (typeof code !== 'string') return null;
+  return LOCAL_DATABASE_ISSUE_CODES.has(code as LocalDatabaseIssueCode)
+    ? (code as LocalDatabaseIssueCode)
+    : null;
+}
+
+export type CreateNovelResult = {
+  novel: Novel | null;
+  databaseIssue: LocalDatabaseIssueCode | null;
+};
+
+/** Localized actionable copy for a typed local-database failure code. */
+export function localDatabaseIssueCopy(
+  t: {
+    databaseBackupRequiredTitle: string;
+    databaseBackupRequiredBody: string;
+    databaseIncompatibleTitle: string;
+    databaseIncompatibleBody: string;
+    databaseNewerVersionTitle: string;
+    databaseNewerVersionBody: string;
+    databaseUnavailableTitle: string;
+    databaseUnavailableBody: string;
+  },
+  code: LocalDatabaseIssueCode,
+): { title: string; body: string } {
+  if (code === 'DATABASE_BACKUP_REQUIRED') {
+    return { title: t.databaseBackupRequiredTitle, body: t.databaseBackupRequiredBody };
+  }
+  if (code === 'DATABASE_NEWER_VERSION') {
+    return { title: t.databaseNewerVersionTitle, body: t.databaseNewerVersionBody };
+  }
+  if (code === 'DATABASE_UNAVAILABLE') {
+    return { title: t.databaseUnavailableTitle, body: t.databaseUnavailableBody };
+  }
+  return { title: t.databaseIncompatibleTitle, body: t.databaseIncompatibleBody };
+}
+
 /** Same-document fan-out after a successful novel PATCH so list subscribers converge. */
 export const NOVEL_UPDATED_EVENT = 'inkmarshal:novel-updated';
 
@@ -43,6 +97,7 @@ export function useNovels() {
   const [novels, setNovels] = useState<Novel[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const [databaseIssue, setDatabaseIssue] = useState<LocalDatabaseIssueCode | null>(null);
   const refreshSeqRef = useRef(0);
   const updateVersionRef = useRef(0);
   const pendingUpdatesRef = useRef(
@@ -56,9 +111,20 @@ export function useNovels() {
     setError(null);
     try {
       const res = await fetch('/api/novels');
-      if (!res.ok) throw new Error(`GET /api/novels ${res.status}`);
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        const issue = parseLocalDatabaseIssue(payload);
+        if (refreshSeqRef.current !== seq) return;
+        setDatabaseIssue(issue);
+        throw new Error(
+          issue
+            ? `GET /api/novels ${res.status} ${issue}`
+            : `GET /api/novels ${res.status}`,
+        );
+      }
       const fetched = await res.json() as Novel[];
       if (refreshSeqRef.current !== seq) return;
+      setDatabaseIssue(null);
       let merged = fetched;
       for (const pending of pendingUpdatesRef.current.values()) {
         // Only events that arrived after this GET began can be newer than its
@@ -108,20 +174,31 @@ export function useNovels() {
     return () => window.removeEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated);
   }, []);
   const create = useCallback(
-    async (data: CreateNovelRequest = {}): Promise<Novel | null> => {
+    async (data: CreateNovelRequest = {}): Promise<CreateNovelResult> => {
+      let databaseIssue: LocalDatabaseIssueCode | null = null;
       try {
         const res = await fetch('/api/novels', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(data),
         });
-        if (!res.ok) throw new Error(`POST /api/novels ${res.status}`);
+        if (!res.ok) {
+          const payload = await res.json().catch(() => null);
+          databaseIssue = parseLocalDatabaseIssue(payload);
+          if (databaseIssue) setDatabaseIssue(databaseIssue);
+          throw new Error(
+            databaseIssue
+              ? `POST /api/novels ${res.status} ${databaseIssue}`
+              : `POST /api/novels ${res.status}`,
+          );
+        }
         const novel: Novel = await res.json();
+        setDatabaseIssue(null);
         await refresh();
-        return novel;
+        return { novel, databaseIssue: null };
       } catch (err) {
         console.error('[useNovels] create failed:', err);
-        return null;
+        return { novel: null, databaseIssue };
       }
     },
     [refresh],
@@ -142,7 +219,7 @@ export function useNovels() {
     [refresh],
   );
 
-  return { novels, loading, error, refresh, create, remove };
+  return { novels, loading, error, databaseIssue, refresh, create, remove };
 }
 
 export function useNovel(novelId: string | undefined) {

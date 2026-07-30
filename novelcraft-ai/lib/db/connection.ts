@@ -4,7 +4,14 @@
 // the DB from client code" convention into an enforced module boundary (Phase 2).
 import 'server-only';
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import path from 'node:path';
 import { nowIso } from '@/lib/utils';
 import { LOCAL_USER_ID, LOCAL_USER_EMAIL } from '@/lib/local-user';
@@ -12,6 +19,8 @@ import { resolveLocalDbPath } from '@/lib/db-local-path';
 import {
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
+  LocalDatabaseUnavailableError,
+  PreMigrationBackupRequiredError,
   ensureCurrentSchema,
   initializeCurrentSchema,
   inspectSchemaOpenPlan,
@@ -53,32 +62,100 @@ function applyConnectionPragmas(db: Database.Database): void {
   db.pragma('temp_store = MEMORY');
 }
 
+function sourceDatabaseFileState(dbPath: string): string {
+  return [dbPath, `${dbPath}-wal`].map(filePath => {
+    if (!existsSync(/*turbopackIgnore: true*/ filePath)) return 'absent';
+    const stat = statSync(/*turbopackIgnore: true*/ filePath, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  }).join('|');
+}
+
+function copySnapshotFile(source: string, destination: string): void {
+  const result = spawnSync('/bin/cp', ['-p', source, destination], {
+    encoding: 'utf8',
+    shell: false,
+  });
+  if (result.status !== 0) {
+    throw new Error(`Database snapshot copy failed with exit code ${result.status ?? 'unknown'}.`);
+  }
+}
+
+/** @internal Exported only for the WAL checkpoint race regression test. */
+export function inspectExistingDatabaseWithoutTouchingSource(
+  dbPath: string,
+  afterMainCopy?: () => void,
+): string {
+  // The published desktop target is macOS; keep the trace root literal so the
+  // bundled Next server does not pull the repository into its NFT file list.
+  const snapshotDir = mkdtempSync('/tmp/inkmarshal-db-inspection-');
+  const snapshotPath = `${snapshotDir}${path.sep}inkmarshal.db`;
+  try {
+    const walPath = `${dbPath}-wal`;
+    const snapshotWalPath = `${snapshotPath}-wal`;
+    let stableSnapshot = false;
+    let stableSourceState = '';
+    for (let attempt = 0; attempt < 3 && !stableSnapshot; attempt += 1) {
+      const sourceStateBefore = sourceDatabaseFileState(dbPath);
+      rmSync(/*turbopackIgnore: true*/ snapshotPath, { force: true });
+      rmSync(/*turbopackIgnore: true*/ snapshotWalPath, { force: true });
+      try {
+        copySnapshotFile(dbPath, snapshotPath);
+        afterMainCopy?.();
+        if (existsSync(/*turbopackIgnore: true*/ walPath)) {
+          copySnapshotFile(walPath, snapshotWalPath);
+        }
+      } catch {
+        continue;
+      }
+      const sourceStateAfter = sourceDatabaseFileState(dbPath);
+      stableSnapshot = sourceStateBefore === sourceStateAfter;
+      if (stableSnapshot) stableSourceState = sourceStateAfter;
+    }
+    if (!stableSnapshot) {
+      throw new LocalDatabaseUnavailableError(
+        'InkMarshal could not capture a stable read-only database snapshot for compatibility inspection.',
+      );
+    }
+    const verifier = new Database(snapshotPath, { readonly: true, fileMustExist: true });
+    try {
+      inspectSchemaOpenPlan(verifier);
+    } finally {
+      verifier.close();
+    }
+    return stableSourceState;
+  } finally {
+    rmSync(/*turbopackIgnore: true*/ snapshotDir, { recursive: true, force: true });
+  }
+}
+
 export function getDb(): Database.Database {
   if (_db) return _db;
   assertDbRuntimeAllowed();
   const dbPath = resolveLocalDbPath();
   let db: Database.Database | undefined;
+  let inspectedSourceState: string | null = null;
   try {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     const hasExistingDatabase = existsSync(dbPath) && statSync(dbPath).size > 0;
     if (hasExistingDatabase) {
-      // Classify on a readonly handle first so unsupported databases fail closed
-      // without creating WAL/SHM sidecars or rewriting published bytes.
-      const verifier = new Database(dbPath, { readonly: true, fileMustExist: true });
-      try {
-        inspectSchemaOpenPlan(verifier);
-      } finally {
-        verifier.close();
-      }
+      // Inspect a byte-for-byte main/WAL snapshot. SQLite may create or update
+      // shared-memory sidecars even for readonly WAL connections, so the
+      // published source directory must not be opened during fail-closed checks.
+      inspectedSourceState = inspectExistingDatabaseWithoutTouchingSource(dbPath);
     }
 
+    if (inspectedSourceState && inspectedSourceState !== sourceDatabaseFileState(dbPath)) {
+      throw new LocalDatabaseUnavailableError(
+        'InkMarshal local database changed after compatibility inspection; retrying is safe.',
+      );
+    }
     db = new Database(dbPath);
-    applyConnectionPragmas(db);
     if (hasExistingDatabase) {
       ensureCurrentSchema(db);
     } else {
       initializeCurrentSchema(db);
     }
+    applyConnectionPragmas(db);
     seedLocalUser(db);
     seedPromptTemplates(db);
   } catch (e) {
@@ -89,9 +166,10 @@ export function getDb(): Database.Database {
     // read/write touched an unsupported on-disk shape.
     if (
       e instanceof DatabaseFromNewerAppVersionError ||
-      e instanceof IncompatibleDatabaseSchemaError
+      e instanceof IncompatibleDatabaseSchemaError ||
+      e instanceof PreMigrationBackupRequiredError
     ) throw e;
-    throw new Error(
+    throw new LocalDatabaseUnavailableError(
       `InkMarshal: could not open local database at ${dbPath}: ${(e as Error).message}`,
       { cause: e },
     );
