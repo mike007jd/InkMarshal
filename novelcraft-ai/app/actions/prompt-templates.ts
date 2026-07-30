@@ -13,7 +13,11 @@
 
 import { getUser } from '@/lib/local-auth';
 import { getDb } from '@/lib/db/connection';
-import { getActiveNovels, updateNovel, verifyNovelOwnership } from '@/lib/db/queries-novel';
+import {
+  getActiveNovels,
+  patchNovelSettings,
+  verifyNovelOwnership,
+} from '@/lib/db/queries-novel';
 import { nowIso } from '@/lib/utils';
 import { applyGenrePack, listGenrePacks } from '@/lib/prompt-genre-packs';
 import {
@@ -484,12 +488,13 @@ export async function novelsReferencingVariant(variant: string): Promise<Array<{
  */
 export async function setNovelVariant(novelId: string, variant: string): Promise<void> {
   const userId = await requireUser();
-  const novel = await verifyNovelOwnership(novelId, userId);
+  await verifyNovelOwnership(novelId, userId);
   if (variant) assertVariant(variant);
-  const settings = { ...(novel.settings ?? {}) };
-  if (variant) settings.promptVariant = variant;
-  else delete settings.promptVariant;
-  await updateNovel(novelId, { settings });
+  await patchNovelSettings(
+    novelId,
+    variant ? { promptVariant: variant } : {},
+    variant ? [] : ['promptVariant'],
+  );
 }
 
 // ── Pack import / export ─────────────────────────────────────────────────────

@@ -107,7 +107,14 @@ export interface ImportMeta {
   importedAt: string;
   originalFilename: string;
   detectedChapters: number;
-  kbExtraction?: 'pending' | 'done' | 'failed';
+  kbExtraction?: 'pending' | 'running' | 'done' | 'failed';
+  /** Fences the optional async extraction to the import generation that launched it. */
+  kbExtractionId?: string;
+  /** Attempt lease prevents duplicate requests within one import generation. */
+  kbExtractionAttemptId?: string;
+  kbExtractionLeaseExpiresAt?: string;
+  /** Durable per-generation slots make crash recovery idempotent. */
+  kbExtractionCompletedSlots?: string[];
 }
 
 /** Front/back-matter section toggle for the publishing workspace. */

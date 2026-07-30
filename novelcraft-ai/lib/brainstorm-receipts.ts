@@ -1214,6 +1214,20 @@ export async function undoBrainstormReceipt(
         if (!current || !sameKnowledgeEntry(current, mutation.after)) {
           throw Object.assign(new Error('conflict'), { reason: 'conflict' as const });
         }
+        if (!mutation.before) {
+          // Brainstorm tools never create relations, so a receipt-created entry's
+          // authoritative completion baseline is empty. Any live relation was
+          // added later and must block the cascading entry delete.
+          const laterRelation = db.prepare(
+            `SELECT 1
+               FROM knowledge_relations
+              WHERE source_id = ? OR target_id = ?
+              LIMIT 1`,
+          ).get(mutation.after.id, mutation.after.id);
+          if (laterRelation) {
+            throw Object.assign(new Error('conflict'), { reason: 'conflict' as const });
+          }
+        }
       }
 
       let inversesApplied = 0;

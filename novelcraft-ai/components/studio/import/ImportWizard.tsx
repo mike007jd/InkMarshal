@@ -310,7 +310,15 @@ function ImportWizardBody({
 
       // Fire-and-forget KB extraction — never blocks navigation. Progress is
       // surfaced via toasts.
-      if (runKb) void runKbExtraction(result.novelId, locale, copy, toast);
+      if (runKb && result.kbExtractionId) {
+        void runKbExtraction(
+          result.novelId,
+          result.kbExtractionId,
+          locale,
+          copy,
+          toast,
+        );
+      }
     } catch {
       setError(copy.importFailed);
     } finally {
@@ -618,6 +626,7 @@ async function fetchDedupeReport(
 
 async function runKbExtraction(
   novelId: string,
+  kbExtractionId: string,
   locale: string,
   copy: ReturnType<typeof importCopy>,
   toast: (message: string, type?: 'success' | 'error' | 'info') => void,
@@ -627,14 +636,19 @@ async function runKbExtraction(
     const headers = await buildAIRequestHeaders(locale, 'summarize');
     const res = await fetch(`/api/novels/${novelId}/import/extract-knowledge`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({}),
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ kbExtractionId }),
     });
     if (!res.ok) {
       toast(copy.kbFailed, 'info');
       return;
     }
     const data = (await res.json()) as { outcome: string; created: number };
+    if (
+      data.outcome === 'superseded'
+      || data.outcome === 'in_progress'
+      || data.outcome === 'already_done'
+    ) return;
     if (data.outcome === 'done') toast(copy.kbDone(data.created), 'success');
     else toast(copy.kbFailed, 'info');
   } catch {

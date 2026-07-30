@@ -12,7 +12,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { strFromU8, unzipSync } from 'fflate';
+import { crc32, deflateRawSync } from 'node:zlib';
+import { strFromU8, unzipSync, Zip, ZipDeflate } from 'fflate';
 import { LOCAL_USER_ID } from '@/lib/local-user';
 
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;
@@ -1068,6 +1069,125 @@ describe('published 1.x backward compatibility', () => {
 });
 
 describe('verify — ZIP resource guard', () => {
+  it('rejects a valid backup whose local and central headers conceal oversized DEFLATE output', async () => {
+    const { db, extract, build, verify } = await mods();
+    const novel = await db.createNovel({
+      userId: LOCAL_USER_ID,
+      title: 'Concealed ZIP bomb',
+    });
+    const packaged = await build.buildBackupPackage(
+      await extract.extractBackupBundle(novel.id),
+    );
+    const entries = unzipSync(packaged.bytes);
+    const concealed = compressedZeroPayload(64 * 1024 * 1024 + 1);
+
+    // fflate trusts the declared 1-byte output buffer and truncates the real
+    // stream to one zero byte. Give that unsafe legacy result a valid package
+    // checksum so only the ZIP resource guard can reject the archive.
+    const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+      sha256: Record<string, string>;
+    };
+    manifest.sha256['bomb.bin'] = await build.sha256Hex(new Uint8Array([0]));
+    entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+
+    const bytes = craftStoredZip([
+      ...Object.entries(entries).map(([name, data]) => ({ name, data })),
+      {
+        name: 'bomb.bin',
+        data: concealed.data,
+        declaredUncompressedSize: 1,
+        method: 8 as const,
+        crc: concealed.crc,
+      },
+    ]);
+    expect(bytes.byteLength).toBeLessThan(100_000);
+
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'zip_entry_too_large',
+      ref: 'bomb.bin',
+    }));
+    expect(report.bundle).toBeNull();
+  });
+
+  it('rejects a checksum-valid package when DEFLATE output length contradicts both headers', async () => {
+    const { db, extract, build, verify } = await mods();
+    const novel = await db.createNovel({
+      userId: LOCAL_USER_ID,
+      title: 'Concealed ZIP length',
+    });
+    const packaged = await build.buildBackupPackage(
+      await extract.extractBackupBundle(novel.id),
+    );
+    const entries = unzipSync(packaged.bytes);
+    const concealed = compressedZeroPayload(1024);
+    const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+      sha256: Record<string, string>;
+    };
+    manifest.sha256['concealed.bin'] = await build.sha256Hex(new Uint8Array([0]));
+    entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+
+    const report = await verify.verifyBackupPackage(craftStoredZip([
+      ...Object.entries(entries).map(([name, data]) => ({ name, data })),
+      {
+        name: 'concealed.bin',
+        data: concealed.data,
+        declaredUncompressedSize: 1,
+        method: 8 as const,
+        crc: concealed.crc,
+      },
+    ]));
+
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({ code: 'not_a_zip' }));
+    expect(report.bundle).toBeNull();
+  });
+
+  it('rejects a package whose local and central CRC agree but do not match the payload', async () => {
+    const { db, extract, build, verify } = await mods();
+    const novel = await db.createNovel({
+      userId: LOCAL_USER_ID,
+      title: 'Invalid ZIP CRC',
+    });
+    const packaged = await build.buildBackupPackage(
+      await extract.extractBackupBundle(novel.id),
+    );
+    const entries = unzipSync(packaged.bytes);
+    const wrongCrc = (crc32(entries['manifest.json']) ^ 1) >>> 0;
+
+    const report = await verify.verifyBackupPackage(craftStoredZip(
+      Object.entries(entries).map(([name, data]) => ({
+        name,
+        data,
+        crc: name === 'manifest.json' ? wrongCrc : undefined,
+      })),
+    ));
+
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({ code: 'not_a_zip' }));
+    expect(report.bundle).toBeNull();
+  });
+
+  it('accepts a valid backup written with signed data descriptors', async () => {
+    const { db, extract, build, verify } = await mods();
+    const novel = await db.createNovel({
+      userId: LOCAL_USER_ID,
+      title: 'Streamed backup',
+    });
+    const packaged = await build.buildBackupPackage(
+      await extract.extractBackupBundle(novel.id),
+    );
+    const bytes = zipWithDataDescriptors(unzipSync(packaged.bytes));
+    expect(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(6, true) & 0x0008)
+      .toBe(0x0008);
+
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(true);
+    expect(report.errors).toHaveLength(0);
+    expect(report.bundle?.novel.title).toBe('Streamed backup');
+  });
+
   it('rejects archives that exceed the entry-count hard limit', async () => {
     const { verify } = await mods();
     const files: Record<string, Uint8Array> = {};
@@ -1105,15 +1225,49 @@ describe('verify — ZIP resource guard', () => {
     const { verify } = await mods();
     const perEntry = 64 * 1024 * 1024;
     const bytes = craftStoredZip([
-      { name: 'a.bin', data: new Uint8Array([1]), declaredUncompressedSize: perEntry },
-      { name: 'b.bin', data: new Uint8Array([2]), declaredUncompressedSize: perEntry },
-      { name: 'c.bin', data: new Uint8Array([3]), declaredUncompressedSize: perEntry },
-      { name: 'd.bin', data: new Uint8Array([4]), declaredUncompressedSize: perEntry },
-      { name: 'e.bin', data: new Uint8Array([5]), declaredUncompressedSize: 1 },
+      { name: 'a.bin', data: new Uint8Array([1]), declaredUncompressedSize: perEntry, method: 8 },
+      { name: 'b.bin', data: new Uint8Array([2]), declaredUncompressedSize: perEntry, method: 8 },
+      { name: 'c.bin', data: new Uint8Array([3]), declaredUncompressedSize: perEntry, method: 8 },
+      { name: 'd.bin', data: new Uint8Array([4]), declaredUncompressedSize: perEntry, method: 8 },
+      { name: 'e.bin', data: new Uint8Array([5]), declaredUncompressedSize: 1, method: 8 },
     ]);
     const report = await verify.verifyBackupPackage(bytes);
     expect(report.ok).toBe(false);
     expect(report.errors).toContainEqual(expect.objectContaining({ code: 'zip_total_too_large' }));
+  });
+
+  it('stops when actual DEFLATE output exceeds the total cap despite legal declared metadata', async () => {
+    const { verify } = await mods();
+    const perEntry = 64 * 1024 * 1024;
+    const full = compressedZeroPayload(perEntry);
+    const oneByte = compressedZeroPayload(1);
+    const bytes = craftStoredZip([
+      ...['a.bin', 'b.bin', 'c.bin', 'd.bin'].map(name => ({
+        name,
+        data: full.data,
+        declaredUncompressedSize: perEntry,
+        method: 8 as const,
+        crc: full.crc,
+      })),
+      {
+        name: 'overflow.bin',
+        data: oneByte.data,
+        // The declared aggregate is exactly 256 MiB. Only measured output can
+        // reveal this final byte crossing the archive-wide budget.
+        declaredUncompressedSize: 0,
+        method: 8 as const,
+        crc: oneByte.crc,
+      },
+    ]);
+    expect(bytes.byteLength).toBeLessThan(300_000);
+
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'zip_total_too_large',
+      ref: 'overflow.bin',
+    }));
+    expect(report.bundle).toBeNull();
   });
 
   it('rejects duplicate entry names when constructible', async () => {
@@ -1160,6 +1314,7 @@ function craftStoredZip(
     data: Uint8Array;
     declaredUncompressedSize?: number;
     method?: 0 | 8;
+    crc?: number;
   }>,
 ): Uint8Array {
   const localParts: Uint8Array[] = [];
@@ -1171,11 +1326,13 @@ function craftStoredZip(
     const data = file.data;
     const declared = file.declaredUncompressedSize ?? data.length;
     const method = file.method ?? 0;
+    const checksum = file.crc ?? (method === 0 ? crc32(data) : 0);
 
     const local = new Uint8Array(30 + nameBytes.length + data.length);
     const lv = new DataView(local.buffer);
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(8, method, true);
+    lv.setUint32(14, checksum, true);
     lv.setUint32(18, data.length, true); // compressed size
     lv.setUint32(22, declared, true); // uncompressed size (may be lied)
     lv.setUint16(26, nameBytes.length, true);
@@ -1187,6 +1344,7 @@ function craftStoredZip(
     const cv = new DataView(central.buffer);
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(10, method, true);
+    cv.setUint32(16, checksum, true);
     cv.setUint32(20, data.length, true);
     cv.setUint32(24, declared, true);
     cv.setUint16(28, nameBytes.length, true);
@@ -1221,4 +1379,40 @@ function craftStoredZip(
   }
   out.set(end, o);
   return out;
+}
+
+function compressedZeroPayload(size: number): { data: Uint8Array; crc: number } {
+  const payload = Buffer.alloc(size);
+  return {
+    data: deflateRawSync(payload, { level: 9 }),
+    crc: crc32(payload),
+  };
+}
+
+function zipWithDataDescriptors(entries: Record<string, Uint8Array>): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  let archiveError: Error | null = null;
+  const archive = new Zip((error, chunk) => {
+    if (error) {
+      archiveError = error;
+      return;
+    }
+    chunks.push(chunk);
+  });
+  for (const [name, bytes] of Object.entries(entries)) {
+    const entry = new ZipDeflate(name, { level: 6 });
+    archive.add(entry);
+    entry.push(bytes, true);
+  }
+  archive.end();
+  if (archiveError) throw archiveError;
+
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }

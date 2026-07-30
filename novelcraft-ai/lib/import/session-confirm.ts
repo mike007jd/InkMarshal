@@ -12,7 +12,7 @@ import { appendSafetySnapshot } from '@/lib/db/queries-chapter';
 import { recordActivityEvent } from '@/lib/db/queries-activity';
 import { touchNovelUpdatedAt } from '@/lib/db/transactions';
 import { toJsonText } from '@/lib/db/json-columns';
-import { countWords, nowIso } from '@/lib/utils';
+import { countWords, isUuid, nowIso } from '@/lib/utils';
 import {
   consentContentFingerprint,
   dedupeCandidates,
@@ -73,6 +73,8 @@ export interface ConfirmImportSessionResult {
   novelId: string;
   importedChapters: number;
   skippedChapters: number;
+  /** Opaque generation fence for the optional asynchronous KB extraction. */
+  kbExtractionId?: string;
 }
 
 function canonicalJson(value: unknown): string {
@@ -237,6 +239,10 @@ function parseStoredResult(raw: string | null): ConfirmImportSessionResult {
     typeof parsed.novelId !== 'string'
     || !Number.isInteger(parsed.importedChapters)
     || !Number.isInteger(parsed.skippedChapters)
+    || (
+      parsed.kbExtractionId !== undefined
+      && !isUuid(parsed.kbExtractionId)
+    )
   ) {
     throw new Error('Import confirmation result is corrupt.');
   }
@@ -625,6 +631,9 @@ export async function confirmImportSession(
         }
       }
 
+      const kbExtractionId = input.runKbExtraction
+        ? crypto.randomUUID()
+        : undefined;
       const settings = {
         ...baseSettings,
         importMeta: {
@@ -632,7 +641,12 @@ export async function confirmImportSession(
           importedAt: now,
           originalFilename: session.filename,
           detectedChapters: imported,
-          ...(input.runKbExtraction ? { kbExtraction: 'pending' as const } : {}),
+          ...(kbExtractionId
+            ? {
+                kbExtraction: 'pending' as const,
+                kbExtractionId,
+              }
+            : {}),
         },
       };
       db.prepare(
@@ -644,6 +658,7 @@ export async function confirmImportSession(
         novelId,
         importedChapters: imported,
         skippedChapters: skipped,
+        ...(kbExtractionId ? { kbExtractionId } : {}),
       };
       db.prepare(
         `UPDATE import_confirmations

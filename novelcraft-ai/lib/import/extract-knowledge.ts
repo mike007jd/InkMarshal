@@ -12,23 +12,29 @@
 //                                       already committed stay (they're valid).
 //
 // The detector + chapter write are the load-bearing import; THIS is best-effort
-// enrichment. importMeta.kbExtraction tracks pending → done|failed.
+// enrichment. importMeta.kbExtraction tracks pending → running → done|failed.
 
 import type { LanguageModel } from 'ai';
 
 import { extractEntryFromMessageResult } from '@/lib/ai/conversation-extract';
 import { extractStyleNotesResult, formatStyleNotes } from '@/lib/ai/style-extractor';
-import { createKnowledgeEntry } from '@/app/actions/knowledge';
+import { createKnowledgeEntryForImportGeneration } from '@/app/actions/knowledge';
 import {
   createKnowledgeEntrySchema,
   type KnowledgeType,
 } from '@/lib/types/knowledge';
 import type { ExtractedEntry } from '@/lib/ai/conversation-extract';
 
-export type KbExtractionOutcome = 'done' | 'failed' | 'cancelled';
+export type KbExtractionOutcome = 'done' | 'failed' | 'cancelled' | 'superseded';
 
 export interface ExtractKnowledgeArgs {
   novelId: string;
+  /** Opaque import generation that must still be current for every DB write. */
+  kbExtractionId: string;
+  /** Per-request lease owner within the import generation. */
+  kbExtractionAttemptId: string;
+  /** Slots committed by a previous crashed attempt in the same generation. */
+  completedSlots?: readonly string[];
   /** Chapter prose in order. We sample, not exhaustively scan — see SAMPLE_*. */
   chapters: { title: string; content: string }[];
   model: LanguageModel;
@@ -54,6 +60,13 @@ class AbortError extends Error {
   constructor() {
     super('aborted');
     this.name = 'AbortError';
+  }
+}
+
+class SupersededExtractionError extends Error {
+  constructor() {
+    super('superseded');
+    this.name = 'SupersededExtractionError';
   }
 }
 
@@ -174,6 +187,7 @@ export async function extractKnowledgeFromManuscript(
   // every attempted write failed and nothing was created, surface 'failed'.
   let persistFailures = 0;
   let attemptedWrites = 0;
+  const completedSlots = new Set(args.completedSlots ?? []);
   // Dedup by (type,title) so the same character introduced across two sampled
   // chapters isn't written twice.
   const seen = new Set<string>();
@@ -181,46 +195,61 @@ export async function extractKnowledgeFromManuscript(
   /** Apply one tryCreate result to the running counters. */
   const apply = (res: TryCreateResult) => {
     if (res.status === 'created') created++;
-    else if (res.status === 'persist-failed') {
+    else if (res.status === 'superseded') {
+      throw new SupersededExtractionError();
+    } else if (res.status === 'persist-failed') {
       persistFailures++;
       attemptedWrites++;
     }
     // 'skipped' (validation error) is a safe no-op for a single bad entry.
+    // 'replayed' means an earlier attempt already committed this durable slot.
   };
 
   try {
     // 1. Style reference from the opening prose.
-    throwIfAborted(args.signal);
-    const styleSample = args.chapters
-      .map(c => c.content)
-      .join('\n\n')
-      .slice(0, STYLE_SAMPLE_CHARS);
-    const styleResult = await extractStyleNotesResult({
-      sampleText: styleSample,
-      model: args.model,
-      locale: args.locale,
-      signal: args.signal,
-    });
-    if (styleResult.ok) {
-      const notes = formatStyleNotes(styleResult.notes, args.locale);
-      if (notes.trim()) {
-        const input = {
-          type: 'style_reference' as const,
-          title: deriveStyleTitle(args.locale),
-          tags: [],
-          data: {
-            sampleText: styleSample.slice(0, 5_000),
-            styleNotes: notes.slice(0, 2_000),
-            source: 'imported manuscript',
-          },
-        };
-        apply(await tryCreate(args.novelId, input));
+    if (!completedSlots.has('style')) {
+      throwIfAborted(args.signal);
+      const styleSample = args.chapters
+        .map(c => c.content)
+        .join('\n\n')
+        .slice(0, STYLE_SAMPLE_CHARS);
+      const styleResult = await extractStyleNotesResult({
+        sampleText: styleSample,
+        model: args.model,
+        locale: args.locale,
+        signal: args.signal,
+      });
+      throwIfAborted(args.signal);
+      if (styleResult.ok) {
+        const notes = formatStyleNotes(styleResult.notes, args.locale);
+        if (notes.trim()) {
+          const input = {
+            type: 'style_reference' as const,
+            title: deriveStyleTitle(args.locale),
+            tags: [],
+            data: {
+              sampleText: styleSample.slice(0, 5_000),
+              styleNotes: notes.slice(0, 2_000),
+              source: 'imported manuscript',
+            },
+          };
+          apply(await tryCreate(
+            args.novelId,
+            args.kbExtractionId,
+            args.kbExtractionAttemptId,
+            'style',
+            args.signal,
+            input,
+          ));
+        }
       }
     }
 
     // 2. Character / world / timeline entries from sampled chunks.
     const chunks = buildSampleChunks(args.chapters);
-    for (const chunk of chunks) {
+    for (const [chunkIndex, chunk] of chunks.entries()) {
+      const slot = `chunk:${chunkIndex}`;
+      if (completedSlots.has(slot)) continue;
       throwIfAborted(args.signal);
       if (created >= MAX_ENTRIES) break;
       const result = await extractEntryFromMessageResult({
@@ -229,13 +258,21 @@ export async function extractKnowledgeFromManuscript(
         locale: args.locale,
         signal: args.signal,
       });
+      throwIfAborted(args.signal);
       if (!result.ok) continue;
       const coerced = coerceEntryInput(result.entry);
       if (!coerced) continue;
       const key = `${coerced.type}:${coerced.title.trim().toLowerCase()}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      apply(await tryCreate(args.novelId, coerced));
+      apply(await tryCreate(
+        args.novelId,
+        args.kbExtractionId,
+        args.kbExtractionAttemptId,
+        slot,
+        args.signal,
+        coerced,
+      ));
     }
 
     // If nothing was created AND every attempted write failed at the persistence
@@ -249,18 +286,33 @@ export async function extractKnowledgeFromManuscript(
     if (err instanceof Error && err.name === 'AbortError') {
       return { outcome: 'cancelled', created };
     }
+    if (err instanceof Error && err.name === 'SupersededExtractionError') {
+      return { outcome: 'superseded', created };
+    }
     // Any other failure → degrade. Partial entries already written stay.
     return { outcome: 'failed', created };
   }
 }
 
-type TryCreateResult = { status: 'created' } | { status: 'skipped' } | { status: 'persist-failed' };
+type TryCreateResult =
+  | { status: 'created' }
+  | { status: 'replayed' }
+  | { status: 'skipped' }
+  | { status: 'persist-failed' }
+  | { status: 'superseded' };
 
 /** Validate against the strict schema and create. A validation failure (bad
  *  entry shape) returns 'skipped' so one bad entry never aborts the whole
  *  extraction. A persistence failure (DB/IO) returns 'persist-failed' so the
  *  caller can detect a total outage instead of a silent 0-created 'done'. */
-async function tryCreate(novelId: string, input: unknown): Promise<TryCreateResult> {
+async function tryCreate(
+  novelId: string,
+  kbExtractionId: string,
+  kbExtractionAttemptId: string,
+  slot: string,
+  signal: AbortSignal | undefined,
+  input: unknown,
+): Promise<TryCreateResult> {
   let parsed: unknown;
   try {
     parsed = createKnowledgeEntrySchema.parse(input);
@@ -269,9 +321,18 @@ async function tryCreate(novelId: string, input: unknown): Promise<TryCreateResu
     return { status: 'skipped' };
   }
   try {
-    await createKnowledgeEntry(novelId, parsed);
-    return { status: 'created' };
-  } catch {
+    throwIfAborted(signal);
+    const created = await createKnowledgeEntryForImportGeneration(
+      novelId,
+      kbExtractionId,
+      kbExtractionAttemptId,
+      slot,
+      parsed,
+    );
+    if (!created) return { status: 'superseded' };
+    return created.created ? { status: 'created' } : { status: 'replayed' };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error;
     // Persistence error — distinct from a validation skip so a total outage
     // is not masked as an empty success.
     return { status: 'persist-failed' };

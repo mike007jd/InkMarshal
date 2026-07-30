@@ -2,7 +2,8 @@ import { getDb } from '@/lib/db/connection';
 import { touchNovelUpdatedAt } from '@/lib/db/transactions';
 import { nowIso } from '@/lib/utils';
 import { upsertKnowledgeIndex, type KnowledgeIndexInsert } from '@/lib/db/queries-vault';
-import { SAFE_DATA_JSON } from '@/lib/db/json-columns';
+import { SAFE_DATA_JSON, toJsonText } from '@/lib/db/json-columns';
+import type { NovelSettings } from '@/lib/db-types';
 import {
   enqueueKnowledgeVaultDelete,
   enqueueKnowledgeVaultUpsert,
@@ -38,6 +39,23 @@ export interface KnowledgeRelationRow {
   label: string;
   created_at: string;
 }
+
+export interface KnowledgeEntryInsert {
+  id: string;
+  novelId: string;
+  type: string;
+  title: string;
+  summary: string;
+  data: string;
+  sortOrder: number;
+  tags: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ImportGenerationKnowledgeWriteResult =
+  | { status: 'created'; entry: KnowledgeEntryRow }
+  | { status: 'replayed' };
 
 export async function getKnowledgeEntries(
   novelId: string,
@@ -78,18 +96,9 @@ export async function getKnowledgeEntryById(id: string): Promise<KnowledgeEntryR
     .get(id) as KnowledgeEntryRow | undefined;
 }
 
-export async function createKnowledgeEntry(data: {
-  id: string;
-  novelId: string;
-  type: string;
-  title: string;
-  summary: string;
-  data: string;
-  sortOrder: number;
-  tags: string;
-  createdAt: string;
-  updatedAt: string;
-}): Promise<KnowledgeEntryRow> {
+export async function createKnowledgeEntry(
+  data: KnowledgeEntryInsert,
+): Promise<KnowledgeEntryRow> {
   const db = getDb();
   db.prepare(
     `INSERT INTO knowledge_entries (id, novel_id, type, title, summary, data, sort_order, tags, created_at, updated_at)
@@ -113,51 +122,124 @@ export async function createKnowledgeEntry(data: {
 }
 
 export async function createKnowledgeEntryWithIndex(
-  data: {
-    id: string;
-    novelId: string;
-    type: string;
-    title: string;
-    summary: string;
-    data: string;
-    sortOrder: number;
-    tags: string;
-    createdAt: string;
-    updatedAt: string;
-  },
+  data: KnowledgeEntryInsert,
   index: KnowledgeIndexInsert,
 ): Promise<KnowledgeEntryRow> {
   const db = getDb();
-  const insertEntry = db.prepare(
-    `INSERT INTO knowledge_entries (id, novel_id, type, title, summary, data, sort_order, tags, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
   const tx = db.transaction(() => {
-    insertEntry.run(
-      data.id,
-      data.novelId,
-      data.type,
-      data.title,
-      data.summary,
-      data.data,
-      data.sortOrder,
-      data.tags,
-      data.createdAt,
-      data.updatedAt,
-    );
-    upsertKnowledgeIndex(db, index);
-    enqueueKnowledgeVaultUpsert(db, {
-      entryId: index.id,
-      novelId: index.novelId,
-      relPath: index.path,
-      updatedAt: data.updatedAt,
-    });
-    touchNovelUpdatedAt(db, data.novelId);
+    insertKnowledgeEntryWithIndex(db, data, index);
   });
   tx();
   return db
     .prepare('SELECT * FROM knowledge_entries WHERE id = ?')
     .get(data.id) as KnowledgeEntryRow;
+}
+
+function insertKnowledgeEntryWithIndex(
+  db: ReturnType<typeof getDb>,
+  data: KnowledgeEntryInsert,
+  index: KnowledgeIndexInsert,
+): void {
+  const insertEntry = db.prepare(
+    `INSERT INTO knowledge_entries (id, novel_id, type, title, summary, data, sort_order, tags, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insertEntry.run(
+    data.id,
+    data.novelId,
+    data.type,
+    data.title,
+    data.summary,
+    data.data,
+    data.sortOrder,
+    data.tags,
+    data.createdAt,
+    data.updatedAt,
+  );
+  upsertKnowledgeIndex(db, index);
+  enqueueKnowledgeVaultUpsert(db, {
+    entryId: index.id,
+    novelId: index.novelId,
+    relPath: index.path,
+    updatedAt: data.updatedAt,
+  });
+  touchNovelUpdatedAt(db, data.novelId);
+}
+
+/**
+ * Atomically create an import-derived entry only while the launching import
+ * generation and attempt lease are still current. Recording the bounded slot
+ * in the same transaction makes a recovered attempt idempotent even if the
+ * previously generated entry was later deleted by the user.
+ */
+export async function createKnowledgeEntryWithIndexForImportGeneration(
+  data: KnowledgeEntryInsert,
+  index: KnowledgeIndexInsert,
+  expectedKbExtractionId: string,
+  expectedAttemptId: string,
+  slot: string,
+): Promise<ImportGenerationKnowledgeWriteResult | null> {
+  const db = getDb();
+  const write = (): 'created' | 'replayed' | null => {
+    const current = db.prepare(
+      `SELECT settings
+         FROM novels
+        WHERE id = ?
+          AND json_valid(settings)
+          AND json_extract(settings, '$.importMeta.kbExtractionId') = ?
+          AND json_extract(settings, '$.importMeta.kbExtraction') = 'running'
+          AND json_extract(settings, '$.importMeta.kbExtractionAttemptId') = ?
+          AND json_extract(settings, '$.importMeta.kbExtractionLeaseExpiresAt') > ?`,
+    ).get(
+      data.novelId,
+      expectedKbExtractionId,
+      expectedAttemptId,
+      nowIso(),
+    ) as { settings: string } | undefined;
+    if (!current) return null;
+
+    const parsedSettings = JSON.parse(current.settings) as unknown;
+    if (
+      !parsedSettings
+      || typeof parsedSettings !== 'object'
+      || Array.isArray(parsedSettings)
+    ) {
+      return null;
+    }
+    const settings = parsedSettings as NovelSettings;
+    const importMeta = settings.importMeta;
+    if (!importMeta) return null;
+    const completedSlots = Array.isArray(importMeta.kbExtractionCompletedSlots)
+      ? importMeta.kbExtractionCompletedSlots.filter(
+          (completed): completed is string => typeof completed === 'string',
+        )
+      : [];
+    if (completedSlots.includes(slot)) return 'replayed';
+
+    insertKnowledgeEntryWithIndex(db, data, index);
+    db.prepare('UPDATE novels SET settings = ? WHERE id = ?').run(
+      toJsonText({
+        ...settings,
+        importMeta: {
+          ...importMeta,
+          kbExtractionCompletedSlots: [...completedSlots, slot],
+        },
+      }),
+      data.novelId,
+    );
+    return 'created';
+  };
+  const outcome = db.inTransaction
+    ? write()
+    : db.transaction(write).immediate();
+  if (outcome === null) return null;
+  if (outcome === 'replayed') return { status: 'replayed' };
+  return {
+    status: 'created',
+    entry: db
+      .prepare('SELECT * FROM knowledge_entries WHERE id = ?')
+      .get(data.id) as KnowledgeEntryRow,
+  };
 }
 
 export async function updateKnowledgeEntry(

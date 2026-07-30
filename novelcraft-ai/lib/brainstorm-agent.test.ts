@@ -333,4 +333,71 @@ describe('brainstorm agent tools', () => {
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });
+
+  it.each(['source', 'target'] as const)(
+    'refuses to undo an AI-created card after the writer adds a relation with it as %s',
+    async direction => {
+      const {
+        createKnowledgeEntry,
+        createKnowledgeRelation,
+        createNovel,
+        deleteNovelCascade,
+        getKnowledgeEntries,
+        getKnowledgeRelationsByEntry,
+      } = await import('@/lib/db');
+      const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+      const {
+        beginBrainstormReceipt,
+        consumeLatestBrainstormReceipt,
+        undoBrainstormReceipt,
+      } = await import('@/lib/brainstorm-receipts');
+      const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Relation Undo' });
+      const now = '2026-07-30T08:09:10.000Z';
+
+      try {
+        const writerEntry = await createKnowledgeEntry({
+          id: crypto.randomUUID(),
+          novelId: novel.id,
+          type: 'world',
+          title: 'Writer World',
+          summary: 'A writer-owned card.',
+          data: '{}',
+          sortOrder: 0,
+          tags: '[]',
+          createdAt: now,
+          updatedAt: now,
+        });
+        const receiptId = beginBrainstormReceipt(novel.id);
+        const tools = createBrainstormTools(novel.id, receiptId);
+        await (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
+          entries: [{
+            type: 'character',
+            title: 'Mira',
+            summary: 'An AI-created card.',
+            details: {},
+          }],
+        });
+        expect(consumeLatestBrainstormReceipt(novel.id)?.id).toBe(receiptId);
+        const aiEntry = (await getKnowledgeEntries(novel.id, { type: 'character' }))[0];
+        const relationId = crypto.randomUUID();
+        await createKnowledgeRelation({
+          id: relationId,
+          sourceId: direction === 'source' ? aiEntry.id : writerEntry.id,
+          targetId: direction === 'target' ? aiEntry.id : writerEntry.id,
+          relationType: 'knows',
+          label: 'Writer added after completion',
+          createdAt: '2026-07-30T08:10:11.000Z',
+        });
+
+        expect(await undoBrainstormReceipt(novel.id, receiptId))
+          .toEqual({ ok: false, reason: 'conflict' });
+        expect((await getKnowledgeEntries(novel.id)).map(entry => entry.id).sort())
+          .toEqual([aiEntry.id, writerEntry.id].sort());
+        expect(await getKnowledgeRelationsByEntry(aiEntry.id))
+          .toEqual([expect.objectContaining({ id: relationId })]);
+      } finally {
+        await deleteNovelCascade(novel.id, 'local-user');
+      }
+    },
+  );
 });

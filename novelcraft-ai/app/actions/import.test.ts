@@ -596,10 +596,14 @@ describe('import durability fencing (adversarial)', () => {
       mode: 'new' as const,
       novelTitle: 'Exactly Once',
       chapters: opened.chapters.map(c => ({ title: c.title, parts: c.parts })),
+      runKbExtraction: true,
     };
 
     const first = await confirmImportSessionAction(input);
     try {
+      expect(first.kbExtractionId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
       // Simulate cleanup failure: restore session dir is unnecessary; replay must
       // still return the stored result even if filesystem session is gone.
       expect(existsSync(sessionDirForToken(opened.sessionToken))).toBe(false);
@@ -607,7 +611,15 @@ describe('import durability fencing (adversarial)', () => {
 
       const replay = await confirmImportSessionAction(input);
       expect(replay).toEqual(first);
-      expect(await getNovel(first.novelId)).toMatchObject({ title: 'Exactly Once' });
+      expect(await getNovel(first.novelId)).toMatchObject({
+        title: 'Exactly Once',
+        settings: {
+          importMeta: {
+            kbExtraction: 'pending',
+            kbExtractionId: first.kbExtractionId,
+          },
+        },
+      });
       expect(await getChapters(first.novelId)).toHaveLength(2);
 
       const novels = (

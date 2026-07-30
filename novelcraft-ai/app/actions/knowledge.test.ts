@@ -93,6 +93,119 @@ describe('knowledge actions: real SQLite integration', () => {
     expect(parsed.summary).toBeTruthy();
   });
 
+  it('fences import-derived entries to the current extraction generation', async () => {
+    const {
+      createKnowledgeEntryForImportGeneration,
+      deleteKnowledgeEntry,
+    } = await import('@/app/actions/knowledge');
+    const {
+      claimNovelKbExtraction,
+      createNovel,
+      deleteNovelCascade,
+      getNovel,
+      getKnowledgeEntries,
+      updateNovel,
+    } = await import('@/lib/db');
+    const oldId = '00000000-0000-4000-8000-000000000030';
+    const currentId = '00000000-0000-4000-8000-000000000031';
+    const novel = await createNovel({
+      userId: USER_ID,
+      title: 'Import Generation Fence',
+    });
+    await updateNovel(novel.id, {
+      settings: {
+        importMeta: {
+          source: 'docx',
+          importedAt: '2026-07-30T00:03:00.000Z',
+          originalFilename: 'current.docx',
+          detectedChapters: 4,
+          kbExtraction: 'pending',
+          kbExtractionId: currentId,
+        },
+      },
+    });
+    const input = {
+      type: 'character',
+      title: 'Generation Hero',
+      data: {
+        role: 'protagonist',
+        description: 'Belongs only to the current import.',
+        backstory: '',
+        motivation: '',
+        traits: [],
+        arc: '',
+      },
+      tags: [],
+    };
+    const claim = claimNovelKbExtraction(novel.id, currentId, 90_000);
+    expect(claim.status).toBe('claimed');
+    if (claim.status !== 'claimed') throw new Error('claim failed');
+
+    try {
+      expect(await createKnowledgeEntryForImportGeneration(
+        novel.id,
+        oldId,
+        '00000000-0000-4000-8000-000000000130',
+        'chunk:0',
+        input,
+      )).toBeNull();
+      expect(await getKnowledgeEntries(novel.id)).toHaveLength(0);
+
+      expect(await createKnowledgeEntryForImportGeneration(
+        novel.id,
+        currentId,
+        claim.attemptId,
+        'chunk:0',
+        input,
+      )).toMatchObject({
+        created: true,
+        novelId: novel.id,
+        title: 'Generation Hero',
+      });
+      const [firstEntry] = await getKnowledgeEntries(novel.id);
+      expect(firstEntry).toBeDefined();
+
+      const afterFirstWrite = await getNovel(novel.id);
+      if (!afterFirstWrite?.settings?.importMeta) {
+        throw new Error('completed slot metadata missing');
+      }
+      await updateNovel(novel.id, {
+        settings: {
+          ...afterFirstWrite.settings,
+          importMeta: {
+            ...afterFirstWrite.settings.importMeta,
+            kbExtractionLeaseExpiresAt: '2000-01-01T00:00:00.000Z',
+          },
+        },
+      });
+      const recovered = claimNovelKbExtraction(novel.id, currentId, 90_000);
+      expect(recovered.status).toBe('claimed');
+      if (recovered.status !== 'claimed') throw new Error('recovery claim failed');
+
+      await deleteKnowledgeEntry(firstEntry.id);
+      expect(await getKnowledgeEntries(novel.id)).toHaveLength(0);
+      expect(await createKnowledgeEntryForImportGeneration(
+        novel.id,
+        currentId,
+        recovered.attemptId,
+        'chunk:0',
+        input,
+      )).toEqual({ created: false });
+      expect(await getKnowledgeEntries(novel.id)).toHaveLength(0);
+
+      expect(await createKnowledgeEntryForImportGeneration(
+        novel.id,
+        currentId,
+        recovered.attemptId,
+        'chunk:1',
+        { ...input, title: 'Generation Hero Two' },
+      )).toMatchObject({ created: true, title: 'Generation Hero Two' });
+      expect(await getKnowledgeEntries(novel.id)).toHaveLength(1);
+    } finally {
+      await deleteNovelCascade(novel.id, USER_ID);
+    }
+  });
+
   it('keeps the committed DB entry when best-effort vault markdown sync fails', async () => {
     const { createKnowledgeEntry } = await import('@/app/actions/knowledge');
     const { createNovel, deleteNovelCascade, getKnowledgeEntries } = await import('@/lib/db');

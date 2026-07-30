@@ -17,17 +17,13 @@
 
 import { NextResponse } from 'next/server';
 import { requireNovelOwner } from '@/lib/local-auth';
-import { updateNovel } from '@/lib/db';
+import { patchNovelSettings } from '@/lib/db';
 import { safeParseJsonObject, sanitizeError } from '@/lib/utils';
 import { isCreativityLevel } from '@/lib/ai/generation-presets';
 import type { NovelSettings } from '@/lib/db-types';
 
 interface PatchSettingsBody {
   creativity?: unknown;
-}
-
-function isSettingsPatchObject(value: unknown): value is PatchSettingsBody {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function hasOnlySupportedSettingsKeys(value: PatchSettingsBody): boolean {
@@ -55,20 +51,14 @@ export async function PATCH(
     return NextResponse.json({ error: 'unsupported settings field' }, { status: 400 });
   }
 
-  const current: NovelSettings = isSettingsPatchObject(ownerCheck.novel.settings)
-    ? ownerCheck.novel.settings
-    : {};
-  const next: NovelSettings = { ...current };
-  let changed = false;
-
+  const patch: Partial<Omit<NovelSettings, 'importMeta'>> = {};
+  const clearKeys: Array<keyof Omit<NovelSettings, 'importMeta'>> = [];
   if (Object.prototype.hasOwnProperty.call(body, 'creativity')) {
     const c = body.creativity;
     if (c === null) {
-      changed = Object.prototype.hasOwnProperty.call(current, 'creativity');
-      delete next.creativity;
+      clearKeys.push('creativity');
     } else if (isCreativityLevel(c)) {
-      changed = current.creativity !== c;
-      next.creativity = c;
+      patch.creativity = c;
     } else {
       return NextResponse.json(
         { error: 'creativity must be conservative | balanced | wild' },
@@ -77,15 +67,8 @@ export async function PATCH(
     }
   }
 
-  // Collapse empty bag back to NULL so it round-trips clean — keeps the
-  // "no opinion → use defaults" semantic explicit at the DB layer too.
-  const persisted: NovelSettings | null = Object.keys(next).length === 0 ? null : next;
-  if (!changed) {
-    return NextResponse.json({ settings: persisted });
-  }
-
   try {
-    const updated = await updateNovel(id, { settings: persisted }, true);
+    const updated = await patchNovelSettings(id, patch, clearKeys);
     if (!updated) {
       return NextResponse.json({ error: 'Novel not found' }, { status: 404 });
     }

@@ -118,6 +118,110 @@ describe('novel settings API request validation', () => {
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });
+
+  it('preserves extraction state and durable slots across a delayed settings patch', async () => {
+    const {
+      claimNovelKbExtraction,
+      createNovel,
+      deleteNovelCascade,
+      getNovel,
+      updateNovel,
+      updateNovelKbExtractionState,
+    } = await import('@/lib/db');
+    const {
+      createKnowledgeEntryForImportGeneration,
+    } = await import('@/app/actions/knowledge');
+    const { PATCH } = await import('@/app/api/novels/[id]/settings/route');
+    const kbExtractionId = crypto.randomUUID();
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Settings extraction race',
+    });
+    await updateNovel(novel.id, {
+      settings: {
+        importMeta: {
+          source: 'txt',
+          importedAt: '2026-07-30T01:00:00.000Z',
+          originalFilename: 'race.txt',
+          detectedChapters: 1,
+          kbExtraction: 'pending',
+          kbExtractionId,
+        },
+      },
+    });
+
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    let markBodyRead!: () => void;
+    const bodyRead = new Promise<void>(resolve => {
+      markBodyRead = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        bodyController = controller;
+        markBodyRead();
+      },
+    }, { highWaterMark: 0 });
+    const init: RequestInit & { duplex: 'half' } = {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body,
+      duplex: 'half',
+    };
+
+    try {
+      const patchResponse = PATCH(
+        new Request(`http://localhost/api/novels/${novel.id}/settings`, init),
+        { params: Promise.resolve({ id: novel.id }) },
+      );
+      await bodyRead;
+
+      const claim = claimNovelKbExtraction(novel.id, kbExtractionId, 90_000);
+      expect(claim.status).toBe('claimed');
+      if (claim.status !== 'claimed') throw new Error('claim failed');
+      await expect(createKnowledgeEntryForImportGeneration(
+        novel.id,
+        kbExtractionId,
+        claim.attemptId,
+        'chunk:0',
+        {
+          type: 'character',
+          title: 'Slot Hero',
+          data: {
+            role: 'protagonist',
+            description: 'Must remain idempotent.',
+            backstory: '',
+            motivation: '',
+            traits: [],
+            arc: '',
+          },
+          tags: [],
+        },
+      )).resolves.toMatchObject({ created: true });
+      expect(updateNovelKbExtractionState(
+        novel.id,
+        kbExtractionId,
+        claim.attemptId,
+        'done',
+      )).toBe(true);
+
+      bodyController.enqueue(new TextEncoder().encode(JSON.stringify({
+        creativity: 'wild',
+      })));
+      bodyController.close();
+      expect((await patchResponse).status).toBe(200);
+
+      expect((await getNovel(novel.id))?.settings).toMatchObject({
+        creativity: 'wild',
+        importMeta: {
+          kbExtraction: 'done',
+          kbExtractionId,
+          kbExtractionCompletedSlots: ['chunk:0'],
+        },
+      });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
 });
 
 // B10: a server-side write failure (DB locked / disk full) must surface as 500,
