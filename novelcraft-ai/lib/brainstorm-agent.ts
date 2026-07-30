@@ -5,31 +5,36 @@ import { z } from 'zod';
 import {
   getKnowledgeEntries,
   getNovel,
-  updateNovel,
   type KnowledgeEntryRow,
 } from '@/lib/db';
 import { getDb } from '@/lib/db/connection';
+import {
+  insertKnowledgeEntryWithIndexInTx,
+  updateKnowledgeEntryWithIndexInTx,
+} from '@/lib/db/queries-knowledge';
+import { getKnowledgeVaultOutboxRow } from '@/lib/db/queries-knowledge-vault-outbox';
+import type { KnowledgeIndexInsert } from '@/lib/db/queries-vault';
 import { mapNovel, type Novel } from '@/lib/db-types';
 import type { Locale } from '@/lib/i18n';
 import { toJsonb, type InterviewState } from '@/lib/interview-state';
-import { upsertKnowledgeEntryByTitle } from '@/lib/knowledge/upsert-entry';
 import { buildKnowledgeEntrySummary } from '@/lib/knowledge';
-import { syncIndexFromEntry } from '@/lib/knowledge/index-sync';
+import { knowledgeEntryIdentityKey } from '@/lib/knowledge/entry-identity';
+import { buildKnowledgeIndexInsert } from '@/lib/knowledge/index-sync';
 import {
+  attemptKnowledgeVaultUpsert,
   clearStaleEmbedding,
   scheduleEmbeddingRefresh,
-  trySyncKnowledgeEntryToVault,
 } from '@/lib/knowledge/apply-write';
 import {
   approveExistingBrainstormAtomicSync,
-  finalizeBrainstormAtomic,
   finalizeBrainstormAtomicSync,
+  type BrainstormProjectionRepair,
 } from '@/lib/db/brainstorm-finalization';
 import { mutateClaimedChatTurn } from '@/lib/db/queries-chat-turns';
 import { applyNovelUpdate, hydrateNovelRow } from '@/lib/db/queries-novel';
 import { isInStages, type NovelStage } from '@/lib/novel-stages';
 import type { KnowledgeType } from '@/lib/types/knowledge';
-import { nowIso } from '@/lib/utils';
+import { nowIso, parseJsonField } from '@/lib/utils';
 import {
   brainstormMutationCheckpoint,
   brainstormProfileSnapshot,
@@ -38,7 +43,6 @@ import {
   type DurableBrainstormToolContext,
   recordBrainstormEntryMutation,
   recordBrainstormProfileMutation,
-  recordBrainstormProfileSnapshotMutation,
   runDurableBrainstormTool,
 } from '@/lib/brainstorm-receipts';
 
@@ -170,76 +174,134 @@ function greenlightProposalState(
   };
 }
 
-async function upsertStoryDeckEntry(
-  novelId: string,
-  entry: z.infer<typeof storyDeckEntrySchema>,
-  existingByType: ReadonlyMap<StoryDeckType, readonly KnowledgeEntryRow[]>,
-): Promise<'created' | 'updated' | 'unchanged'> {
-  const title = entry.title.trim();
-  const summaryInput = entry.summary.trim();
-  const data: Record<string, unknown> = storyDeckData(entry.type, summaryInput, entry.details);
-  const result = await upsertKnowledgeEntryByTitle({
-    novelId,
-    type: entry.type as KnowledgeType,
-    title,
-    data,
-    tags: ['brainstorm'],
-    existingEntries: existingByType.get(entry.type) ?? [],
-    context: 'brainstormAgent.upsertStoryDeckEntries',
-  });
-  return result;
-}
-
 type FinalizeBrainstormInput = z.infer<typeof finalizeBrainstormSchema>;
 
-async function reconcileBrainstormEntryEffects(
+type PlannedStoryDeckWrite = {
+  entryKey: string;
+  type: StoryDeckType;
+  title: string;
+  id: string;
+  action: 'created' | 'updated' | 'unchanged';
+  updatedAt: string;
+  summary: string;
+  data: Record<string, unknown>;
+  tags: string[];
+  index: KnowledgeIndexInsert | null;
+};
+
+function entryKey(entry: Pick<{ type: string; title: string }, 'type' | 'title'>): string {
+  return knowledgeEntryIdentityKey(entry);
+}
+
+function storyDeckInputMatchesRow(
+  entry: z.infer<typeof storyDeckEntrySchema>,
+  row: KnowledgeEntryRow | undefined,
+): row is KnowledgeEntryRow {
+  if (!row) return false;
+  const data = storyDeckData(entry.type, entry.summary.trim(), entry.details);
+  return row.title === entry.title.trim()
+    && row.summary === buildKnowledgeEntrySummary(entry.type, data)
+    && row.data === JSON.stringify(data)
+    && row.tags === JSON.stringify(['brainstorm']);
+}
+
+/** Post-commit only: the transaction already committed index + outbox intent. */
+async function drainCommittedBrainstormEntryEffects(
   novelId: string,
   entries: readonly KnowledgeEntryRow[],
 ): Promise<void> {
   await Promise.allSettled(entries.map(async entry => {
-    await syncIndexFromEntry({
-      id: entry.id,
-      novelId,
-      type: entry.type as KnowledgeType,
-      title: entry.title,
-      summary: entry.summary,
-      data: JSON.parse(entry.data) as Record<string, unknown>,
-      tags: JSON.parse(entry.tags) as string[],
-      updatedAt: entry.updated_at,
-    });
-    await trySyncKnowledgeEntryToVault(novelId, entry.id, 'brainstormAgent.finalizeBrainstorm');
+    const intent = getKnowledgeVaultOutboxRow(entry.id);
+    if (
+      intent?.operation === 'upsert'
+      && intent.status === 'pending'
+    ) {
+      await attemptKnowledgeVaultUpsert(
+        novelId,
+        entry.id,
+        intent.intentRevision,
+        'brainstormAgent.storyDeck',
+      );
+    }
     await clearStaleEmbedding(entry.id, novelId);
     scheduleEmbeddingRefresh(entry.id);
   }));
 }
 
-function buildFinalizeEntries(input: FinalizeBrainstormInput) {
-  return Array.from(new Map(input.entries.map(entry => [
-    `${entry.type}:${entry.title.trim().toLowerCase()}`,
-    {
+async function planStoryDeckWrites(
+  novelId: string,
+  entries: readonly z.infer<typeof storyDeckEntrySchema>[],
+  beforeByKey: ReadonlyMap<string, KnowledgeEntryRow>,
+  reservedPaths = new Set<string>(),
+): Promise<PlannedStoryDeckWrite[]> {
+  const plans: PlannedStoryDeckWrite[] = [];
+  for (const entry of entries) {
+    const key = entryKey(entry);
+    const before = beforeByKey.get(key);
+    const title = entry.title.trim();
+    const summaryInput = entry.summary.trim();
+    const data = storyDeckData(entry.type, summaryInput, entry.details);
+    const summary = buildKnowledgeEntrySummary(entry.type, data);
+    const tags = ['brainstorm'];
+    const action = !before
+      ? 'created' as const
+      : (storyDeckInputMatchesRow(entry, before) ? 'unchanged' as const : 'updated' as const);
+    const id = before?.id ?? crypto.randomUUID();
+    const updatedAt = nowIso();
+    const index = action === 'unchanged'
+      ? null
+      : await buildKnowledgeIndexInsert({
+        id,
+        novelId,
+        type: entry.type as KnowledgeType,
+        title,
+        summary,
+        data,
+        tags,
+        updatedAt,
+      }, reservedPaths);
+    if (index) reservedPaths.add(index.path);
+    plans.push({
+      entryKey: key,
       type: entry.type,
-      title: entry.title.trim(),
-      summary: entry.summary.trim(),
-      data: storyDeckData(entry.type, entry.summary.trim(), entry.details),
-      tags: ['brainstorm'],
-    },
-  ])).values()).map(entry => ({
-    ...entry,
-    summary: buildKnowledgeEntrySummary(entry.type, entry.data),
+      title,
+      id,
+      action,
+      updatedAt,
+      summary,
+      data,
+      tags,
+      index,
+    });
+  }
+  return plans;
+}
+
+function buildFinalizeEntries(plannedWrites: readonly PlannedStoryDeckWrite[]) {
+  return plannedWrites.map(plan => ({
+    id: plan.id,
+    type: plan.type,
+    title: plan.title,
+    summary: plan.summary,
+    data: plan.data,
+    tags: plan.tags,
+    updatedAt: plan.updatedAt,
+    index: plan.index,
   }));
 }
 
 function commitFinalizedBrainstormSync(
   novelId: string,
   input: FinalizeBrainstormInput,
+  plannedWrites: readonly PlannedStoryDeckWrite[],
   receiptId: string | undefined,
-  options: { preserveExistingStoryDeck?: boolean } = {},
+  options: {
+    preserveExistingStoryDeck?: boolean;
+    projectionRepairs?: readonly BrainstormProjectionRepair[];
+  } = {},
 ) {
   const db = getDb();
-  const novelRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-    | Record<string, unknown>
-    | undefined;
-  const novel = novelRow ? mapNovel(hydrateNovelRow(novelRow)) : null;
+  const novel = readBrainstormNovel(db, novelId);
   if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
     return { ok: false as const, reason: 'not_editable' as const };
   }
@@ -256,8 +318,9 @@ function commitFinalizedBrainstormSync(
       ...profileUpdate,
       interviewState: toJsonb(greenlightProposalState(novel, input.profile)),
     },
-    entries: buildFinalizeEntries(input),
+    entries: buildFinalizeEntries(plannedWrites),
     preserveExistingStoryDeck: options.preserveExistingStoryDeck,
+    projectionRepairs: options.projectionRepairs,
   });
   if (!result.ok) return result;
 
@@ -282,65 +345,49 @@ function commitFinalizedBrainstormSync(
   };
 }
 
-async function commitFinalizedBrainstorm(
-  novelId: string,
-  input: FinalizeBrainstormInput,
-  receiptId?: string,
-  options: { preserveExistingStoryDeck?: boolean } = {},
-) {
-  const result = commitFinalizedBrainstormSync(novelId, input, receiptId, options);
-  if (!result.ok) return result;
-  await reconcileBrainstormEntryEffects(
-    novelId,
-    result.mutations.map(mutation => mutation.after),
-  );
-  return { ok: true as const, coverage: result.coverage };
-}
-
 function upsertStoryDeckEntryInTx(
   db: ReturnType<typeof getDb>,
   novelId: string,
   entry: z.infer<typeof storyDeckEntrySchema>,
-  existingByType: ReadonlyMap<StoryDeckType, readonly KnowledgeEntryRow[]>,
+  plan: PlannedStoryDeckWrite,
 ): {
   action: 'created' | 'updated' | 'unchanged';
   before: KnowledgeEntryRow | null;
   after: KnowledgeEntryRow | null;
 } {
   const title = entry.title.trim();
-  const summaryInput = entry.summary.trim();
-  const data = storyDeckData(entry.type, summaryInput, entry.details);
-  const summary = buildKnowledgeEntrySummary(entry.type, data);
-  const tags = JSON.stringify(['brainstorm']);
-  const dataJson = JSON.stringify(data);
-  const before = (existingByType.get(entry.type) ?? []).find(
-    candidate => candidate.title.trim().toLowerCase() === title.toLowerCase(),
-  ) ?? null;
-  const now = nowIso();
-  if (!before) {
-    const id = crypto.randomUUID();
-    db.prepare(
-      `INSERT INTO knowledge_entries
-        (id, novel_id, type, title, summary, data, sort_order, tags, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, novelId, entry.type, title, summary, dataJson, 0, tags, now, now);
-    const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?').get(id) as KnowledgeEntryRow;
-    return { action: 'created', before: null, after };
-  }
-  if (
-    before.title === title
-    && before.summary === summary
-    && before.data === dataJson
-    && before.tags === tags
-  ) {
+  const tagsJson = JSON.stringify(plan.tags);
+  const dataJson = JSON.stringify(plan.data);
+  const before = readStoryDeckRowByKey(db, novelId, entry.type, title) ?? null;
+
+  if (plan.action === 'unchanged') {
     return { action: 'unchanged', before, after: before };
   }
-  db.prepare(
-    `UPDATE knowledge_entries
-        SET title = ?, summary = ?, data = ?, tags = ?, updated_at = ?
-      WHERE id = ? AND novel_id = ?`,
-  ).run(title, summary, dataJson, tags, now, before.id, novelId);
-  const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?').get(before.id) as KnowledgeEntryRow;
+  if (!plan.index) throw new Error('Durable brainstorm tool missing planned index');
+  if (plan.action === 'created') {
+    insertKnowledgeEntryWithIndexInTx(db, {
+      id: plan.id,
+      novelId,
+      type: entry.type,
+      title,
+      summary: plan.summary,
+      data: dataJson,
+      sortOrder: 0,
+      tags: tagsJson,
+      createdAt: plan.updatedAt,
+      updatedAt: plan.updatedAt,
+    }, plan.index);
+    const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?').get(plan.id) as KnowledgeEntryRow;
+    return { action: 'created', before: null, after };
+  }
+  updateKnowledgeEntryWithIndexInTx(db, plan.id, {
+    title,
+    summary: plan.summary,
+    data: dataJson,
+    tags: tagsJson,
+    updatedAt: plan.updatedAt,
+  }, plan.index);
+  const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?').get(plan.id) as KnowledgeEntryRow;
   return { action: 'updated', before, after };
 }
 
@@ -380,38 +427,53 @@ function buildApprovedStoryDeckInput(novel: Novel, locale: Locale): FinalizeBrai
   };
 }
 
-function finalizeApprovedStoryDeckSync(
+async function prepareApprovedStoryDeck(
   novelId: string,
   locale: Locale,
-  receiptId?: string,
 ) {
-  const row = getDb().prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-    | Record<string, unknown>
-    | undefined;
-  const novel = row ? mapNovel(hydrateNovelRow(row)) : null;
+  const novel = await getNovel(novelId);
   if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
     return { ok: false as const, reason: 'not_editable' as const };
   }
-  return commitFinalizedBrainstormSync(
+  const input = buildApprovedStoryDeckInput(novel, locale);
+  const entries = input.entries;
+  const scopedEntries = (await Promise.all(STORY_DECK_TYPES.map(
+    type => getKnowledgeEntries(novelId, { type }),
+  ))).flat();
+  const reservedPaths = new Set<string>();
+  const projectionRepairs: BrainstormProjectionRepair[] = [];
+  for (const entry of scopedEntries) {
+    const index = await buildKnowledgeIndexInsert({
+      id: entry.id,
+      novelId,
+      type: entry.type as KnowledgeType,
+      title: entry.title,
+      summary: entry.summary,
+      data: parseJsonField<Record<string, unknown>>(entry.data, {}),
+      tags: parseJsonField<string[]>(entry.tags, []),
+      updatedAt: entry.updated_at,
+    }, reservedPaths);
+    reservedPaths.add(index.path);
+    projectionRepairs.push({ entry, index });
+  }
+  const existingTypes = new Set(scopedEntries.map(entry => entry.type));
+  const missingEntries = entries.filter(entry => !existingTypes.has(entry.type));
+  const plannedWrites = await planStoryDeckWrites(
     novelId,
-    buildApprovedStoryDeckInput(novel, locale),
-    receiptId,
-    { preserveExistingStoryDeck: true },
+    missingEntries,
+    new Map(scopedEntries.map(entry => [entryKey(entry), entry])),
+    reservedPaths,
   );
-}
-
-export async function finalizeApprovedStoryDeck(
-  novelId: string,
-  locale: Locale,
-  receiptId?: string,
-) {
-  const result = finalizeApprovedStoryDeckSync(novelId, locale, receiptId);
-  if (!result.ok) return result;
-  await reconcileBrainstormEntryEffects(
-    novelId,
-    result.mutations.map(mutation => mutation.after),
-  );
-  return { ok: true as const, coverage: result.coverage };
+  return {
+    ok: true as const,
+    input,
+    beforeProfile: brainstormProfileSnapshot(novel),
+    beforeStage: novel.stage,
+    beforeEntries: scopedEntries,
+    beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+    plannedWrites,
+    projectionRepairs,
+  };
 }
 
 export async function finalizeApprovedStoryDeckForClaim(args: {
@@ -421,24 +483,50 @@ export async function finalizeApprovedStoryDeckForClaim(args: {
   userMessageId: string;
   claimToken: string;
 }) {
+  const prepared = await prepareApprovedStoryDeck(args.novelId, args.locale);
+  if (!prepared.ok) return prepared;
   const claimed = mutateClaimedChatTurn({
     novelId: args.novelId,
     userMessageId: args.userMessageId,
     claimToken: args.claimToken,
-    mutate: () => finalizeApprovedStoryDeckSync(
-      args.novelId,
-      args.locale,
-      args.receiptId,
-    ),
+    mutate: db => {
+      const currentNovel = readBrainstormNovel(db, args.novelId);
+      if (
+        !sameBrainstormProfile(currentNovel, prepared.beforeProfile)
+        || knowledgeEntriesFingerprint(readBrainstormState(db, args.novelId).entries)
+          !== prepared.beforeScopeFingerprint
+        || !storyDeckKeysMatchPreparedBefore(db, args.novelId, prepared)
+      ) {
+        throw new Error('Story Deck repair state conflict');
+      }
+      return commitFinalizedBrainstormSync(
+        args.novelId,
+        prepared.input,
+        prepared.plannedWrites,
+        args.receiptId,
+        {
+          preserveExistingStoryDeck: true,
+          projectionRepairs: prepared.projectionRepairs,
+        },
+      );
+    },
   });
   if (claimed.kind === 'lost_claim') {
     throw new Error('Chat turn claim lost before Story Deck repair');
   }
   const result = claimed.result;
   if (!result.ok) return result;
-  await reconcileBrainstormEntryEffects(
+  const entriesToDrain = new Map(prepared.projectionRepairs.map(
+    repair => [repair.entry.id, repair.entry],
+  ));
+  for (const mutation of result.mutations) {
+    if (mutation.action !== 'unchanged') {
+      entriesToDrain.set(mutation.after.id, mutation.after);
+    }
+  }
+  await drainCommittedBrainstormEntryEffects(
     args.novelId,
-    result.mutations.map(mutation => mutation.after),
+    [...entriesToDrain.values()],
   );
   return { ok: true as const, coverage: result.coverage };
 }
@@ -607,22 +695,6 @@ export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): 
     : `You are running a novel Brainstorm. Do not use a fixed questionnaire, open with a checklist, or force the user through slots in order. Cover length, genre, references, point of view, world, characters, central conflict, ending direction, and target reader feeling naturally, asking at most one high-value follow-up at a time.\n\nOnly facts explicitly stated by the user may be written to the Brainstorm profile or Story Deck with tools. Inferences, gap-filling, and creative ideas must be labeled as suggestions and require explicit approval. When the complete writing brief is ready, call finalizeBrainstorm once with the profile and at least one character, world, and outline entry. End the turn immediately after that tool and never continue into manuscript prose.`;
 }
 
-function storyDeckInputMatchesRow(
-  entry: z.infer<typeof storyDeckEntrySchema>,
-  row: KnowledgeEntryRow | undefined,
-): row is KnowledgeEntryRow {
-  if (!row) return false;
-  const data = storyDeckData(entry.type, entry.summary.trim(), entry.details);
-  return row.title === entry.title.trim()
-    && row.summary === buildKnowledgeEntrySummary(entry.type, data)
-    && row.data === JSON.stringify(data)
-    && row.tags === JSON.stringify(['brainstorm']);
-}
-
-function entryKey(entry: Pick<KnowledgeEntryRow, 'type' | 'title'>): string {
-  return `${entry.type}:${entry.title.trim().toLowerCase()}`;
-}
-
 function knowledgeEntriesFingerprint(entries: readonly KnowledgeEntryRow[]): string {
   return createHash('sha256')
     .update(JSON.stringify([...entries].sort((left, right) =>
@@ -633,20 +705,91 @@ function knowledgeEntriesFingerprint(entries: readonly KnowledgeEntryRow[]): str
     .digest('hex');
 }
 
-function brainstormProfileFingerprint(novel: Novel | null | undefined): string | null {
-  if (!novel) return null;
-  return createHash('sha256')
-    .update(JSON.stringify(brainstormProfileSnapshot(novel)))
-    .digest('hex');
+function sameKnowledgeEntryRow(
+  left: KnowledgeEntryRow,
+  right: KnowledgeEntryRow,
+): boolean {
+  return left.id === right.id
+    && left.novel_id === right.novel_id
+    && left.series_id === right.series_id
+    && left.type === right.type
+    && left.title === right.title
+    && left.summary === right.summary
+    && left.data === right.data
+    && left.data_v === right.data_v
+    && left.tags === right.tags
+    && left.sort_order === right.sort_order
+    && left.created_at === right.created_at
+    && left.updated_at === right.updated_at;
 }
 
-function assertAuthoritativeCompletion(
-  actual: unknown,
-  expected: Record<string, unknown>,
-): void {
-  if (!sameJsonValue(actual, expected)) {
-    throw new Error('Durable brainstorm tool state conflict');
+function readStoryDeckRowByKey(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  type: string,
+  title: string,
+): KnowledgeEntryRow | undefined {
+  const targetKey = entryKey({ type, title });
+  return (db.prepare(
+    `SELECT * FROM knowledge_entries
+      WHERE novel_id = ? AND type = ?
+      ORDER BY updated_at DESC`,
+  ).all(novelId, type) as KnowledgeEntryRow[])
+    .find(row => entryKey(row) === targetKey);
+}
+
+/** Per-key fencing so concurrent same-name tool calls with different titles can commit. */
+function storyDeckKeysMatchPreparedBefore(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  prepared: {
+    beforeStage: NovelStage | null;
+    beforeEntries: readonly KnowledgeEntryRow[];
+    plannedWrites: readonly PlannedStoryDeckWrite[];
+  },
+): boolean {
+  const novelRow = db.prepare('SELECT stage FROM novels WHERE id = ?').get(novelId) as
+    | { stage: NovelStage }
+    | undefined;
+  if ((novelRow?.stage ?? null) !== prepared.beforeStage) return false;
+  const beforeByKey = new Map(
+    prepared.beforeEntries.map(entry => [entryKey(entry), entry]),
+  );
+  for (const plan of prepared.plannedWrites) {
+    const current = readStoryDeckRowByKey(db, novelId, plan.type, plan.title);
+    const before = beforeByKey.get(plan.entryKey);
+    if (plan.action === 'created') {
+      if (current) return false;
+      continue;
+    }
+    if (!before || !current || !sameKnowledgeEntryRow(before, current)) return false;
   }
+  return true;
+}
+
+function readBrainstormNovel(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+): Novel | null {
+  const row = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? mapNovel(hydrateNovelRow(row)) : null;
+}
+
+function readBrainstormState(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+) {
+  const entries = STORY_DECK_TYPES.flatMap(type =>
+    db.prepare(
+      'SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?',
+    ).all(novelId, type) as KnowledgeEntryRow[]
+  );
+  return {
+    novel: readBrainstormNovel(db, novelId),
+    entries,
+  };
 }
 
 function sameBrainstormProfile(
@@ -708,21 +851,11 @@ function hydrateKnowledgeBeforeEntries<
   } as T;
 }
 
-function normalizeDurableToolContext(
-  receiptOrContext?: string | DurableBrainstormToolContext,
-): { receiptId?: string; durable?: DurableBrainstormToolContext } {
-  if (typeof receiptOrContext === 'string') return { receiptId: receiptOrContext };
-  return {
-    receiptId: receiptOrContext?.receiptId,
-    durable: receiptOrContext,
-  };
-}
-
 export function createBrainstormTools(
   novelId: string,
-  receiptOrContext?: string | DurableBrainstormToolContext,
+  context: DurableBrainstormToolContext,
 ) {
-  const { receiptId, durable } = normalizeDurableToolContext(receiptOrContext);
+  const { receiptId } = context;
   return {
     updateBrainstormProfile: tool({
       description: 'Merge the current conversation into the novel brainstorm profile.',
@@ -750,49 +883,35 @@ export function createBrainstormTools(
         const executeSync = (prepared: Awaited<ReturnType<typeof prepare>>) => {
           if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
           const db = getDb();
-          const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-            | Record<string, unknown>
-            | undefined;
-          const current = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
+          const current = readBrainstormNovel(db, novelId);
           if (!current || !isInStages(current.stage, EDITABLE_BRAINSTORM_STAGES)) {
             return { ok: false as const, reason: 'not_editable' as const };
           }
           if (!sameBrainstormProfile(current, prepared.beforeProfile)) {
             throw new Error('Durable brainstorm tool state conflict');
           }
+          if (sameJsonValue(
+            profileAfterSnapshot(prepared.beforeProfile, novelUpdate),
+            prepared.beforeProfile,
+          )) {
+            return { ok: true as const };
+          }
           const updatedNovel = applyNovelUpdate(db, novelId, novelUpdate);
           brainstormMutationCheckpoint('after_first_mutation');
-          if (receiptId && updatedNovel) {
-            recordBrainstormProfileMutation(receiptId, current, updatedNovel);
-          }
-          return { ok: true as const };
-        };
-        if (!durable) {
-          if (!receiptId) return executeSync(await prepare());
-          const prepared = await prepare();
-          if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
-          const current = await getNovel(novelId);
-          if (!current || !isInStages(current.stage, EDITABLE_BRAINSTORM_STAGES)) {
-            return { ok: false as const, reason: 'not_editable' as const };
-          }
-          const updatedNovel = await updateNovel(novelId, novelUpdate);
           if (updatedNovel) {
             recordBrainstormProfileMutation(receiptId, current, updatedNovel);
           }
           return { ok: true as const };
-        }
+        };
         return runDurableBrainstormTool({
           novelId,
-          context: durable,
+          context,
           toolName: 'updateBrainstormProfile',
           input: novelUpdate,
           prepare,
           execute: executeSync,
           validateRecovered: (prepared, result) => {
-            const currentRow = getDb().prepare(
-              'SELECT * FROM novels WHERE id = ?',
-            ).get(novelId) as Record<string, unknown> | undefined;
-            const current = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
+            const current = readBrainstormNovel(getDb(), novelId);
             if (!result.ok || !prepared.beforeProfile) {
               if (
                 (!current && !prepared.beforeProfile)
@@ -813,41 +932,6 @@ export function createBrainstormTools(
               return;
             }
             throw new Error('Durable brainstorm tool state conflict');
-          },
-          captureCompletionData: () => {
-            const currentRow = getDb().prepare(
-              'SELECT * FROM novels WHERE id = ?',
-            ).get(novelId) as Record<string, unknown> | undefined;
-            const current = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            return {
-              version: 1,
-              profileFingerprint: brainstormProfileFingerprint(current),
-            };
-          },
-          validateCompleted: (_prepared, _result, completionData) => {
-            const currentRow = getDb().prepare(
-              'SELECT * FROM novels WHERE id = ?',
-            ).get(novelId) as Record<string, unknown> | undefined;
-            const current = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            assertAuthoritativeCompletion(completionData, {
-              version: 1,
-              profileFingerprint: brainstormProfileFingerprint(current),
-            });
-          },
-          ensureReceipts: (prepared, result) => {
-            if (!receiptId || !result.ok || !prepared.beforeProfile) return;
-            const currentRow = getDb().prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-              | Record<string, unknown>
-              | undefined;
-            const current = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            if (current) {
-              recordBrainstormProfileSnapshotMutation(
-                receiptId,
-                novelId,
-                prepared.beforeProfile,
-                current,
-              );
-            }
           },
           recover: async prepared => {
             const current = await getNovel(novelId);
@@ -885,7 +969,7 @@ export function createBrainstormTools(
       execute: async input => {
         const uniqueEntries = Array.from(
           new Map(input.entries.map(entry => [
-            `${entry.type}:${entry.title.trim().toLowerCase()}`,
+            entryKey(entry),
             entry,
           ])).values(),
         );
@@ -905,70 +989,61 @@ export function createBrainstormTools(
           const beforeEntries = uniqueEntries.map(entry =>
             scopedEntries.find(row => entryKey(row) === entryKey(entry))
           ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
+          const beforeByKey = new Map(beforeEntries.map(entry => [entryKey(entry), entry]));
+          const plannedWrites = await planStoryDeckWrites(novelId, uniqueEntries, beforeByKey);
           if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
             return {
               editable: false as const,
               beforeStage: novel?.stage ?? null,
               beforeEntries,
-              beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+              plannedWrites,
               result: { ok: false as const, reason: 'not_editable' as const },
             };
           }
-          const actions = uniqueEntries.map(entry => {
-            const before = beforeEntries.find(row => entryKey(row) === entryKey(entry));
-            if (!before) return 'created' as const;
-            return storyDeckInputMatchesRow(entry, before) ? 'unchanged' as const : 'updated' as const;
-          });
           return {
             editable: true as const,
             beforeStage: novel.stage,
             beforeEntries,
-            beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+            plannedWrites,
             result: {
               ok: true as const,
-              created: actions.filter(action => action === 'created').length,
-              updated: actions.filter(action => action === 'updated').length,
-              unchanged: actions.filter(action => action === 'unchanged').length,
+              created: plannedWrites.filter(plan => plan.action === 'created').length,
+              updated: plannedWrites.filter(plan => plan.action === 'updated').length,
+              unchanged: plannedWrites.filter(plan => plan.action === 'unchanged').length,
             },
           };
         };
         const executeSync = (prepared: Awaited<ReturnType<typeof prepare>>) => {
           if (!prepared.editable) return prepared.result;
           const db = getDb();
-          const novelRow = db.prepare('SELECT stage FROM novels WHERE id = ?').get(novelId) as
-            | { stage: NovelStage }
+          const novelRow = db.prepare('SELECT stage, updated_at FROM novels WHERE id = ?')
+            .get(novelId) as
+            | { stage: NovelStage; updated_at: string }
             | undefined;
           if (!novelRow || !isInStages(novelRow.stage, EDITABLE_BRAINSTORM_STAGES)) {
             return { ok: false as const, reason: 'not_editable' as const };
           }
-          const existingByType = new Map(touchedTypes.map(type => [
-            type,
-            db.prepare(
-              `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-            ).all(novelId, type) as KnowledgeEntryRow[],
-          ] as const));
-          const currentEntries = [...existingByType.values()].flat();
-          if (
-            novelRow.stage !== prepared.beforeStage
-            || knowledgeEntriesFingerprint(currentEntries)
-              !== prepared.beforeScopeFingerprint
-          ) {
+          if (!storyDeckKeysMatchPreparedBefore(db, novelId, prepared)) {
             throw new Error('Durable brainstorm tool state conflict');
           }
-          const mutations = uniqueEntries.map(entry =>
-            upsertStoryDeckEntryInTx(db, novelId, entry, existingByType),
+          const planByKey = new Map(
+            prepared.plannedWrites.map(plan => [plan.entryKey, plan]),
           );
+          const mutations = uniqueEntries.map(entry => {
+            const plan = planByKey.get(entryKey(entry));
+            if (!plan) throw new Error('Durable brainstorm tool missing planned write');
+            return upsertStoryDeckEntryInTx(db, novelId, entry, plan);
+          });
           brainstormMutationCheckpoint('after_first_mutation');
-          if (receiptId) {
-            for (const mutation of mutations) {
-              if (mutation.action === 'unchanged' || !mutation.after) continue;
-              recordBrainstormEntryMutation(
-                receiptId,
-                mutation.before,
-                mutation.after,
-                mutation.action,
-              );
-            }
+          for (const mutation of mutations) {
+            if (mutation.action === 'unchanged' || !mutation.after) continue;
+            recordBrainstormEntryMutation(
+              receiptId,
+              mutation.before,
+              mutation.after,
+              mutation.action,
+              { profileRevisionBeforeMutation: Date.parse(novelRow.updated_at) },
+            );
           }
           return {
             ok: true as const,
@@ -977,48 +1052,9 @@ export function createBrainstormTools(
             unchanged: mutations.filter(result => result.action === 'unchanged').length,
           };
         };
-        if (!durable) {
-          const prepared = await prepare();
-          if (!prepared.editable) return prepared.result;
-          const novel = await getNovel(novelId);
-          if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
-            return { ok: false as const, reason: 'not_editable' as const };
-          }
-          const existingPairs = await Promise.all(touchedTypes.map(async type => [
-            type,
-            await getKnowledgeEntries(novelId, { type }),
-          ] as const));
-          const existingByType = new Map(existingPairs);
-          const results = await Promise.all(uniqueEntries.map(entry =>
-            upsertStoryDeckEntry(novelId, entry, existingByType),
-          ));
-          const afterPairs = await Promise.all(touchedTypes.map(async type => [
-            type,
-            await getKnowledgeEntries(novelId, { type }),
-          ] as const));
-          const afterByType = new Map(afterPairs);
-          uniqueEntries.forEach((entry, index) => {
-            const result = results[index];
-            if (!receiptId || result === 'unchanged') return;
-            const normalizedTitle = entry.title.trim().toLowerCase();
-            const before = (existingByType.get(entry.type) ?? []).find(
-              candidate => candidate.title.trim().toLowerCase() === normalizedTitle,
-            ) ?? null;
-            const after = (afterByType.get(entry.type) ?? []).find(
-              candidate => candidate.title.trim().toLowerCase() === normalizedTitle,
-            );
-            if (after) recordBrainstormEntryMutation(receiptId, before, after, result);
-          });
-          return {
-            ok: true as const,
-            created: results.filter(result => result === 'created').length,
-            updated: results.filter(result => result === 'updated').length,
-            unchanged: results.filter(result => result === 'unchanged').length,
-          };
-        }
         const durableResult = await runDurableBrainstormTool({
           novelId,
-          context: durable,
+          context,
           toolName: 'upsertStoryDeckEntries',
           input: semanticInput,
           prepare,
@@ -1027,17 +1063,7 @@ export function createBrainstormTools(
           execute: executeSync,
           validateRecovered: (prepared, result) => {
             const db = getDb();
-            const novelRow = db.prepare('SELECT stage FROM novels WHERE id = ?').get(novelId) as
-              | { stage: NovelStage }
-              | undefined;
-            const currentEntries = touchedTypes.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            const exactBefore = novelRow?.stage === prepared.beforeStage
-              && knowledgeEntriesFingerprint(currentEntries)
-                === prepared.beforeScopeFingerprint;
+            const exactBefore = storyDeckKeysMatchPreparedBefore(db, novelId, prepared);
             const validNoop = !prepared.editable
               || (
                 result.ok
@@ -1048,67 +1074,14 @@ export function createBrainstormTools(
               throw new Error('Durable brainstorm tool state conflict');
             }
           },
-          captureCompletionData: () => {
-            const db = getDb();
-            const novelRow = db.prepare('SELECT stage FROM novels WHERE id = ?').get(novelId) as
-              | { stage: NovelStage }
-              | undefined;
-            const currentEntries = touchedTypes.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            return {
-              version: 1,
-              stage: novelRow?.stage ?? null,
-              entriesFingerprint: knowledgeEntriesFingerprint(currentEntries),
-            };
-          },
-          validateCompleted: (_prepared, _result, completionData) => {
-            const db = getDb();
-            const novelRow = db.prepare('SELECT stage FROM novels WHERE id = ?').get(novelId) as
-              | { stage: NovelStage }
-              | undefined;
-            const currentEntries = touchedTypes.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            assertAuthoritativeCompletion(completionData, {
-              version: 1,
-              stage: novelRow?.stage ?? null,
-              entriesFingerprint: knowledgeEntriesFingerprint(currentEntries),
-            });
-          },
-          ensureReceipts: (prepared, result) => {
-            if (!receiptId || !result.ok) return;
-            const currentEntries = touchedTypes.flatMap(type =>
-              getDb().prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            uniqueEntries.forEach(entry => {
-              const before = prepared.beforeEntries.find(
-                row => entryKey(row) === entryKey(entry),
-              ) ?? null;
-              const after = currentEntries.find(row => entryKey(row) === entryKey(entry));
-              const action = before
-                ? (storyDeckInputMatchesRow(entry, before) ? 'unchanged' : 'updated')
-                : 'created';
-              if (after && action !== 'unchanged') {
-                recordBrainstormEntryMutation(receiptId, before, after, action);
-              }
-            });
-          },
           recover: async prepared => {
-            const currentNovel = await getNovel(novelId);
-            const currentEntries = (await Promise.all(touchedTypes.map(
-              type => getKnowledgeEntries(novelId, { type }),
-            ))).flat();
-            const exactBefore = currentNovel?.stage === prepared.beforeStage
-              && knowledgeEntriesFingerprint(currentEntries)
-                === prepared.beforeScopeFingerprint;
-            if (exactBefore && prepared.editable) {
+            const db = getDb();
+            if (!prepared.editable) {
+              return storyDeckKeysMatchPreparedBefore(db, novelId, prepared)
+                ? { state: 'already_after', result: prepared.result }
+                : { state: 'conflict' };
+            }
+            if (storyDeckKeysMatchPreparedBefore(db, novelId, prepared)) {
               if (
                 prepared.result.created === 0
                 && prepared.result.updated === 0
@@ -1116,9 +1089,6 @@ export function createBrainstormTools(
                 return { state: 'already_after', result: prepared.result };
               }
               return { state: 'safe_to_execute' };
-            }
-            if (exactBefore && !prepared.editable) {
-              return { state: 'already_after', result: prepared.result };
             }
             return { state: 'conflict' };
           },
@@ -1129,7 +1099,7 @@ export function createBrainstormTools(
           ))).flat().filter(entry =>
             uniqueEntries.some(input => entryKey(input) === entryKey(entry)),
           );
-          await reconcileBrainstormEntryEffects(novelId, afterEntries);
+          await drainCommittedBrainstormEntryEffects(novelId, afterEntries);
         }
         return durableResult;
       },
@@ -1139,7 +1109,7 @@ export function createBrainstormTools(
       inputSchema: finalizeBrainstormSchema,
       execute: async input => {
         const uniqueEntries = Array.from(new Map(input.entries.map(entry => [
-          `${entry.type}:${entry.title.trim().toLowerCase()}`,
+          entryKey(entry),
           entry,
         ])).values());
         const semanticInput = {
@@ -1164,6 +1134,8 @@ export function createBrainstormTools(
           const beforeEntries = uniqueEntries.map(entry =>
             scopedEntries.find(row => entryKey(row) === entryKey(entry))
           ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
+          const beforeByKey = new Map(beforeEntries.map(entry => [entryKey(entry), entry]));
+          const plannedWrites = await planStoryDeckWrites(novelId, uniqueEntries, beforeByKey);
           const coverage = uniqueEntries.reduce<Record<StoryDeckType, number>>(
             (counts, entry) => {
               counts[entry.type] += 1;
@@ -1175,6 +1147,7 @@ export function createBrainstormTools(
             beforeProfile: beforeNovel ? brainstormProfileSnapshot(beforeNovel) : null,
             beforeEntries,
             beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+            plannedWrites,
             result: !beforeNovel || !isInStages(beforeNovel.stage, EDITABLE_BRAINSTORM_STAGES)
               ? { ok: false as const, reason: 'not_editable' as const }
               : { ok: true as const, coverage },
@@ -1183,34 +1156,26 @@ export function createBrainstormTools(
         const executeSync = (prepared: Awaited<ReturnType<typeof prepare>>) => {
           if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
           const db = getDb();
-          const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-            | Record<string, unknown>
-            | undefined;
-          const currentNovel = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-          const currentEntries = STORY_DECK_TYPES.flatMap(type =>
-            db.prepare(
-              `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-            ).all(novelId, type) as KnowledgeEntryRow[]
-          );
+          const current = readBrainstormState(db, novelId);
           if (
-            !sameBrainstormProfile(currentNovel, prepared.beforeProfile)
-            || knowledgeEntriesFingerprint(currentEntries)
+            !sameBrainstormProfile(current.novel, prepared.beforeProfile)
+            || knowledgeEntriesFingerprint(current.entries)
               !== prepared.beforeScopeFingerprint
           ) {
             throw new Error('Durable brainstorm tool state conflict');
           }
-          const committed = commitFinalizedBrainstormSync(novelId, input, receiptId);
+          const committed = commitFinalizedBrainstormSync(
+            novelId,
+            input,
+            prepared.plannedWrites,
+            receiptId,
+          );
           if (!committed.ok) return committed;
           return { ok: true as const, coverage: committed.coverage };
         };
-        if (!durable) {
-          const prepared = await prepare();
-          if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
-          return commitFinalizedBrainstorm(novelId, input, receiptId);
-        }
         const durableResult = await runDurableBrainstormTool({
           novelId,
-          context: durable,
+          context,
           toolName: 'finalizeBrainstorm',
           input: semanticInput,
           prepare,
@@ -1218,89 +1183,15 @@ export function createBrainstormTools(
           hydratePrepared: hydrateKnowledgeBeforeEntries,
           execute: executeSync,
           validateRecovered: (prepared, result) => {
-            const db = getDb();
-            const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-              | Record<string, unknown>
-              | undefined;
-            const currentNovel = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            const currentEntries = STORY_DECK_TYPES.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
+            const current = readBrainstormState(getDb(), novelId);
             const exactBefore = (
-              (!currentNovel && !prepared.beforeProfile)
-              || sameBrainstormProfile(currentNovel, prepared.beforeProfile)
-            ) && knowledgeEntriesFingerprint(currentEntries)
+              (!current.novel && !prepared.beforeProfile)
+              || sameBrainstormProfile(current.novel, prepared.beforeProfile)
+            ) && knowledgeEntriesFingerprint(current.entries)
               === prepared.beforeScopeFingerprint;
             if (result.ok || !exactBefore) {
               throw new Error('Durable brainstorm tool state conflict');
             }
-          },
-          captureCompletionData: () => {
-            const db = getDb();
-            const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-              | Record<string, unknown>
-              | undefined;
-            const currentNovel = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            const currentEntries = STORY_DECK_TYPES.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            return {
-              version: 1,
-              profileFingerprint: brainstormProfileFingerprint(currentNovel),
-              entriesFingerprint: knowledgeEntriesFingerprint(currentEntries),
-            };
-          },
-          validateCompleted: (_prepared, _result, completionData) => {
-            const db = getDb();
-            const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-              | Record<string, unknown>
-              | undefined;
-            const currentNovel = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            const currentEntries = STORY_DECK_TYPES.flatMap(type =>
-              db.prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            assertAuthoritativeCompletion(completionData, {
-              version: 1,
-              profileFingerprint: brainstormProfileFingerprint(currentNovel),
-              entriesFingerprint: knowledgeEntriesFingerprint(currentEntries),
-            });
-          },
-          ensureReceipts: (prepared, result) => {
-            if (!receiptId || !result.ok || !prepared.beforeProfile) return;
-            const currentRow = getDb().prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
-              | Record<string, unknown>
-              | undefined;
-            const currentNovel = currentRow ? mapNovel(hydrateNovelRow(currentRow)) : null;
-            if (!currentNovel) return;
-            recordBrainstormProfileSnapshotMutation(
-              receiptId,
-              novelId,
-              prepared.beforeProfile,
-              currentNovel,
-            );
-            const currentEntries = STORY_DECK_TYPES.flatMap(type =>
-              getDb().prepare(
-                `SELECT * FROM knowledge_entries WHERE novel_id = ? AND type = ?`,
-              ).all(novelId, type) as KnowledgeEntryRow[],
-            );
-            uniqueEntries.forEach(entry => {
-              const before = prepared.beforeEntries.find(
-                row => entryKey(row) === entryKey(entry),
-              ) ?? null;
-              const after = currentEntries.find(row => entryKey(row) === entryKey(entry));
-              const action = before
-                ? (storyDeckInputMatchesRow(entry, before) ? 'unchanged' : 'updated')
-                : 'created';
-              if (after && action !== 'unchanged') {
-                recordBrainstormEntryMutation(receiptId, before, after, action);
-              }
-            });
           },
           recover: async prepared => {
             const currentNovel = await getNovel(novelId);
@@ -1331,7 +1222,7 @@ export function createBrainstormTools(
           const afterEntries = (await Promise.all(STORY_DECK_TYPES.map(
             type => getKnowledgeEntries(novelId, { type }),
           ))).flat();
-          await reconcileBrainstormEntryEffects(novelId, afterEntries);
+          await drainCommittedBrainstormEntryEffects(novelId, afterEntries);
         }
         return durableResult;
       },

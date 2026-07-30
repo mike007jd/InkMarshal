@@ -127,7 +127,7 @@ export async function createKnowledgeEntryWithIndex(
 ): Promise<KnowledgeEntryRow> {
   const db = getDb();
   const tx = db.transaction(() => {
-    insertKnowledgeEntryWithIndex(db, data, index);
+    insertKnowledgeEntryWithIndexInTx(db, data, index);
   });
   tx();
   return db
@@ -135,7 +135,8 @@ export async function createKnowledgeEntryWithIndex(
     .get(data.id) as KnowledgeEntryRow;
 }
 
-function insertKnowledgeEntryWithIndex(
+/** Join an open SQLite transaction: canonical row + index + Vault outbox intent. */
+export function insertKnowledgeEntryWithIndexInTx(
   db: ReturnType<typeof getDb>,
   data: KnowledgeEntryInsert,
   index: KnowledgeIndexInsert,
@@ -164,6 +165,21 @@ function insertKnowledgeEntryWithIndex(
     updatedAt: data.updatedAt,
   });
   touchNovelUpdatedAt(db, data.novelId);
+}
+
+/** Join an open SQLite transaction when the canonical row is already written. */
+export function upsertKnowledgeIndexAndVaultOutboxInTx(
+  db: ReturnType<typeof getDb>,
+  index: KnowledgeIndexInsert,
+  updatedAt: string,
+): void {
+  upsertKnowledgeIndex(db, index);
+  enqueueKnowledgeVaultUpsert(db, {
+    entryId: index.id,
+    novelId: index.novelId,
+    relPath: index.path,
+    updatedAt,
+  });
 }
 
 /**
@@ -216,7 +232,7 @@ export async function createKnowledgeEntryWithIndexForImportGeneration(
       : [];
     if (completedSlots.includes(slot)) return 'replayed';
 
-    insertKnowledgeEntryWithIndex(db, data, index);
+    insertKnowledgeEntryWithIndexInTx(db, data, index);
     db.prepare('UPDATE novels SET settings = ? WHERE id = ?').run(
       toJsonText({
         ...settings,
@@ -271,6 +287,41 @@ export async function updateKnowledgeEntry(
   if (info.changes > 0 && row) touchNovelUpdatedAt(db, row.novel_id);
 }
 
+/** Join an open SQLite transaction: update canonical row + index + Vault outbox. */
+export function updateKnowledgeEntryWithIndexInTx(
+  db: ReturnType<typeof getDb>,
+  id: string,
+  fields: {
+    title?: string;
+    type?: string;
+    summary?: string;
+    data?: string;
+    tags?: string;
+    updatedAt: string;
+  },
+  index: KnowledgeIndexInsert,
+): void {
+  const row = db
+    .prepare('SELECT novel_id FROM knowledge_entries WHERE id = ?')
+    .get(id) as { novel_id: string } | undefined;
+  const setParts: string[] = ['updated_at = ?'];
+  const values: unknown[] = [fields.updatedAt];
+
+  if (fields.title !== undefined) { setParts.push('title = ?'); values.push(fields.title); }
+  if (fields.type !== undefined) { setParts.push('type = ?'); values.push(fields.type); }
+  if (fields.summary !== undefined) { setParts.push('summary = ?'); values.push(fields.summary); }
+  if (fields.data !== undefined) { setParts.push('data = ?'); values.push(fields.data); }
+  if (fields.tags !== undefined) { setParts.push('tags = ?'); values.push(fields.tags); }
+
+  const info = db.prepare(
+    `UPDATE knowledge_entries SET ${setParts.join(', ')} WHERE id = ?`,
+  ).run(...values, id);
+  if (info.changes > 0 && row) {
+    upsertKnowledgeIndexAndVaultOutboxInTx(db, index, fields.updatedAt);
+    touchNovelUpdatedAt(db, row.novel_id);
+  }
+}
+
 export async function updateKnowledgeEntryWithIndex(
   id: string,
   fields: {
@@ -284,33 +335,9 @@ export async function updateKnowledgeEntryWithIndex(
   index: KnowledgeIndexInsert,
 ): Promise<void> {
   const db = getDb();
-  const row = db
-    .prepare('SELECT novel_id FROM knowledge_entries WHERE id = ?')
-    .get(id) as { novel_id: string } | undefined;
-  const setParts: string[] = ['updated_at = ?'];
-  const values: unknown[] = [fields.updatedAt];
-
-  if (fields.title !== undefined) { setParts.push('title = ?'); values.push(fields.title); }
-  if (fields.type !== undefined) { setParts.push('type = ?'); values.push(fields.type); }
-  if (fields.summary !== undefined) { setParts.push('summary = ?'); values.push(fields.summary); }
-  if (fields.data !== undefined) { setParts.push('data = ?'); values.push(fields.data); }
-  if (fields.tags !== undefined) { setParts.push('tags = ?'); values.push(fields.tags); }
-
-  const updateEntry = db.prepare(`UPDATE knowledge_entries SET ${setParts.join(', ')} WHERE id = ?`);
-  const tx = db.transaction(() => {
-    const info = updateEntry.run(...values, id);
-    if (info.changes > 0 && row) {
-      upsertKnowledgeIndex(db, index);
-      enqueueKnowledgeVaultUpsert(db, {
-        entryId: index.id,
-        novelId: index.novelId,
-        relPath: index.path,
-        updatedAt: fields.updatedAt,
-      });
-      touchNovelUpdatedAt(db, row.novel_id);
-    }
-  });
-  tx();
+  db.transaction(() => {
+    updateKnowledgeEntryWithIndexInTx(db, id, fields, index);
+  })();
 }
 
 export async function deleteKnowledgeEntry(

@@ -2,8 +2,25 @@ import type Database from 'better-sqlite3';
 import { nowIso } from '@/lib/utils';
 import { getDb } from '@/lib/db/connection';
 
-export function touchNovelUpdatedAt(db: Database.Database, novelId: string): void {
-  db.prepare('UPDATE novels SET updated_at = ? WHERE id = ?').run(nowIso(), novelId);
+export function nextNovelUpdatedAt(db: Database.Database, novelId: string): string {
+  const row = db.prepare('SELECT updated_at FROM novels WHERE id = ?').get(novelId) as
+    | { updated_at: string }
+    | undefined;
+  const previousMs = row ? Date.parse(row.updated_at) : Number.NaN;
+  return new Date(Math.max(
+    Date.now(),
+    Number.isFinite(previousMs) ? previousMs + 1 : 0,
+  )).toISOString();
+}
+
+export function touchNovelUpdatedAt(
+  db: Database.Database,
+  novelId: string,
+): number | null {
+  const updatedAt = nextNovelUpdatedAt(db, novelId);
+  const result = db.prepare('UPDATE novels SET updated_at = ? WHERE id = ?')
+    .run(updatedAt, novelId);
+  return result.changes === 1 ? Date.parse(updatedAt) : null;
 }
 
 export interface SeedKnowledgeEntry {
