@@ -139,7 +139,11 @@ function validateMacBundleSignature() {
   if (appEntitlements.includes('<key>com.apple.security.cs.allow-jit</key>')) {
     fail('allow-jit must be limited to the bundled Node runtime, not the app process.');
   }
-  const spctlOutput = runRequired('spctl', ['-a', '-vv', '-t', 'install', stableDmgPath], 'Gatekeeper assessment');
+  const spctlOutput = runRequired(
+    '/usr/sbin/spctl',
+    ['-a', '-vv', '-t', 'install', stableDmgPath],
+    'Gatekeeper assessment',
+  );
   if (/no usable signature|source=Unnotarized Developer ID|rejected/i.test(spctlOutput)) {
     fail(`Gatekeeper assessment is not release-grade: ${spctlOutput}`);
   }
