@@ -92,15 +92,51 @@ describe('explicit writing approval detection', () => {
   });
 });
 
+async function acquireDurableBrainstormTools(novelId: string, label: string) {
+  const {
+    attachChatTurnBrainstormReceipt,
+    beginChatTurn,
+    hashChatTurnRequest,
+  } = await import('@/lib/db');
+  const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+  const { ensureBrainstormReceipt } = await import('@/lib/brainstorm-receipts');
+  const userMessageId = `${label}-user`;
+  const claim = beginChatTurn({
+    novelId,
+    userMessageId,
+    requestHash: hashChatTurnRequest({ content: label, mode: 'ordinary' }),
+    assistantMessageId: `${label}-assistant`,
+  });
+  if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+    throw new Error(`Expected acquired durable tools for ${label}`);
+  }
+  const receiptId = ensureBrainstormReceipt(novelId, claim.turn.brainstormReceiptId);
+  expect(attachChatTurnBrainstormReceipt(
+    novelId,
+    userMessageId,
+    receiptId,
+    claim.turn.claimToken,
+  )).toBe(true);
+  return {
+    receiptId,
+    userMessageId,
+    claimToken: claim.turn.claimToken,
+    tools: createBrainstormTools(novelId, {
+      receiptId,
+      userMessageId,
+      claimToken: claim.turn.claimToken,
+    }),
+  };
+}
+
 describe('brainstorm agent tools', () => {
   it('only marks a brainstorm ready after atomically saving a complete Story Deck', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
     const { getInterviewState } = await import('@/lib/interview-state-server');
-    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Ready' });
 
     try {
-      const tools = createBrainstormTools(novel.id);
+      const { tools } = await acquireDurableBrainstormTools(novel.id, 'brainstorm-ready');
       await (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
         profile: {
           genre: 'Mystery',
@@ -131,11 +167,10 @@ describe('brainstorm agent tools', () => {
 
   it('does not advance the stage when finalization omits a required Deck category', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
-    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const novel = await createNovel({ userId: 'local-user', title: 'Incomplete Brainstorm' });
 
     try {
-      const tools = createBrainstormTools(novel.id);
+      const { tools } = await acquireDurableBrainstormTools(novel.id, 'incomplete-brainstorm');
       const result = await (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
         profile: { storySummary: 'A proposal that is not structurally complete.' },
         entries: [
@@ -161,7 +196,8 @@ describe('brainstorm agent tools', () => {
       getNovel,
       updateNovel,
     } = await import('@/lib/db');
-    const { finalizeApprovedStoryDeck } = await import('@/lib/brainstorm-agent');
+    const { getDb } = await import('@/lib/db/connection');
+    const { finalizeApprovedStoryDeckForClaim } = await import('@/lib/brainstorm-agent');
     const novel = await createNovel({ userId: 'local-user', title: 'Partial Deck Repair' });
     await updateNovel(novel.id, {
       genre: 'Mystery',
@@ -200,7 +236,14 @@ describe('brainstorm agent tools', () => {
         });
       }
 
-      expect(await finalizeApprovedStoryDeck(novel.id, 'en')).toMatchObject({ ok: true });
+      const repair = await acquireDurableBrainstormTools(novel.id, 'partial-deck-repair');
+      expect(await finalizeApprovedStoryDeckForClaim({
+        novelId: novel.id,
+        locale: 'en',
+        receiptId: repair.receiptId,
+        userMessageId: repair.userMessageId,
+        claimToken: repair.claimToken,
+      })).toMatchObject({ ok: true });
 
       const entries = await getKnowledgeEntries(novel.id);
       expect(entries.filter(entry => entry.type === 'character')).toHaveLength(1);
@@ -216,6 +259,12 @@ describe('brainstorm agent tools', () => {
           tags: original.tags,
           updated_at: updatedAt,
         });
+        expect(getDb().prepare(
+          'SELECT id FROM knowledge_index WHERE id = ?',
+        ).get(original.id)).toEqual({ id: original.id });
+        expect(getDb().prepare(
+          `SELECT operation, status FROM knowledge_vault_outbox WHERE entry_id = ?`,
+        ).get(original.id)).toMatchObject({ operation: 'upsert', status: 'pending' });
       }
       expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
     } finally {
@@ -225,11 +274,10 @@ describe('brainstorm agent tools', () => {
 
   it('upserts Story Deck entries as knowledge records', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries } = await import('@/lib/db');
-    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Deck' });
 
     try {
-      const tools = createBrainstormTools(novel.id);
+      const { tools } = await acquireDurableBrainstormTools(novel.id, 'brainstorm-deck');
       const result = await (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
         entries: [
           {
@@ -259,17 +307,14 @@ describe('brainstorm agent tools', () => {
 
   it('emits one visible receipt and atomically refuses stale undo', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel, updateNovel } = await import('@/lib/db');
-    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const {
-      beginBrainstormReceipt,
       consumeLatestBrainstormReceipt,
       undoBrainstormReceipt,
     } = await import('@/lib/brainstorm-receipts');
     const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Receipt' });
 
     try {
-      const receiptId = beginBrainstormReceipt(novel.id);
-      const tools = createBrainstormTools(novel.id, receiptId);
+      const { receiptId, tools } = await acquireDurableBrainstormTools(novel.id, 'brainstorm-receipt');
       await (tools.updateBrainstormProfile as unknown as ExecutableTool).execute({
         genre: 'Mystery',
         storySummary: 'A librarian hears erased names.',
@@ -304,17 +349,14 @@ describe('brainstorm agent tools', () => {
 
   it('undoes the exact profile and Story Deck writes from a receipt', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
-    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const {
-      beginBrainstormReceipt,
       consumeLatestBrainstormReceipt,
       undoBrainstormReceipt,
     } = await import('@/lib/brainstorm-receipts');
     const novel = await createNovel({ userId: 'local-user', title: 'Brainstorm Undo' });
 
     try {
-      const receiptId = beginBrainstormReceipt(novel.id);
-      const tools = createBrainstormTools(novel.id, receiptId);
+      const { receiptId, tools } = await acquireDurableBrainstormTools(novel.id, 'brainstorm-undo');
       await (tools.updateBrainstormProfile as unknown as ExecutableTool).execute({ genre: 'Fantasy' });
       await (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
         entries: [{
@@ -345,9 +387,7 @@ describe('brainstorm agent tools', () => {
         getKnowledgeEntries,
         getKnowledgeRelationsByEntry,
       } = await import('@/lib/db');
-      const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
       const {
-        beginBrainstormReceipt,
         consumeLatestBrainstormReceipt,
         undoBrainstormReceipt,
       } = await import('@/lib/brainstorm-receipts');
@@ -367,8 +407,10 @@ describe('brainstorm agent tools', () => {
           createdAt: now,
           updatedAt: now,
         });
-        const receiptId = beginBrainstormReceipt(novel.id);
-        const tools = createBrainstormTools(novel.id, receiptId);
+        const { receiptId, tools } = await acquireDurableBrainstormTools(
+          novel.id,
+          `brainstorm-relation-${direction}`,
+        );
         await (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
           entries: [{
             type: 'character',

@@ -60,6 +60,7 @@ interface ChatToolLedgerEntry {
   status: 'prepared' | 'completed';
   preparedData: unknown;
   result?: unknown;
+  /** Read-compatible only for ledgers written before completed replay became cache-only. */
   completionData?: unknown;
 }
 
@@ -70,11 +71,11 @@ interface ChatToolLedger {
 
 export type PrepareChatTurnToolCallResult =
   | { kind: 'lost_claim' }
+  | { kind: 'blocked_by_prepared' }
   | {
       kind: 'prepared' | 'completed';
       preparedData: unknown;
       result?: unknown;
-      completionData?: unknown;
       newlyPrepared: boolean;
     };
 
@@ -113,6 +114,57 @@ function mapChatTurn(row: ChatTurnRow): ChatTurn {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function refreshBoundBrainstormReceiptRevision(
+  novelId: string,
+  userMessageId: string,
+  expectedBeforeRevision: number,
+  afterRevision: number,
+): void {
+  const db = getDb();
+  const row = db.prepare(
+    `SELECT receipt.id, receipt.profile_json
+       FROM chat_turns turn_row
+       JOIN brainstorm_receipts receipt
+         ON receipt.id = turn_row.brainstorm_receipt_id
+        AND receipt.novel_id = turn_row.novel_id
+      WHERE turn_row.novel_id = ? AND turn_row.user_message_id = ?`,
+  ).get(novelId, userMessageId) as {
+    id: string;
+    profile_json: string | null;
+  } | undefined;
+  if (!row?.profile_json) return;
+
+  try {
+    const profile = JSON.parse(row.profile_json) as {
+      before?: Record<string, unknown>;
+      after?: Record<string, unknown>;
+    };
+    if (
+      !profile.before
+      || !profile.after
+      || !Object.hasOwn(profile.before, 'updatedAt')
+      || !Object.hasOwn(profile.after, 'updatedAt')
+      || profile.after.updatedAt !== expectedBeforeRevision
+    ) {
+      return;
+    }
+    profile.after.updatedAt = afterRevision;
+    db.prepare(
+      `UPDATE brainstorm_receipts
+          SET profile_json = ?, updated_at = ?
+        WHERE id = ? AND novel_id = ? AND profile_json = ?`,
+    ).run(
+      JSON.stringify(profile),
+      nowIso(),
+      row.id,
+      novelId,
+      row.profile_json,
+    );
+  } catch {
+    // A corrupt inverse remains untouched so receipt loading can fail closed.
+  }
 }
 
 function parseChatToolLedger(value: string | null): ChatToolLedger {
@@ -482,7 +534,18 @@ export function persistChatTurnAssistantMessage(args: {
         db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ? AND novel_id = ?')
           .run(now, conversationId, args.novelId);
       }
-      touchNovelUpdatedAt(db, args.novelId);
+      const beforeTouch = db.prepare('SELECT updated_at FROM novels WHERE id = ?')
+        .get(args.novelId) as { updated_at: string } | undefined;
+      const beforeRevision = beforeTouch ? Date.parse(beforeTouch.updated_at) : Number.NaN;
+      const afterRevision = touchNovelUpdatedAt(db, args.novelId);
+      if (Number.isFinite(beforeRevision) && afterRevision !== null) {
+        refreshBoundBrainstormReceiptRevision(
+          args.novelId,
+          args.userMessageId,
+          beforeRevision,
+          afterRevision,
+        );
+      }
     }
     return mapMessage({
       id: row.id as string,
@@ -525,8 +588,10 @@ export function resetEmptySucceededChatTurn(args: {
 }
 
 /**
- * Persist a tool intent before its database mutation. The existing intent or
- * result wins on retry, so provider-generated tool call ids are irrelevant.
+ * Persist a tool intent before its database mutation. `toolKey` must already
+ * encode the semantic call identity (tool name + canonical input). The existing
+ * intent or result wins on retry for that identity; provider-generated tool
+ * call ids are irrelevant and must not be used as keys.
  */
 export function prepareChatTurnToolCall(args: {
   novelId: string;
@@ -556,18 +621,27 @@ export function prepareChatTurnToolCall(args: {
     }
 
     const ledger = parseChatToolLedger(row.response_text);
+    // A recovered turn must finish its oldest prepared intent before admitting
+    // another semantic mutation, regardless of provider retry call order.
+    const firstPreparedKey = Object.entries(ledger.entries)
+      .find(([, entry]) => entry.status === 'prepared')?.[0];
     const existing = ledger.entries[args.toolKey];
     if (existing) {
       if (existing.toolName !== args.toolName || existing.argsHash !== args.argsHash) {
         throw new Error('Durable chat tool ledger key collision');
       }
+      if (existing.status === 'prepared' && firstPreparedKey !== args.toolKey) {
+        return { kind: 'blocked_by_prepared' };
+      }
       return {
         kind: existing.status,
         preparedData: existing.preparedData,
         result: existing.result,
-        completionData: existing.completionData,
         newlyPrepared: false,
       };
+    }
+    if (firstPreparedKey) {
+      return { kind: 'blocked_by_prepared' };
     }
 
     ledger.entries[args.toolKey] = {
@@ -710,8 +784,6 @@ export function mutateAndCompleteChatTurnToolCall<T>(args: {
   toolName: string;
   argsHash: string;
   mutate: () => T;
-  captureCompletionData?: (result: T) => unknown;
-  onAlreadyCompleted?: (result: unknown, completionData: unknown) => void;
 }): MutateAndCompleteChatTurnToolCallResult<T> {
   const db = getDb();
   return db.transaction((): MutateAndCompleteChatTurnToolCallResult<T> => {
@@ -739,15 +811,12 @@ export function mutateAndCompleteChatTurnToolCall<T>(args: {
       throw new Error('Durable chat tool intent missing or mismatched');
     }
     if (entry.status === 'completed') {
-      args.onAlreadyCompleted?.(entry.result, entry.completionData);
       return { kind: 'already_completed', result: entry.result };
     }
 
     const result = args.mutate();
-    const completionData = args.captureCompletionData?.(result);
     entry.status = 'completed';
     entry.result = result;
-    entry.completionData = completionData;
     const write = db.prepare(
       `UPDATE chat_turns
           SET response_text = ?, updated_at = ?

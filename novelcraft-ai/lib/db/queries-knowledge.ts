@@ -8,6 +8,15 @@ import {
   enqueueKnowledgeVaultDelete,
   enqueueKnowledgeVaultUpsert,
 } from '@/lib/db/queries-knowledge-vault-outbox';
+import { knowledgeEntryIdentityKey } from '@/lib/knowledge/entry-identity';
+
+/**
+ * Deterministic ordering for normalized Story Deck identity resolution.
+ * Prepare (`getKnowledgeEntries`), fence, and finalization must share this
+ * so legacy title-case duplicates select the same canonical row.
+ */
+const KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL =
+  'sort_order ASC, updated_at DESC, id ASC';
 
 // `ke.`-aliased variant of SAFE_DATA_JSON (see json-columns.ts) for JOINs where
 // the knowledge table is aliased `ke`.
@@ -74,9 +83,25 @@ export async function getKnowledgeEntries(
     sql += ' AND (title LIKE ? OR summary LIKE ?)';
     params.push(like, like);
   }
-  sql += ' ORDER BY sort_order ASC, updated_at DESC';
+  sql += ` ORDER BY ${KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}`;
 
   return db.prepare(sql).all(...params) as KnowledgeEntryRow[];
+}
+
+/** First matching row under {@link KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}. */
+export function readKnowledgeEntryByNormalizedIdentity(
+  db: ReturnType<typeof getDb>,
+  novelId: string,
+  type: string,
+  title: string,
+): KnowledgeEntryRow | undefined {
+  const targetKey = knowledgeEntryIdentityKey({ type, title });
+  return (db.prepare(
+    `SELECT * FROM knowledge_entries
+      WHERE novel_id = ? AND type = ?
+      ORDER BY ${KNOWLEDGE_ENTRY_IDENTITY_ORDER_SQL}`,
+  ).all(novelId, type) as KnowledgeEntryRow[])
+    .find(row => knowledgeEntryIdentityKey(row) === targetKey);
 }
 
 export async function getKnowledgeEntry(
@@ -127,7 +152,7 @@ export async function createKnowledgeEntryWithIndex(
 ): Promise<KnowledgeEntryRow> {
   const db = getDb();
   const tx = db.transaction(() => {
-    insertKnowledgeEntryWithIndex(db, data, index);
+    insertKnowledgeEntryWithIndexInTx(db, data, index);
   });
   tx();
   return db
@@ -135,7 +160,8 @@ export async function createKnowledgeEntryWithIndex(
     .get(data.id) as KnowledgeEntryRow;
 }
 
-function insertKnowledgeEntryWithIndex(
+/** Join an open SQLite transaction: canonical row + index + Vault outbox intent. */
+export function insertKnowledgeEntryWithIndexInTx(
   db: ReturnType<typeof getDb>,
   data: KnowledgeEntryInsert,
   index: KnowledgeIndexInsert,
@@ -164,6 +190,21 @@ function insertKnowledgeEntryWithIndex(
     updatedAt: data.updatedAt,
   });
   touchNovelUpdatedAt(db, data.novelId);
+}
+
+/** Join an open SQLite transaction when the canonical row is already written. */
+export function upsertKnowledgeIndexAndVaultOutboxInTx(
+  db: ReturnType<typeof getDb>,
+  index: KnowledgeIndexInsert,
+  updatedAt: string,
+): void {
+  upsertKnowledgeIndex(db, index);
+  enqueueKnowledgeVaultUpsert(db, {
+    entryId: index.id,
+    novelId: index.novelId,
+    relPath: index.path,
+    updatedAt,
+  });
 }
 
 /**
@@ -216,7 +257,7 @@ export async function createKnowledgeEntryWithIndexForImportGeneration(
       : [];
     if (completedSlots.includes(slot)) return 'replayed';
 
-    insertKnowledgeEntryWithIndex(db, data, index);
+    insertKnowledgeEntryWithIndexInTx(db, data, index);
     db.prepare('UPDATE novels SET settings = ? WHERE id = ?').run(
       toJsonText({
         ...settings,
@@ -271,6 +312,41 @@ export async function updateKnowledgeEntry(
   if (info.changes > 0 && row) touchNovelUpdatedAt(db, row.novel_id);
 }
 
+/** Join an open SQLite transaction: update canonical row + index + Vault outbox. */
+export function updateKnowledgeEntryWithIndexInTx(
+  db: ReturnType<typeof getDb>,
+  id: string,
+  fields: {
+    title?: string;
+    type?: string;
+    summary?: string;
+    data?: string;
+    tags?: string;
+    updatedAt: string;
+  },
+  index: KnowledgeIndexInsert,
+): void {
+  const row = db
+    .prepare('SELECT novel_id FROM knowledge_entries WHERE id = ?')
+    .get(id) as { novel_id: string } | undefined;
+  const setParts: string[] = ['updated_at = ?'];
+  const values: unknown[] = [fields.updatedAt];
+
+  if (fields.title !== undefined) { setParts.push('title = ?'); values.push(fields.title); }
+  if (fields.type !== undefined) { setParts.push('type = ?'); values.push(fields.type); }
+  if (fields.summary !== undefined) { setParts.push('summary = ?'); values.push(fields.summary); }
+  if (fields.data !== undefined) { setParts.push('data = ?'); values.push(fields.data); }
+  if (fields.tags !== undefined) { setParts.push('tags = ?'); values.push(fields.tags); }
+
+  const info = db.prepare(
+    `UPDATE knowledge_entries SET ${setParts.join(', ')} WHERE id = ?`,
+  ).run(...values, id);
+  if (info.changes > 0 && row) {
+    upsertKnowledgeIndexAndVaultOutboxInTx(db, index, fields.updatedAt);
+    touchNovelUpdatedAt(db, row.novel_id);
+  }
+}
+
 export async function updateKnowledgeEntryWithIndex(
   id: string,
   fields: {
@@ -284,33 +360,9 @@ export async function updateKnowledgeEntryWithIndex(
   index: KnowledgeIndexInsert,
 ): Promise<void> {
   const db = getDb();
-  const row = db
-    .prepare('SELECT novel_id FROM knowledge_entries WHERE id = ?')
-    .get(id) as { novel_id: string } | undefined;
-  const setParts: string[] = ['updated_at = ?'];
-  const values: unknown[] = [fields.updatedAt];
-
-  if (fields.title !== undefined) { setParts.push('title = ?'); values.push(fields.title); }
-  if (fields.type !== undefined) { setParts.push('type = ?'); values.push(fields.type); }
-  if (fields.summary !== undefined) { setParts.push('summary = ?'); values.push(fields.summary); }
-  if (fields.data !== undefined) { setParts.push('data = ?'); values.push(fields.data); }
-  if (fields.tags !== undefined) { setParts.push('tags = ?'); values.push(fields.tags); }
-
-  const updateEntry = db.prepare(`UPDATE knowledge_entries SET ${setParts.join(', ')} WHERE id = ?`);
-  const tx = db.transaction(() => {
-    const info = updateEntry.run(...values, id);
-    if (info.changes > 0 && row) {
-      upsertKnowledgeIndex(db, index);
-      enqueueKnowledgeVaultUpsert(db, {
-        entryId: index.id,
-        novelId: index.novelId,
-        relPath: index.path,
-        updatedAt: fields.updatedAt,
-      });
-      touchNovelUpdatedAt(db, row.novel_id);
-    }
-  });
-  tx();
+  db.transaction(() => {
+    updateKnowledgeEntryWithIndexInTx(db, id, fields, index);
+  })();
 }
 
 export async function deleteKnowledgeEntry(

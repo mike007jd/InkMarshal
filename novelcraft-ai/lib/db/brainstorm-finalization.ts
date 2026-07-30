@@ -1,19 +1,33 @@
 import { mapNovel, type Novel } from '@/lib/db-types';
 import { getDb } from '@/lib/db/connection';
 import { applyNovelUpdate, hydrateNovelRow } from '@/lib/db/queries-novel';
-import type { KnowledgeEntryRow } from '@/lib/db/queries-knowledge';
+import {
+  insertKnowledgeEntryWithIndexInTx,
+  type KnowledgeEntryRow,
+  readKnowledgeEntryByNormalizedIdentity,
+  updateKnowledgeEntryWithIndexInTx,
+  upsertKnowledgeIndexAndVaultOutboxInTx,
+} from '@/lib/db/queries-knowledge';
+import type { KnowledgeIndexInsert } from '@/lib/db/queries-vault';
 import { toJsonb, type InterviewState } from '@/lib/interview-state';
-import { nowIso } from '@/lib/utils';
 
 const EDITABLE_STAGES = new Set(['discovery_interview', 'ready_for_greenlight']);
 const STORY_DECK_TYPES = ['character', 'world', 'outline'] as const;
 
 export type BrainstormFinalizationEntry = {
+  id: string;
   type: 'character' | 'world' | 'outline';
   title: string;
   summary: string;
   data: Record<string, unknown>;
   tags: string[];
+  updatedAt: string;
+  index: KnowledgeIndexInsert | null;
+};
+
+export type BrainstormProjectionRepair = {
+  entry: KnowledgeEntryRow;
+  index: KnowledgeIndexInsert;
 };
 
 type BrainstormEntryMutation = {
@@ -146,15 +160,6 @@ export function approveExistingBrainstormAtomicSync(
   return tx();
 }
 
-export async function approveExistingBrainstormAtomic(
-  novelId: string,
-): Promise<ApproveExistingBrainstormResult> {
-  return approveExistingBrainstormAtomicSync(novelId);
-}
-
-function normalizedTitle(value: string): string {
-  return value.trim().toLowerCase();
-}
 function sameEntry(
   row: KnowledgeEntryRow,
   entry: BrainstormFinalizationEntry,
@@ -163,6 +168,24 @@ function sameEntry(
     && row.summary === entry.summary
     && row.data === JSON.stringify(entry.data)
     && row.tags === JSON.stringify(entry.tags);
+}
+
+function sameKnowledgeEntryRow(
+  left: KnowledgeEntryRow,
+  right: KnowledgeEntryRow,
+): boolean {
+  return left.id === right.id
+    && left.novel_id === right.novel_id
+    && (left.series_id ?? null) === (right.series_id ?? null)
+    && left.type === right.type
+    && left.title === right.title
+    && left.summary === right.summary
+    && left.data === right.data
+    && (left.data_v ?? null) === (right.data_v ?? null)
+    && left.tags === right.tags
+    && left.sort_order === right.sort_order
+    && left.created_at === right.created_at
+    && left.updated_at === right.updated_at;
 }
 
 /**
@@ -174,6 +197,7 @@ export function finalizeBrainstormAtomicSync(args: {
   profile: Partial<Novel>;
   entries: readonly BrainstormFinalizationEntry[];
   preserveExistingStoryDeck?: boolean;
+  projectionRepairs?: readonly BrainstormProjectionRepair[];
 }): FinalizeBrainstormResult {
   const submittedCoverage = args.entries.reduce<Record<BrainstormFinalizationEntry['type'], number>>(
     (counts, entry) => {
@@ -196,16 +220,9 @@ export function finalizeBrainstormAtomicSync(args: {
       return { ok: false, reason: 'not_editable' };
     }
 
-    const existingCoverage = { character: 0, world: 0, outline: 0 };
-    if (args.preserveExistingStoryDeck) {
-      const rows = db.prepare(
-        `SELECT type, COUNT(*) AS count
-           FROM knowledge_entries
-          WHERE novel_id = ? AND type IN ('character', 'world', 'outline')
-          GROUP BY type`,
-      ).all(args.novelId) as { type: BrainstormFinalizationEntry['type']; count: number }[];
-      for (const row of rows) existingCoverage[row.type] = row.count;
-    }
+    const existingCoverage = args.preserveExistingStoryDeck
+      ? storyDeckCoverage(db, args.novelId)
+      : { character: 0, world: 0, outline: 0 };
     const entriesToApply = args.preserveExistingStoryDeck
       ? args.entries.filter(entry => existingCoverage[entry.type] === 0)
       : args.entries;
@@ -220,57 +237,75 @@ export function finalizeBrainstormAtomicSync(args: {
       return { ok: false, reason: 'incomplete' };
     }
 
-    const beforeNovel = applyNovelUpdate(db, args.novelId, {});
-    if (!beforeNovel) return { ok: false, reason: 'not_found' };
+    for (const repair of args.projectionRepairs ?? []) {
+      const current = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?')
+        .get(repair.entry.id) as KnowledgeEntryRow | undefined;
+      if (
+        !current
+        || !sameKnowledgeEntryRow(current, repair.entry)
+        || repair.index.id !== repair.entry.id
+        || repair.index.novelId !== args.novelId
+      ) {
+        throw new Error('Brainstorm projection repair state conflict');
+      }
+      upsertKnowledgeIndexAndVaultOutboxInTx(
+        db,
+        repair.index,
+        repair.entry.updated_at,
+      );
+    }
+
+    const beforeRow = db.prepare('SELECT * FROM novels WHERE id = ?')
+      .get(args.novelId) as Record<string, unknown> | undefined;
+    if (!beforeRow) return { ok: false, reason: 'not_found' };
+    const beforeNovel = mapNovel(hydrateNovelRow(beforeRow));
 
     const mutations: BrainstormEntryMutation[] = [];
     for (const entry of entriesToApply) {
-      const before = db.prepare(
-        `SELECT * FROM knowledge_entries
-          WHERE novel_id = ? AND type = ? AND lower(trim(title)) = ?
-          ORDER BY updated_at DESC LIMIT 1`,
-      ).get(args.novelId, entry.type, normalizedTitle(entry.title)) as KnowledgeEntryRow | undefined;
-      const now = nowIso();
+      const before = readKnowledgeEntryByNormalizedIdentity(
+        db,
+        args.novelId,
+        entry.type,
+        entry.title,
+      );
       let action: BrainstormEntryMutation['action'];
-      let id: string;
       if (before) {
-        id = before.id;
+        if (entry.id !== before.id) {
+          throw new Error('Brainstorm finalization entry identity changed');
+        }
         action = sameEntry(before, entry) ? 'unchanged' : 'updated';
         if (action === 'updated') {
-          db.prepare(
-            `UPDATE knowledge_entries
-                SET title = ?, summary = ?, data = ?, tags = ?, updated_at = ?
-              WHERE id = ?`,
-          ).run(
-            entry.title,
-            entry.summary,
-            JSON.stringify(entry.data),
-            JSON.stringify(entry.tags),
-            now,
-            id,
-          );
+          if (!entry.index) {
+            throw new Error('Brainstorm finalization missing planned index');
+          }
+          updateKnowledgeEntryWithIndexInTx(db, entry.id, {
+            title: entry.title,
+            summary: entry.summary,
+            data: JSON.stringify(entry.data),
+            tags: JSON.stringify(entry.tags),
+            updatedAt: entry.updatedAt,
+          }, entry.index);
         }
       } else {
-        id = crypto.randomUUID();
+        if (!entry.index) {
+          throw new Error('Brainstorm finalization missing planned index');
+        }
         action = 'created';
-        db.prepare(
-          `INSERT INTO knowledge_entries
-            (id, novel_id, type, title, summary, data, sort_order, tags, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          id,
-          args.novelId,
-          entry.type,
-          entry.title,
-          entry.summary,
-          JSON.stringify(entry.data),
-          0,
-          JSON.stringify(entry.tags),
-          now,
-          now,
-        );
+        insertKnowledgeEntryWithIndexInTx(db, {
+          id: entry.id,
+          novelId: args.novelId,
+          type: entry.type,
+          title: entry.title,
+          summary: entry.summary,
+          data: JSON.stringify(entry.data),
+          sortOrder: 0,
+          tags: JSON.stringify(entry.tags),
+          createdAt: entry.updatedAt,
+          updatedAt: entry.updatedAt,
+        }, entry.index);
       }
-      const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?').get(id) as KnowledgeEntryRow;
+      const after = db.prepare('SELECT * FROM knowledge_entries WHERE id = ?')
+        .get(entry.id) as KnowledgeEntryRow;
       mutations.push({ action, before: before ?? null, after });
     }
 
@@ -283,18 +318,4 @@ export function finalizeBrainstormAtomicSync(args: {
     return { ok: true, beforeNovel, novel, mutations, coverage };
   });
   return tx();
-}
-
-/**
- * Commits the approved profile, the complete structured Story Deck, and the
- * ready stage in one SQLite transaction. If any write throws, none of the
- * visible brainstorm completion state is committed.
- */
-export async function finalizeBrainstormAtomic(args: {
-  novelId: string;
-  profile: Partial<Novel>;
-  entries: readonly BrainstormFinalizationEntry[];
-  preserveExistingStoryDeck?: boolean;
-}): Promise<FinalizeBrainstormResult> {
-  return finalizeBrainstormAtomicSync(args);
 }

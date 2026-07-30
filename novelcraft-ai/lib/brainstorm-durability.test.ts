@@ -24,7 +24,7 @@ afterAll(async () => {
 });
 
 describe('durable brainstorm tool effects', () => {
-  it('recovers every mutation-after-intent crash without a second write and rejects changed retry args', async () => {
+  it('recovers every mutation-after-intent crash without a second write', async () => {
     const {
       attachChatTurnBrainstormReceipt,
       beginChatTurn,
@@ -179,11 +179,6 @@ describe('durable brainstorm tool effects', () => {
           .execute({ storySummary: profileInput.storySummary, genre: profileInput.genre } as never),
       ).resolves.toEqual({ ok: true });
       expect((await getNovel(novel.id))?.genre).toBe('Mystery');
-      await expect(
-        (active.tools.updateBrainstormProfile as unknown as ExecutableTool)
-          .execute({ genre: 'Science Fiction' } as never),
-      ).rejects.toThrow('ledger key collision');
-      expect((await getNovel(novel.id))?.genre).toBe('Mystery');
 
       __setBrainstormMutationFaultForTest({ point: 'during_receipt_persist' });
       await expect(
@@ -191,6 +186,13 @@ describe('durable brainstorm tool effects', () => {
           .execute(deckInput as never),
       ).rejects.toThrow('INJECTED_BRAINSTORM_FAULT_DURING_RECEIPT_PERSIST');
       expect(await getKnowledgeEntries(novel.id, { type: 'character' })).toEqual([]);
+      expect(getDb().prepare(
+        `SELECT COUNT(*) AS count FROM knowledge_index
+          WHERE novel_id = ? AND type = 'character'`,
+      ).get(novel.id)).toEqual({ count: 0 });
+      expect(getDb().prepare(
+        `SELECT COUNT(*) AS count FROM knowledge_vault_outbox WHERE novel_id = ?`,
+      ).get(novel.id)).toEqual({ count: 0 });
       await expect(
         (active.tools.upsertStoryDeckEntries as unknown as ExecutableTool)
           .execute({
@@ -202,19 +204,25 @@ describe('durable brainstorm tool effects', () => {
       ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
       const mira = (await getKnowledgeEntries(novel.id, { type: 'character' }))[0];
       const miraIdentity = { id: mira.id, updatedAt: mira.updated_at };
+      expect(getDb().prepare(
+        'SELECT id FROM knowledge_index WHERE id = ?',
+      ).get(mira.id)).toEqual({ id: mira.id });
+      expect(getDb().prepare(
+        `SELECT entry_id, operation, status FROM knowledge_vault_outbox WHERE entry_id = ?`,
+      ).get(mira.id)).toMatchObject({
+        entry_id: mira.id,
+        operation: 'upsert',
+        status: 'pending',
+      });
+      // Exact same-input replay under the same durable turn is idempotent.
       await expect(
         (active.tools.upsertStoryDeckEntries as unknown as ExecutableTool)
-          .execute({
-            entries: [{
-              type: 'character',
-              title: 'Different Retry Title',
-              summary: 'Must never be inserted.',
-              details: {},
-            }],
-          } as never),
-      ).rejects.toThrow('ledger key collision');
+          .execute(deckInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
       expect((await getKnowledgeEntries(novel.id, { type: 'character' }))
         .map(entry => entry.title)).toEqual(['Mira']);
+      expect((await getKnowledgeEntries(novel.id, { type: 'character' }))[0])
+        .toMatchObject({ id: miraIdentity.id, updated_at: miraIdentity.updatedAt });
 
       // Simulate a real process restart after the ledger result was durable:
       // the in-memory receipt disappears, cancellation supplies partial text,
@@ -254,6 +262,12 @@ describe('durable brainstorm tool effects', () => {
       ).rejects.toThrow('INJECTED_BRAINSTORM_FAULT_AFTER_FIRST_MUTATION');
       expect((await getNovel(novel.id))?.stage).toBe('discovery_interview');
       expect((await getKnowledgeEntries(novel.id)).map(entry => entry.title)).toEqual(['Mira']);
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_index WHERE novel_id = ?',
+      ).get(novel.id)).toEqual({ count: 1 });
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_vault_outbox WHERE novel_id = ?',
+      ).get(novel.id)).toEqual({ count: 1 });
 
       failAndReclaim(active.claimToken);
       active = acquireTools();
@@ -268,16 +282,25 @@ describe('durable brainstorm tool effects', () => {
         .toEqual(['Mira', 'The Archive', 'The Locked Shelf'].sort());
       await expect(
         (active.tools.finalizeBrainstorm as unknown as ExecutableTool)
-          .execute({
-            ...finalizeInput,
-            entries: finalizeInput.entries.map((entry, index) => (
-              index === 1 ? { ...entry, title: 'Different World Retry' } : entry
-            )),
-          } as never),
-      ).rejects.toThrow('ledger key collision');
-      expect((await getKnowledgeEntries(novel.id)).some(
-        entry => entry.title === 'Different World Retry',
-      )).toBe(false);
+          .execute(finalizeInput as never),
+      ).resolves.toEqual({
+        ok: true,
+        coverage: { character: 1, world: 1, outline: 1 },
+      });
+      expect((await getKnowledgeEntries(novel.id)).map(entry => entry.title).sort())
+        .toEqual(['Mira', 'The Archive', 'The Locked Shelf'].sort());
+      for (const entry of await getKnowledgeEntries(novel.id)) {
+        expect(getDb().prepare(
+          'SELECT id FROM knowledge_index WHERE id = ?',
+        ).get(entry.id)).toEqual({ id: entry.id });
+        expect(getDb().prepare(
+          `SELECT entry_id, operation, status FROM knowledge_vault_outbox WHERE entry_id = ?`,
+        ).get(entry.id)).toMatchObject({
+          entry_id: entry.id,
+          operation: 'upsert',
+          status: 'pending',
+        });
+      }
 
       const receipt = consumeLatestBrainstormReceipt(novel.id);
       expect(receipt).toMatchObject({
@@ -308,7 +331,142 @@ describe('durable brainstorm tool effects', () => {
     }
   });
 
-  it('rejects completed replay when a user recreates the same card under a new identity', async () => {
+  it('upserts MIRA onto the prepare-selected canonical row among legacy normalized-title duplicates', async () => {
+    const {
+      attachChatTurnBrainstormReceipt,
+      beginChatTurn,
+      createKnowledgeEntry,
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const { ensureBrainstormReceipt } = await import('@/lib/brainstorm-receipts');
+
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Legacy Title Case Dupes',
+    });
+    const userMessageId = 'legacy-title-case-dupes-turn';
+    const requestHash = hashChatTurnRequest({
+      content: 'Update Mira casing',
+      mode: 'ordinary',
+    });
+    const claim = beginChatTurn({
+      novelId: novel.id,
+      userMessageId,
+      requestHash,
+      assistantMessageId: 'legacy-title-case-dupes-assistant',
+    });
+    if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+      throw new Error('Expected an acquired durable tool turn');
+    }
+    const receiptId = ensureBrainstormReceipt(
+      novel.id,
+      claim.turn.brainstormReceiptId,
+    );
+    expect(attachChatTurnBrainstormReceipt(
+      novel.id,
+      userMessageId,
+      receiptId,
+      claim.turn.claimToken,
+    )).toBe(true);
+    const tools = createBrainstormTools(novel.id, {
+      receiptId,
+      userMessageId,
+      claimToken: claim.turn.claimToken,
+    });
+
+    const canonicalId = crypto.randomUUID();
+    const newerDuplicateId = crypto.randomUUID();
+    try {
+      // Inverse of updated_at vs sort_order: prepare prefers sort_order ASC first.
+      await createKnowledgeEntry({
+        id: canonicalId,
+        novelId: novel.id,
+        type: 'character',
+        title: 'Mira',
+        summary: 'Older title-case row.',
+        data: JSON.stringify({ description: 'Older title-case row.' }),
+        tags: JSON.stringify(['brainstorm']),
+        sortOrder: 0,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:00:00.000Z',
+      });
+      await createKnowledgeEntry({
+        id: newerDuplicateId,
+        novelId: novel.id,
+        type: 'character',
+        title: 'mira',
+        summary: 'Newer lowercase duplicate.',
+        data: JSON.stringify({ description: 'Newer lowercase duplicate.' }),
+        tags: JSON.stringify(['brainstorm']),
+        sortOrder: 10,
+        createdAt: '2026-07-02T00:00:00.000Z',
+        updatedAt: '2026-07-30T00:00:00.000Z',
+      });
+
+      const prepareCanonical = (await getKnowledgeEntries(novel.id, { type: 'character' }))
+        .find(entry => entry.title.trim().toLowerCase() === 'mira');
+      expect(prepareCanonical?.id).toBe(canonicalId);
+
+      const miraUpdate = {
+        type: 'character' as const,
+        title: 'MIRA',
+        summary: 'Canonical casing restored.',
+        details: { arc: 'Keeps the prepare-selected identity' },
+      };
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
+          entries: [miraUpdate],
+        } as never),
+      ).resolves.toEqual({ ok: true, created: 0, updated: 1, unchanged: 0 });
+
+      const characters = await getKnowledgeEntries(novel.id, { type: 'character' });
+      expect(characters).toHaveLength(2);
+      const mutated = characters.find(entry => entry.id === canonicalId);
+      expect(mutated).toMatchObject({ id: canonicalId, title: 'MIRA' });
+      expect(mutated?.summary).toContain('Canonical casing restored.');
+      expect(characters.find(entry => entry.id === newerDuplicateId)).toMatchObject({
+        id: newerDuplicateId,
+        title: 'mira',
+        summary: 'Newer lowercase duplicate.',
+      });
+      await expect(
+        (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
+          profile: {
+            genre: 'Mystery',
+            storySummary: 'An index rewrites itself.',
+            characterSummary: 'MIRA protects the canonical record.',
+            arcSummary: 'She exposes the duplicate.',
+          },
+          entries: [
+            miraUpdate,
+            {
+              type: 'world',
+              title: 'The Archive',
+              summary: 'Erased histories speak at night.',
+              details: {},
+            },
+            {
+              type: 'outline',
+              title: 'The Locked Shelf',
+              summary: 'MIRA exposes the duplicate.',
+              details: {},
+            },
+          ],
+        } as never),
+      ).resolves.toEqual({
+        ok: true,
+        coverage: { character: 1, world: 1, outline: 1 },
+      });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('returns a completed replay without touching a user replacement', async () => {
     const {
       attachChatTurnBrainstormReceipt,
       beginChatTurn,
@@ -316,11 +474,13 @@ describe('durable brainstorm tool effects', () => {
       createNovel,
       deleteNovelCascade,
       getKnowledgeEntries,
+      getNovel,
       hashChatTurnRequest,
     } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
     const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
     const {
+      consumeLatestBrainstormReceipt,
       ensureBrainstormReceipt,
       undoBrainstormReceipt,
     } = await import('@/lib/brainstorm-receipts');
@@ -428,15 +588,20 @@ describe('durable brainstorm tool effects', () => {
       await expect(
         (active.tools.upsertStoryDeckEntries as unknown as ExecutableTool)
           .execute(input as never),
-      ).rejects.toThrow('Durable brainstorm tool state conflict');
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
       expect((await getKnowledgeEntries(novel.id, { type: 'character' }))[0].id)
         .toBe(replacementId);
 
       expect(getDb().prepare(
         'SELECT entries_json FROM brainstorm_receipts WHERE id = ?',
-      ).get(active.receiptId)).toEqual({ entries_json: '[]' });
+      ).get(active.receiptId)).toEqual({
+        entries_json: expect.stringContaining(original.id),
+      });
+      expect(consumeLatestBrainstormReceipt(novel.id)).toMatchObject({
+        id: active.receiptId,
+      });
       expect(await undoBrainstormReceipt(novel.id, active.receiptId))
-        .toEqual({ ok: false, reason: 'expired' });
+        .toEqual({ ok: false, reason: 'conflict' });
       expect((await getKnowledgeEntries(novel.id, { type: 'character' }))[0].id)
         .toBe(replacementId);
     } finally {
@@ -728,6 +893,7 @@ describe('durable brainstorm tool effects', () => {
       createNovel,
       deleteNovelCascade,
       getKnowledgeEntries,
+      getNovel,
       hashChatTurnRequest,
     } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
@@ -802,7 +968,7 @@ describe('durable brainstorm tool effects', () => {
         receiptId,
         claim.turn.claimToken,
       )).toBe(true);
-      const tools = createBrainstormTools(novel.id, {
+      let tools = createBrainstormTools(novel.id, {
         receiptId,
         userMessageId,
         claimToken: claim.turn.claimToken,
@@ -1070,11 +1236,16 @@ describe('durable brainstorm tool effects', () => {
       createNovel,
       deleteNovelCascade,
       getKnowledgeEntries,
+      getNovel,
       hashChatTurnRequest,
     } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
     const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
-    const { ensureBrainstormReceipt } = await import('@/lib/brainstorm-receipts');
+    const {
+      consumeLatestBrainstormReceipt,
+      ensureBrainstormReceipt,
+      undoBrainstormReceipt,
+    } = await import('@/lib/brainstorm-receipts');
     const novel = await createNovel({
       userId: 'local-user',
       title: 'Corrupt receipt rollback',
@@ -1131,6 +1302,544 @@ describe('durable brainstorm tool effects', () => {
         response_text: expect.stringContaining('"status":"prepared"'),
       });
     } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('serializes semantic calls, reserves colliding paths, and keeps exact replays cache-only', async () => {
+    const {
+      attachChatTurnBrainstormReceipt,
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      failChatTurn,
+      getKnowledgeEntries,
+      getNovel,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const {
+      __setBrainstormMutationFaultForTest,
+      consumeLatestBrainstormReceipt,
+      ensureBrainstormReceipt,
+      undoBrainstormReceipt,
+    } = await import('@/lib/brainstorm-receipts');
+
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Semantic tool identity',
+    });
+    const userMessageId = 'semantic-identity-turn';
+    const claim = beginChatTurn({
+      novelId: novel.id,
+      userMessageId,
+      requestHash: hashChatTurnRequest({
+        content: 'Two independent deck writes',
+        mode: 'ordinary',
+      }),
+      assistantMessageId: 'semantic-identity-assistant',
+    });
+
+    try {
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected semantic identity claim');
+      }
+      const receiptId = ensureBrainstormReceipt(novel.id);
+      expect(attachChatTurnBrainstormReceipt(
+        novel.id,
+        userMessageId,
+        receiptId,
+        claim.turn.claimToken,
+      )).toBe(true);
+      let tools = createBrainstormTools(novel.id, {
+        receiptId,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+      });
+      const genreInput = { genre: 'Mystery' };
+      const storyInput = { storySummary: 'A librarian hears erased names.' };
+      __setBrainstormMutationFaultForTest({ point: 'after_prepare' });
+      const [failedIntent, blockedMutation] = await Promise.allSettled([
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(genreInput as never),
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(storyInput as never),
+      ]);
+      expect(failedIntent).toMatchObject({
+        status: 'rejected',
+        reason: { message: 'INJECTED_BRAINSTORM_FAULT_AFTER_PREPARE' },
+      });
+      expect(blockedMutation).toMatchObject({
+        status: 'rejected',
+        reason: { message: 'Durable brainstorm tool queue stopped after prior failure' },
+      });
+      expect(await getNovel(novel.id)).toMatchObject({ genre: '', storySummary: '' });
+
+      expect(failChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+        errorCode: 'provider_failed',
+      })).toMatchObject({ status: 'failed' });
+      const reclaimed = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({
+          content: 'Two independent deck writes',
+          mode: 'ordinary',
+        }),
+        assistantMessageId: 'semantic-identity-assistant',
+      });
+      if (reclaimed.kind !== 'acquired' || !reclaimed.turn.claimToken) {
+        throw new Error('Expected reclaimed semantic identity claim');
+      }
+      tools = createBrainstormTools(novel.id, {
+        receiptId,
+        userMessageId,
+        claimToken: reclaimed.turn.claimToken,
+      });
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(storyInput as never),
+      ).rejects.toThrow('Durable brainstorm tool waiting for earlier prepared intent');
+      expect(await getNovel(novel.id)).toMatchObject({ genre: '', storySummary: '' });
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(genreInput as never),
+      ).resolves.toEqual({ ok: true });
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(storyInput as never),
+      ).resolves.toEqual({ ok: true });
+      const beforeNoOpRevision = (await getNovel(novel.id))!.updatedAt;
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute({ genre: 'Mystery', targetWords: 80_000 } as never),
+      ).resolves.toEqual({ ok: true });
+      expect((await getNovel(novel.id))!.updatedAt).toBe(beforeNoOpRevision);
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(genreInput as never),
+      ).resolves.toEqual({ ok: true });
+      expect(await getNovel(novel.id)).toMatchObject({
+        genre: 'Mystery',
+        storySummary: 'A librarian hears erased names.',
+      });
+      const miraInput = {
+        entries: [{
+          type: 'character' as const,
+          title: 'Mira',
+          summary: 'A skeptical archivist.',
+          details: { arc: 'Learns to trust the uncanny' },
+        }],
+      };
+      const collidingSlugInput = {
+        entries: [{
+          type: 'character' as const,
+          title: 'Mira*',
+          summary: 'A night librarian.',
+          details: { arc: 'Keeps the erased names' },
+        }],
+      };
+
+      const [miraResult, collidingSlugResult] = await Promise.all([
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(miraInput as never),
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(collidingSlugInput as never),
+      ]);
+      expect(miraResult).toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      expect(collidingSlugResult).toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      expect((await getKnowledgeEntries(novel.id, { type: 'character' }))
+        .map(entry => entry.title).sort()).toEqual(['Mira', 'Mira*']);
+
+      const beforeReplay = await getKnowledgeEntries(novel.id, { type: 'character' });
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(miraInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      expect(await getKnowledgeEntries(novel.id, { type: 'character' }))
+        .toEqual(beforeReplay);
+
+      for (const entry of beforeReplay) {
+        expect(getDb().prepare(
+          'SELECT id FROM knowledge_index WHERE id = ?',
+        ).get(entry.id)).toEqual({ id: entry.id });
+        expect(getDb().prepare(
+          `SELECT operation, status FROM knowledge_vault_outbox WHERE entry_id = ?`,
+        ).get(entry.id)).toMatchObject({ operation: 'upsert', status: 'pending' });
+      }
+      const indexPaths = getDb().prepare(
+        `SELECT path FROM knowledge_index
+          WHERE novel_id = ? AND type = 'character'`,
+      ).all(novel.id) as Array<{ path: string }>;
+      expect(new Set(indexPaths.map(row => row.path)).size).toBe(2);
+
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
+          entries: [
+            {
+              type: 'character',
+              title: 'Atlas',
+              summary: 'A mapmaker.',
+              details: {},
+            },
+            {
+              type: 'character',
+              title: 'Atlas*',
+              summary: 'A map thief.',
+              details: {},
+            },
+          ],
+        } as never),
+      ).resolves.toEqual({ ok: true, created: 2, updated: 0, unchanged: 0 });
+      const batchEntries = (await getKnowledgeEntries(novel.id, { type: 'character' }))
+        .filter(entry => entry.title.startsWith('Atlas'));
+      const batchPaths = batchEntries.map(entry => (
+        getDb().prepare('SELECT path FROM knowledge_index WHERE id = ?')
+          .get(entry.id) as { path: string }
+      ).path);
+      expect(batchEntries).toHaveLength(2);
+      expect(new Set(batchPaths).size).toBe(2);
+
+      const unicodeFirstInput = {
+        entries: [{
+          type: 'character' as const,
+          title: 'E\u0301lan',
+          summary: 'First version.',
+          details: {},
+        }],
+      };
+      const unicodeSecondInput = {
+        entries: [{
+          type: 'character' as const,
+          title: 'Élan',
+          summary: 'Second version.',
+          details: {},
+        }],
+      };
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(unicodeFirstInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(unicodeSecondInput as never),
+      ).resolves.toEqual({ ok: true, created: 0, updated: 1, unchanged: 0 });
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(unicodeFirstInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      expect((await getKnowledgeEntries(novel.id, { type: 'character' }))
+        .find(entry => entry.title.normalize('NFC') === 'Élan')).toMatchObject({
+        summary: 'Second version.',
+      });
+
+      await expect(
+        (tools.finalizeBrainstorm as unknown as ExecutableTool).execute({
+          profile: {
+            genre: 'Mystery',
+            targetWords: 60_000,
+            storySummary: 'A librarian hears erased names.',
+            characterSummary: 'Mira protects the archive.',
+            arcSummary: 'The archive reveals a betrayal.',
+          },
+          entries: [
+            ...miraInput.entries,
+            {
+              type: 'world',
+              title: 'The Archive',
+              summary: 'Erased histories speak at night.',
+              details: {},
+            },
+            {
+              type: 'outline',
+              title: 'The Locked Shelf',
+              summary: 'Mira exposes the betrayal.',
+              details: {},
+            },
+          ],
+        } as never),
+      ).resolves.toEqual({
+        ok: true,
+        coverage: { character: 1, world: 1, outline: 1 },
+      });
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(miraInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
+      expect(consumeLatestBrainstormReceipt(novel.id)).toMatchObject({ id: receiptId });
+      expect(await undoBrainstormReceipt(novel.id, receiptId)).toEqual({ ok: true });
+      expect(await getKnowledgeEntries(novel.id)).toEqual([]);
+      expect((await getNovel(novel.id))?.stage).toBe('discovery_interview');
+    } finally {
+      __setBrainstormMutationFaultForTest(null);
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('refuses stale undo after a user restores the same profile value', async () => {
+    const {
+      attachChatTurnBrainstormReceipt,
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      getNovel,
+      hashChatTurnRequest,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const { persistChatTurnAssistantMessage } = await import('@/lib/db/queries-chat-turns');
+    const {
+      consumeLatestBrainstormReceipt,
+      ensureBrainstormReceipt,
+      undoBrainstormReceipt,
+    } = await import('@/lib/brainstorm-receipts');
+
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Profile ABA fence',
+    });
+    const userMessageId = 'profile-aba-fence-turn';
+    const claim = beginChatTurn({
+      novelId: novel.id,
+      userMessageId,
+      requestHash: hashChatTurnRequest({
+        content: 'Use Mystery',
+        mode: 'ordinary',
+      }),
+      assistantMessageId: 'profile-aba-fence-assistant',
+    });
+
+    try {
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected profile ABA claim');
+      }
+      const receiptId = ensureBrainstormReceipt(novel.id);
+      expect(attachChatTurnBrainstormReceipt(
+        novel.id,
+        userMessageId,
+        receiptId,
+        claim.turn.claimToken,
+      )).toBe(true);
+      const tools = createBrainstormTools(novel.id, {
+        receiptId,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+      });
+      const input = { genre: 'Mystery' };
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(input as never),
+      ).resolves.toEqual({ ok: true });
+
+      await updateNovel(novel.id, { genre: 'Romance' });
+      await updateNovel(novel.id, { genre: 'Mystery' });
+      await expect(
+        (tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute(input as never),
+      ).resolves.toEqual({ ok: true });
+
+      expect(persistChatTurnAssistantMessage({
+        novelId: novel.id,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+        assistantMessageId: 'profile-aba-fence-assistant',
+        responseText: 'Mystery retained.',
+      })).toMatchObject({ content: 'Mystery retained.' });
+      expect(consumeLatestBrainstormReceipt(novel.id)).toMatchObject({ id: receiptId });
+      expect(await undoBrainstormReceipt(novel.id, receiptId))
+        .toEqual({ ok: false, reason: 'conflict' });
+      expect((await getNovel(novel.id))?.genre).toBe('Mystery');
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('rejects receipt chains that cross intervening user edits', async () => {
+    const {
+      attachChatTurnBrainstormReceipt,
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      getNovel,
+      hashChatTurnRequest,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const {
+      consumeLatestBrainstormReceipt,
+      ensureBrainstormReceipt,
+      undoBrainstormReceipt,
+    } = await import('@/lib/brainstorm-receipts');
+
+    const acquire = async (title: string, userMessageId: string) => {
+      const novel = await createNovel({ userId: 'local-user', title });
+      const claim = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({ content: title, mode: 'ordinary' }),
+        assistantMessageId: `${userMessageId}-assistant`,
+      });
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected intervening-edit claim');
+      }
+      const receiptId = ensureBrainstormReceipt(novel.id);
+      expect(attachChatTurnBrainstormReceipt(
+        novel.id,
+        userMessageId,
+        receiptId,
+        claim.turn.claimToken,
+      )).toBe(true);
+      return {
+        novel,
+        receiptId,
+        tools: createBrainstormTools(novel.id, {
+          receiptId,
+          userMessageId,
+          claimToken: claim.turn.claimToken,
+        }),
+      };
+    };
+
+    const profileCase = await acquire('Profile chain fence', 'profile-chain-fence');
+    const entryCase = await acquire('Entry chain fence', 'entry-chain-fence');
+    try {
+      await expect(
+        (profileCase.tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute({ genre: 'Fantasy' } as never),
+      ).resolves.toEqual({ ok: true });
+      await updateNovel(profileCase.novel.id, { genre: 'Romance' });
+      await expect(
+        (profileCase.tools.updateBrainstormProfile as unknown as ExecutableTool)
+          .execute({ genre: 'Mystery' } as never),
+      ).rejects.toThrow('Durable brainstorm receipt mutation conflict');
+      expect((await getNovel(profileCase.novel.id))?.genre).toBe('Romance');
+      expect(consumeLatestBrainstormReceipt(profileCase.novel.id))
+        .toMatchObject({ id: profileCase.receiptId });
+      expect(await undoBrainstormReceipt(profileCase.novel.id, profileCase.receiptId))
+        .toEqual({ ok: false, reason: 'conflict' });
+
+      const firstEntryInput = {
+        entries: [{
+          type: 'character' as const,
+          title: 'Mira',
+          summary: 'Tool first version.',
+          details: {},
+        }],
+      };
+      await expect(
+        (entryCase.tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute(firstEntryInput as never),
+      ).resolves.toEqual({ ok: true, created: 1, updated: 0, unchanged: 0 });
+      const entry = (await getKnowledgeEntries(
+        entryCase.novel.id,
+        { type: 'character' },
+      ))[0];
+      getDb().prepare(
+        `UPDATE knowledge_entries
+            SET summary = ?, data = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(
+        'Writer-owned version.',
+        JSON.stringify({ writerOwned: true }),
+        new Date(Date.now() + 1_000).toISOString(),
+        entry.id,
+      );
+      await expect(
+        (entryCase.tools.upsertStoryDeckEntries as unknown as ExecutableTool)
+          .execute({
+            entries: [{
+              ...firstEntryInput.entries[0],
+              summary: 'Tool second version.',
+            }],
+          } as never),
+      ).rejects.toThrow('Durable brainstorm receipt mutation conflict');
+      expect((await getKnowledgeEntries(
+        entryCase.novel.id,
+        { type: 'character' },
+      ))[0]).toMatchObject({ summary: 'Writer-owned version.' });
+      expect(consumeLatestBrainstormReceipt(entryCase.novel.id))
+        .toMatchObject({ id: entryCase.receiptId });
+      expect(await undoBrainstormReceipt(entryCase.novel.id, entryCase.receiptId))
+        .toEqual({ ok: false, reason: 'conflict' });
+    } finally {
+      await deleteNovelCascade(profileCase.novel.id, 'local-user');
+      await deleteNovelCascade(entryCase.novel.id, 'local-user');
+    }
+  });
+
+  it('rolls back entry, index, and outbox together when a claimed Story Deck mutation faults', async () => {
+    const {
+      attachChatTurnBrainstormReceipt,
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { createBrainstormTools } = await import('@/lib/brainstorm-agent');
+    const {
+      __setBrainstormMutationFaultForTest,
+      ensureBrainstormReceipt,
+    } = await import('@/lib/brainstorm-receipts');
+
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Atomic story deck rollback',
+    });
+    const userMessageId = 'atomic-story-deck-rollback';
+    const claim = beginChatTurn({
+      novelId: novel.id,
+      userMessageId,
+      requestHash: hashChatTurnRequest({
+        content: 'Atomic rollback',
+        mode: 'ordinary',
+      }),
+      assistantMessageId: 'atomic-story-deck-assistant',
+    });
+
+    try {
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected atomic rollback claim');
+      }
+      const receiptId = ensureBrainstormReceipt(novel.id);
+      expect(attachChatTurnBrainstormReceipt(
+        novel.id,
+        userMessageId,
+        receiptId,
+        claim.turn.claimToken,
+      )).toBe(true);
+      const tools = createBrainstormTools(novel.id, {
+        receiptId,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+      });
+      __setBrainstormMutationFaultForTest({ point: 'after_first_mutation' });
+      await expect(
+        (tools.upsertStoryDeckEntries as unknown as ExecutableTool).execute({
+          entries: [{
+            type: 'world',
+            title: 'The Archive',
+            summary: 'Must not partially land.',
+            details: {},
+          }],
+        } as never),
+      ).rejects.toThrow('INJECTED_BRAINSTORM_FAULT_AFTER_FIRST_MUTATION');
+      expect(await getKnowledgeEntries(novel.id)).toEqual([]);
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_index WHERE novel_id = ?',
+      ).get(novel.id)).toEqual({ count: 0 });
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_vault_outbox WHERE novel_id = ?',
+      ).get(novel.id)).toEqual({ count: 0 });
+    } finally {
+      __setBrainstormMutationFaultForTest(null);
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });
@@ -1208,6 +1917,12 @@ describe('durable brainstorm tool effects', () => {
       })).rejects.toThrow('INJECTED_BRAINSTORM_FAULT_DURING_RECEIPT_PERSIST');
       expect((await getNovel(repairNovel.id))?.stage).toBe('discovery_interview');
       expect(await getKnowledgeEntries(repairNovel.id)).toEqual([]);
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_index WHERE novel_id = ?',
+      ).get(repairNovel.id)).toEqual({ count: 0 });
+      expect(getDb().prepare(
+        'SELECT COUNT(*) AS count FROM knowledge_vault_outbox WHERE novel_id = ?',
+      ).get(repairNovel.id)).toEqual({ count: 0 });
       expectEmptyReceipt(repair.receiptId);
       await expect(finalizeApprovedStoryDeckForClaim({
         novelId: repairNovel.id,

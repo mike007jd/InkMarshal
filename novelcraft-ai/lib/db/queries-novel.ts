@@ -1,6 +1,6 @@
 import { nowIso, parseTimestamp } from '@/lib/utils';
 import { getDb } from '@/lib/db/connection';
-import { touchNovelUpdatedAt } from '@/lib/db/transactions';
+import { nextNovelUpdatedAt, touchNovelUpdatedAt } from '@/lib/db/transactions';
 import {
   parseJsonbWithVersion,
   toJsonText,
@@ -499,7 +499,7 @@ export function applyNovelUpdate(
   const allowedKeys = internal ? NOVEL_INTERNAL_FIELDS : NOVEL_WRITABLE_FIELDS;
 
   const setParts: string[] = ['updated_at = ?'];
-  const values: unknown[] = [nowIso()];
+  const values: unknown[] = [nextNovelUpdatedAt(db, id)];
   for (const key of allowedKeys) {
     if (key in data) {
       const col = FIELD_TO_COLUMN[key];

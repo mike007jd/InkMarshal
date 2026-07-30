@@ -62,17 +62,17 @@ async function seedCompleteDeck(novelId: string) {
   }
 }
 
-describe('approveExistingBrainstormAtomic', () => {
+describe('approveExistingBrainstormAtomicSync', () => {
   it('atomically advances when existing profile and Story Deck coverage are complete', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
     const { getInterviewState } = await import('@/lib/interview-state-server');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Approve Complete' });
 
     try {
       await seedCompleteDeck(novel.id);
       const beforeEntries = await getKnowledgeEntries(novel.id);
-      const result = await approveExistingBrainstormAtomic(novel.id);
+      const result = approveExistingBrainstormAtomicSync(novel.id);
 
       expect(result).toMatchObject({ ok: true, alreadyReady: false });
       expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
@@ -85,7 +85,7 @@ describe('approveExistingBrainstormAtomic', () => {
 
   it('rejects empty profile without title fallback or card writes', async () => {
     const { createKnowledgeEntry, createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Empty Profile' });
 
     try {
@@ -106,7 +106,7 @@ describe('approveExistingBrainstormAtomic', () => {
       }
 
       const beforeEntries = await getKnowledgeEntries(novel.id);
-      expect(await approveExistingBrainstormAtomic(novel.id)).toEqual({
+      expect(approveExistingBrainstormAtomicSync(novel.id)).toEqual({
         ok: false,
         reason: 'incomplete',
       });
@@ -127,7 +127,7 @@ describe('approveExistingBrainstormAtomic', () => {
       getNovel,
       updateNovel,
     } = await import('@/lib/db');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Incomplete Deck' });
 
     try {
@@ -150,7 +150,7 @@ describe('approveExistingBrainstormAtomic', () => {
         updatedAt: now,
       });
 
-      expect(await approveExistingBrainstormAtomic(novel.id)).toEqual({
+      expect(approveExistingBrainstormAtomicSync(novel.id)).toEqual({
         ok: false,
         reason: 'incomplete',
       });
@@ -169,7 +169,7 @@ describe('approveExistingBrainstormAtomic', () => {
       getNovel,
     } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict TOCTOU' });
 
     try {
@@ -181,7 +181,7 @@ describe('approveExistingBrainstormAtomic', () => {
         .run(outline.id, novel.id);
       const beforeUpdatedAt = (await getNovel(novel.id))!.updatedAt;
 
-      expect(await approveExistingBrainstormAtomic(novel.id)).toEqual({
+      expect(approveExistingBrainstormAtomicSync(novel.id)).toEqual({
         ok: false,
         reason: 'incomplete',
       });
@@ -205,7 +205,7 @@ describe('approveExistingBrainstormAtomic', () => {
   it('leaves no half-state when the stage write aborts', async () => {
     const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Atomic Fail' });
     const db = getDb();
 
@@ -221,7 +221,7 @@ describe('approveExistingBrainstormAtomic', () => {
          END`,
       ).run();
 
-      await expect(approveExistingBrainstormAtomic(novel.id)).rejects.toThrow(
+      expect(() => approveExistingBrainstormAtomicSync(novel.id)).toThrow(
         'forced strict approve failure',
       );
 
@@ -235,7 +235,7 @@ describe('approveExistingBrainstormAtomic', () => {
 
   it('returns alreadyReady without touching the novel when stage is ready', async () => {
     const { createNovel, deleteNovelCascade, getNovel, updateNovel } = await import('@/lib/db');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Already Ready' });
 
     try {
@@ -243,7 +243,7 @@ describe('approveExistingBrainstormAtomic', () => {
       await updateNovel(novel.id, { stage: 'ready_for_greenlight', progress: 0 });
       const before = await getNovel(novel.id);
 
-      const result = await approveExistingBrainstormAtomic(novel.id);
+      const result = approveExistingBrainstormAtomicSync(novel.id);
       expect(result).toMatchObject({ ok: true, alreadyReady: true });
       expect(await getNovel(novel.id)).toEqual(before);
     } finally {
@@ -260,7 +260,7 @@ describe('approveExistingBrainstormAtomic', () => {
       updateNovel,
     } = await import('@/lib/db');
     const { getDb } = await import('@/lib/db/connection');
-    const { approveExistingBrainstormAtomic } = await import('@/lib/db/brainstorm-finalization');
+    const { approveExistingBrainstormAtomicSync } = await import('@/lib/db/brainstorm-finalization');
     const novel = await createNovel({ userId: 'local-user', title: 'Strict Ready Incomplete' });
 
     try {
@@ -271,14 +271,14 @@ describe('approveExistingBrainstormAtomic', () => {
         .run(outline.id, novel.id);
       const before = await getNovel(novel.id);
 
-      expect(await approveExistingBrainstormAtomic(novel.id)).toEqual({
+      expect(approveExistingBrainstormAtomicSync(novel.id)).toEqual({
         ok: false,
         reason: 'incomplete',
       });
       expect(await getNovel(novel.id)).toEqual(before);
 
       await updateNovel(novel.id, { storySummary: '' });
-      expect(await approveExistingBrainstormAtomic(novel.id)).toEqual({
+      expect(approveExistingBrainstormAtomicSync(novel.id)).toEqual({
         ok: false,
         reason: 'incomplete',
       });

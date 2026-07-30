@@ -22,6 +22,7 @@ import {
 import { upsertKnowledgeIndex } from '@/lib/db/queries-vault';
 import { mapNovel } from '@/lib/db-types';
 import { buildKnowledgeIndexInsert } from '@/lib/knowledge/index-sync';
+import { knowledgeEntryIdentityKey } from '@/lib/knowledge/entry-identity';
 import type { InterviewStageName } from '@/lib/interview-state';
 import { type NovelStage } from '@/lib/novel-stages';
 import {
@@ -45,7 +46,9 @@ const PROFILE_FIELDS = [
 ] as const;
 
 type ProfileField = typeof PROFILE_FIELDS[number];
-export type BrainstormProfileSnapshot = Pick<Novel, ProfileField>;
+export type BrainstormProfileSnapshot =
+  & Pick<Novel, ProfileField>
+  & Partial<Pick<Novel, 'updatedAt'>>;
 
 interface EntryMutation {
   key: string;
@@ -91,6 +94,7 @@ type BrainstormMutationFaultPoint =
 
 type RegistryGlobal = typeof globalThis & {
   __inkmarshalBrainstormToolExecutions?: Map<string, Promise<unknown>>;
+  __inkmarshalBrainstormToolQueues?: Map<string, Promise<boolean>>;
   __inkmarshalBrainstormUndoFault?: (() => void) | null;
   __inkmarshalBrainstormMutationFault?: {
     point: BrainstormMutationFaultPoint;
@@ -102,6 +106,8 @@ type RegistryGlobal = typeof globalThis & {
 const registryGlobal = globalThis as RegistryGlobal;
 const toolExecutions = registryGlobal.__inkmarshalBrainstormToolExecutions
   ?? (registryGlobal.__inkmarshalBrainstormToolExecutions = new Map<string, Promise<unknown>>());
+const toolQueues = registryGlobal.__inkmarshalBrainstormToolQueues
+  ?? (registryGlobal.__inkmarshalBrainstormToolQueues = new Map<string, Promise<boolean>>());
 
 /** Test-only: throw inside the undo transaction after the first inverse op. */
 export function __setBrainstormUndoFaultForTest(hook: (() => void) | null): void {
@@ -165,11 +171,15 @@ function canonicalJson(value: unknown): string {
   ).join(',')}}`;
 }
 
+class EarlierPreparedToolPendingError extends Error {}
+
 /**
  * Execute one semantic tool mutation exactly once for a durable chat turn.
  * Claim validation, the semantic mutation, receipt persistence, and ledger
  * completion share one SQLite transaction. The in-process promise only
- * coalesces parallel duplicate calls from one provider step.
+ * coalesces exact duplicates. All tools in one turn serialize so each prepare
+ * sees prior commits, and a failed intent blocks mutations already queued
+ * behind it instead of invalidating that intent's recovery snapshot.
  */
 export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
   novelId: string;
@@ -193,18 +203,12 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
   recover: (prepared: TPrepared) => Promise<DurableToolRecovery<TResult>>;
   /** Revalidate a recovered no-op inside the same transaction as ledger completion. */
   validateRecovered: (prepared: TPrepared, result: TResult) => void;
-  /** Capture a compact authoritative post-image while still inside the claim transaction. */
-  captureCompletionData: (prepared: TPrepared, result: TResult) => unknown;
-  /** Revalidate the authoritative post-image before repairing a completed replay. */
-  validateCompleted: (
-    prepared: TPrepared,
-    result: TResult,
-    completionData: unknown,
-  ) => void;
-  /** Optional receipt repair after the authoritative post-image has been validated. */
-  ensureReceipts?: (prepared: TPrepared, result: TResult) => void;
 }): Promise<TResult> {
   const canonicalInput = canonicalJson(args.input);
+  // Semantic identity is toolName + canonical input. Same-name calls with
+  // different inputs get independent ledger slots and in-process promises;
+  // exact replay under the same turn coalesces and remains idempotent.
+  // Do not key on provider toolCallId — those are not stable across app replay.
   const argsHash = createHash('sha256')
     .update('inkmarshal.brainstorm-tool-args:v1:')
     .update(args.toolName)
@@ -214,6 +218,8 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
   const toolKey = createHash('sha256')
     .update('inkmarshal.brainstorm-tool-slot:v1:')
     .update(args.toolName)
+    .update('\0')
+    .update(canonicalInput)
     .digest('hex');
   const executionKey = [
     args.novelId,
@@ -223,8 +229,17 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
   ].join(':');
   const active = toolExecutions.get(executionKey) as Promise<TResult> | undefined;
   if (active) return active;
+  const queueKey = [
+    args.novelId,
+    args.context.userMessageId,
+    args.context.claimToken,
+  ].join(':');
+  const previous = toolQueues.get(queueKey) ?? Promise.resolve(true);
 
   const execution = (async (): Promise<TResult> => {
+    if (!await previous) {
+      throw new Error('Durable brainstorm tool queue stopped after prior failure');
+    }
     const proposedPrepared = await args.prepare();
     const externalized = args.externalizePrepared?.(proposedPrepared) ?? {
       preparedData: proposedPrepared,
@@ -243,6 +258,11 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
     if (ledger.kind === 'lost_claim') {
       throw new Error('Chat turn claim lost before brainstorm tool execution');
     }
+    if (ledger.kind === 'blocked_by_prepared') {
+      throw new EarlierPreparedToolPendingError(
+        'Durable brainstorm tool waiting for earlier prepared intent',
+      );
+    }
     maybeThrowMutationFault('after_prepare');
     const hydrate = (preparedData: unknown): TPrepared => {
       if (!args.hydratePrepared) return preparedData as TPrepared;
@@ -258,39 +278,13 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
       );
     };
     if (ledger.kind === 'completed') {
-      const prepared = hydrate(ledger.preparedData);
-      const completed = mutateAndCompleteChatTurnToolCall({
-        novelId: args.novelId,
-        userMessageId: args.context.userMessageId,
-        claimToken: args.context.claimToken,
-        toolKey,
-        toolName: args.toolName,
-        argsHash,
-        mutate: () => {
-          throw new Error('Completed brainstorm tool unexpectedly requested mutation');
-        },
-        onAlreadyCompleted: (result, completionData) => {
-          args.validateCompleted(prepared, result as TResult, completionData);
-          args.ensureReceipts?.(prepared, result as TResult);
-        },
-      });
-      if (completed.kind === 'lost_claim') {
-        throw new Error('Chat turn claim lost during brainstorm tool replay');
-      }
-      return completed.result as TResult;
+      return ledger.result as TResult;
     }
 
     const prepared = hydrate(ledger.preparedData);
-    let shouldExecute = false;
-    let alreadyAfter: TResult | undefined;
     const recovery = await args.recover(prepared);
     if (recovery.state === 'conflict') {
       throw new Error('Durable brainstorm tool state conflict');
-    }
-    if (recovery.state === 'already_after') {
-      alreadyAfter = recovery.result;
-    } else {
-      shouldExecute = true;
     }
     maybeThrowMutationFault('after_recover');
 
@@ -302,30 +296,33 @@ export async function runDurableBrainstormTool<TPrepared, TResult>(args: {
       toolName: args.toolName,
       argsHash,
       mutate: () => {
-        if (alreadyAfter !== undefined) {
-          args.validateRecovered(prepared, alreadyAfter);
-          args.ensureReceipts?.(prepared, alreadyAfter);
+        if (recovery.state === 'already_after') {
+          args.validateRecovered(prepared, recovery.result);
           maybeThrowMutationFault('during_receipt_persist');
-          return alreadyAfter;
-        }
-        if (!shouldExecute) {
-          throw new Error('Durable brainstorm tool reached mutate without work');
+          return recovery.result;
         }
         return args.execute(prepared);
       },
-      captureCompletionData: result => args.captureCompletionData(prepared, result),
     });
     if (completed.kind === 'lost_claim') {
       throw new Error('Chat turn claim lost during brainstorm tool execution');
     }
     return completed.result as TResult;
   })();
+  const queueTail = execution.then(
+    () => true,
+    error => error instanceof EarlierPreparedToolPendingError,
+  );
   toolExecutions.set(executionKey, execution);
+  toolQueues.set(queueKey, queueTail);
   try {
     return await execution;
   } finally {
     if (toolExecutions.get(executionKey) === execution) {
       toolExecutions.delete(executionKey);
+    }
+    if (toolQueues.get(queueKey) === queueTail) {
+      toolQueues.delete(queueKey);
     }
   }
 }
@@ -460,7 +457,12 @@ function isInterviewStateValue(value: unknown): boolean {
 
 function isProfileSnapshot(value: unknown): value is BrainstormProfileSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  if (!hasExactKeys(value, PROFILE_FIELDS)) return false;
+  if (
+    !hasExactKeys(value, PROFILE_FIELDS)
+    && !hasExactKeys(value, [...PROFILE_FIELDS, 'updatedAt'])
+  ) {
+    return false;
+  }
   const snapshot = value as Record<string, unknown>;
   if (typeof snapshot.genre !== 'string') return false;
   if (
@@ -480,6 +482,12 @@ function isProfileSnapshot(value: unknown): value is BrainstormProfileSnapshot {
     || !Number.isFinite(snapshot.progress)
     || snapshot.progress < 0
     || snapshot.progress > 100
+  ) {
+    return false;
+  }
+  if (
+    snapshot.updatedAt !== undefined
+    && (typeof snapshot.updatedAt !== 'number' || !Number.isFinite(snapshot.updatedAt))
   ) {
     return false;
   }
@@ -612,6 +620,9 @@ function isProfileMutation(value: unknown): value is ProfileMutation {
   if (!mutation.fields.every(isProfileField)) return false;
   if (new Set(mutation.fields).size !== mutation.fields.length) return false;
   const fields = mutation.fields as ProfileField[];
+  const beforeHasRevision = Object.hasOwn(mutation.before as object, 'updatedAt');
+  const afterHasRevision = Object.hasOwn(mutation.after as object, 'updatedAt');
+  if (beforeHasRevision !== afterHasRevision) return false;
   const changedFields = PROFILE_FIELDS.filter(field =>
     profileValuesDiffer(
       mutation.before as BrainstormProfileSnapshot,
@@ -685,11 +696,12 @@ function mapReceiptRow(row: ReceiptRow): DurableReceipt {
   if (row.undone !== 0 && row.undone !== 1) {
     throw new CorruptReceiptError('invalid receipt undone flag');
   }
-  const entries = parseEntryMutations(row.entries_json);
-  for (const mutation of entries) {
-    const expectedKey = `${mutation.after.type}:${mutation.after.title.trim().toLowerCase()}`;
+  const entries: EntryMutation[] = [];
+  for (const mutation of parseEntryMutations(row.entries_json)) {
+    const expectedKey = knowledgeEntryIdentityKey(mutation.after);
+    const legacyKey = legacyEntryIdentityKey(mutation.after);
     if (
-      mutation.key !== expectedKey
+      (mutation.key !== expectedKey && mutation.key !== legacyKey)
       || mutation.after.novel_id !== row.novel_id
       || (mutation.before !== null && (
         mutation.before.id !== mutation.after.id
@@ -697,6 +709,16 @@ function mapReceiptRow(row: ReceiptRow): DurableReceipt {
       ))
     ) {
       throw new CorruptReceiptError('entry mutation identity mismatch');
+    }
+    const existing = entries.find(entry => entry.key === expectedKey);
+    if (existing) {
+      if (!mutation.before || !sameKnowledgeEntry(existing.after, mutation.before)) {
+        throw new CorruptReceiptError('entry mutation chain mismatch');
+      }
+      existing.after = mutation.after;
+      existing.action = existing.before ? 'updated' : 'created';
+    } else {
+      entries.push({ ...mutation, key: expectedKey });
     }
   }
   return {
@@ -712,19 +734,20 @@ function mapReceiptRow(row: ReceiptRow): DurableReceipt {
   };
 }
 
-function selectReceiptRow(receiptId: string): ReceiptRow | undefined {
-  return getDb()
-    .prepare(
-      `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
-              undo_expires_at_ms, undone, profile_json, entries_json
-         FROM brainstorm_receipts
-        WHERE id = ?`,
-    )
-    .get(receiptId) as ReceiptRow | undefined;
+function selectReceiptRow(
+  db: ReturnType<typeof getDb>,
+  receiptId: string,
+): ReceiptRow | undefined {
+  return db.prepare(
+    `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
+            undo_expires_at_ms, undone, profile_json, entries_json
+       FROM brainstorm_receipts
+      WHERE id = ?`,
+  ).get(receiptId) as ReceiptRow | undefined;
 }
 
 function loadReceiptResult(receiptId: string): LoadReceiptResult {
-  const row = selectReceiptRow(receiptId);
+  const row = selectReceiptRow(getDb(), receiptId);
   if (!row) return { status: 'missing' };
   try {
     return { status: 'ok', receipt: mapReceiptRow(row) };
@@ -732,11 +755,6 @@ function loadReceiptResult(receiptId: string): LoadReceiptResult {
     if (error instanceof CorruptReceiptError) return { status: 'corrupt' };
     throw error;
   }
-}
-
-function loadReceipt(receiptId: string): DurableReceipt | null {
-  const loaded = loadReceiptResult(receiptId);
-  return loaded.status === 'ok' ? loaded.receipt : null;
 }
 
 /** Persist only when the row is absent or already owned by the same novel. */
@@ -776,8 +794,15 @@ function cleanupExpiredReceipts(now = Date.now()): void {
   getDb()
     .prepare(
       `DELETE FROM brainstorm_receipts
-        WHERE expires_at_ms <= ?
-           OR (undone = 1 AND consumed_at_ms IS NOT NULL)`,
+        WHERE (
+          expires_at_ms <= ?
+          OR (undone = 1 AND consumed_at_ms IS NOT NULL)
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM chat_turns
+             WHERE chat_turns.brainstorm_receipt_id = brainstorm_receipts.id
+               AND chat_turns.status = 'running'
+          )`,
     )
     .run(now);
 }
@@ -797,6 +822,7 @@ export function brainstormProfileSnapshot(novel: Novel): BrainstormProfileSnapsh
     stage: novel.stage,
     progress: novel.progress,
     interviewState: novel.interviewState,
+    updatedAt: novel.updatedAt,
   };
 }
 
@@ -819,6 +845,10 @@ function sameKnowledgeEntry(left: KnowledgeEntryRow, right: KnowledgeEntryRow): 
     && left.updated_at === right.updated_at;
 }
 
+function legacyEntryIdentityKey(entry: Pick<KnowledgeEntryRow, 'type' | 'title'>): string {
+  return `${entry.type}:${entry.title.trim().toLowerCase()}`;
+}
+
 function emptyReceipt(novelId: string, id = crypto.randomUUID()): DurableReceipt {
   return {
     id,
@@ -833,7 +863,7 @@ function emptyReceipt(novelId: string, id = crypto.randomUUID()): DurableReceipt
   };
 }
 
-export function beginBrainstormReceipt(novelId: string): string {
+function beginBrainstormReceipt(novelId: string): string {
   cleanupExpiredReceipts();
   const receipt = emptyReceipt(novelId);
   if (!persistReceipt(receipt)) {
@@ -900,6 +930,9 @@ function applyProfileMutationToReceipt(
   if (!receipt.profile) {
     receipt.profile = { before, after, fields: changedFields };
   } else {
+    if (!sameValue(receipt.profile.after, before)) {
+      throw new Error('Durable brainstorm receipt mutation conflict');
+    }
     receipt.profile.after = after;
     const fields = new Set(receipt.profile.fields);
     for (const field of changedFields) fields.add(field);
@@ -924,9 +957,12 @@ function applyEntryMutationToReceipt(
   if ((before !== null && !normalizedBefore) || !normalizedAfter) {
     throw new CorruptReceiptError('refusing to persist invalid entry mutation');
   }
-  const key = `${normalizedAfter.type}:${normalizedAfter.title.trim().toLowerCase()}`;
+  const key = knowledgeEntryIdentityKey(normalizedAfter);
   const existing = receipt.entries.find(entry => entry.key === key);
   if (existing) {
+    if (!normalizedBefore || !sameKnowledgeEntry(existing.after, normalizedBefore)) {
+      throw new Error('Durable brainstorm receipt mutation conflict');
+    }
     existing.after = normalizedAfter;
     // A row created earlier in this receipt remains a net creation even when a
     // later tool updates it; undo must still delete it rather than "restore"
@@ -956,7 +992,7 @@ export function recordBrainstormProfileMutation(
 }
 
 /** Claim-fenced callers may pass an open db handle to join an outer transaction. */
-export function recordBrainstormProfileSnapshotMutation(
+function recordBrainstormProfileSnapshotMutation(
   receiptId: string,
   novelId: string,
   before: BrainstormProfileSnapshot,
@@ -977,6 +1013,7 @@ export function recordBrainstormEntryMutation(
   before: KnowledgeEntryRow | null,
   after: KnowledgeEntryRow,
   action: 'created' | 'updated',
+  options: { profileRevisionBeforeMutation?: number } = {},
   db: ReturnType<typeof getDb> = getDb(),
 ): void {
   const receipt = loadReceiptInTx(db, receiptId);
@@ -984,6 +1021,21 @@ export function recordBrainstormEntryMutation(
     throw new CorruptReceiptError('brainstorm entry receipt missing or mismatched');
   }
   applyEntryMutationToReceipt(receipt, before, after, action);
+  if (
+    receipt.profile
+    && options.profileRevisionBeforeMutation !== undefined
+  ) {
+    const currentNovel = getNovelSync(db, after.novel_id);
+    if (!currentNovel) {
+      throw new CorruptReceiptError('brainstorm profile receipt novel missing');
+    }
+    const receiptRevision = receipt.profile.after.updatedAt;
+    if (receiptRevision === options.profileRevisionBeforeMutation) {
+      receipt.profile.after.updatedAt = currentNovel.updatedAt;
+    } else if (receiptRevision !== currentNovel.updatedAt) {
+      throw new Error('Durable brainstorm receipt mutation conflict');
+    }
+  }
   persistReceiptInTx(db, receipt);
 }
 
@@ -991,12 +1043,7 @@ function loadReceiptInTx(
   db: ReturnType<typeof getDb>,
   receiptId: string,
 ): DurableReceipt | null {
-  const row = db.prepare(
-    `SELECT id, novel_id, created_at_ms, expires_at_ms, consumed_at_ms,
-            undo_expires_at_ms, undone, profile_json, entries_json
-       FROM brainstorm_receipts
-      WHERE id = ?`,
-  ).get(receiptId) as ReceiptRow | undefined;
+  const row = selectReceiptRow(db, receiptId);
   if (!row) return null;
   return mapReceiptRow(row);
 }
@@ -1127,6 +1174,12 @@ export async function undoBrainstormReceipt(
   const currentNovel = await getNovel(novelId);
   if (!currentNovel) return { ok: false, reason: 'not_found' };
   if (receipt.profile) {
+    if (
+      receipt.profile.after.updatedAt !== undefined
+      && currentNovel.updatedAt !== receipt.profile.after.updatedAt
+    ) {
+      return { ok: false, reason: 'conflict' };
+    }
     for (const field of receipt.profile.fields) {
       if (!sameValue(currentNovel[field], receipt.profile.after[field])) {
         return { ok: false, reason: 'conflict' };
@@ -1136,7 +1189,7 @@ export async function undoBrainstormReceipt(
 
   const currentByKey = new Map(
     (await getKnowledgeEntries(novelId)).map(entry => [
-      `${entry.type}:${entry.title.trim().toLowerCase()}`,
+      knowledgeEntryIdentityKey(entry),
       entry,
     ]),
   );
@@ -1194,6 +1247,12 @@ export async function undoBrainstormReceipt(
         if (!live) {
           throw Object.assign(new Error('not_found'), { reason: 'not_found' as const });
         }
+        if (
+          locked.profile.after.updatedAt !== undefined
+          && live.updatedAt !== locked.profile.after.updatedAt
+        ) {
+          throw Object.assign(new Error('conflict'), { reason: 'conflict' as const });
+        }
         for (const field of locked.profile.fields) {
           if (!sameValue(live[field], locked.profile.after[field])) {
             throw Object.assign(new Error('conflict'), { reason: 'conflict' as const });
@@ -1205,7 +1264,7 @@ export async function undoBrainstormReceipt(
         .all(novelId) as KnowledgeEntryRow[];
       const liveByKey = new Map(
         liveEntries.map(entry => [
-          `${entry.type}:${entry.title.trim().toLowerCase()}`,
+          knowledgeEntryIdentityKey(entry),
           entry,
         ]),
       );

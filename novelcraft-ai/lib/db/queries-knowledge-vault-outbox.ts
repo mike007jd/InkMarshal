@@ -51,7 +51,11 @@ function getRawIntentByEntryId(db: Db, entryId: string): RawKnowledgeVaultOutbox
   ).get(entryId) as RawKnowledgeVaultOutboxRow | undefined;
 }
 
-/** Enqueue/supersede an upsert intent; returns the monotonic revision to CAS against. */
+/**
+ * Enqueue/supersede an upsert intent on the caller's db handle so it can join
+ * an open claim-fenced transaction with the canonical row and knowledge_index.
+ * Returns the monotonic revision to CAS against after commit.
+ */
 export function enqueueKnowledgeVaultUpsert(
   db: Db,
   input: { entryId: string; novelId: string; relPath: string; updatedAt: string },

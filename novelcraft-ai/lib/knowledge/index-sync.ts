@@ -46,8 +46,11 @@ export async function syncIndexFromEntry(input: IndexSyncInput): Promise<void> {
   }
 }
 
-export async function buildKnowledgeIndexInsert(input: IndexSyncInput): Promise<KnowledgeIndexInsert> {
-  const relPath = await resolveIndexPath(input);
+export async function buildKnowledgeIndexInsert(
+  input: IndexSyncInput,
+  reservedPaths: ReadonlySet<string> = new Set(),
+): Promise<KnowledgeIndexInsert> {
+  const relPath = await resolveIndexPath(input, reservedPaths);
   const aliases = normalizeKnowledgeAliases(input.data['aliases']);
   const importance = extractImportance(input.data);
   // Frontmatter `data` blob = everything in data minus structural keys + a
@@ -84,7 +87,10 @@ export async function buildKnowledgeIndexInsert(input: IndexSyncInput): Promise<
   };
 }
 
-async function resolveIndexPath(input: Pick<IndexSyncInput, 'id' | 'novelId' | 'type' | 'title'>): Promise<string> {
+async function resolveIndexPath(
+  input: Pick<IndexSyncInput, 'id' | 'novelId' | 'type' | 'title'>,
+  reservedPaths: ReadonlySet<string>,
+): Promise<string> {
   const existing = await getKnowledgeIndexById(input.id);
   if (existing) {
     if (existing.novelId !== input.novelId) {
@@ -96,12 +102,16 @@ async function resolveIndexPath(input: Pick<IndexSyncInput, 'id' | 'novelId' | '
   const slug = slugifyForFs(input.title);
   const basePath = vaultPathFor(input.type, `${slug}.md`);
   const baseOwner = await getKnowledgeIndexRowByPath(input.novelId, basePath);
-  if (!baseOwner || baseOwner.id === input.id) return basePath;
+  if ((!baseOwner || baseOwner.id === input.id) && !reservedPaths.has(basePath)) {
+    return basePath;
+  }
 
   const idSlug = slugifyForFs(input.id).slice(0, 64);
   const idPath = vaultPathFor(input.type, `${slug}-${idSlug}.md`);
   const idPathOwner = await getKnowledgeIndexRowByPath(input.novelId, idPath);
-  if (!idPathOwner || idPathOwner.id === input.id) return idPath;
+  if ((!idPathOwner || idPathOwner.id === input.id) && !reservedPaths.has(idPath)) {
+    return idPath;
+  }
 
   const hash = (await hashContent(`${input.novelId}:${input.id}:${basePath}`)).slice(0, 16);
   return vaultPathFor(input.type, `${slug}-${hash}.md`);
