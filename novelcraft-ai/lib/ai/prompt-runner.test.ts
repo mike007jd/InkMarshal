@@ -97,6 +97,41 @@ describe('resolveTemplate with a custom variant', () => {
     }
   });
 
+  it('rolls back prompt rows when binding the genre pack fails', async () => {
+    const { applyGenrePack } = await import('@/lib/prompt-genre-packs');
+    const { createNovel, deleteNovelCascade } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const novel = await createNovel({
+      userId: 'local-user',
+      title: 'Atomic genre pack',
+    });
+    const db = getDb();
+    const countRows = () => (db.prepare(
+      `SELECT COUNT(*) AS count
+         FROM prompt_templates
+        WHERE variant = 'genre_mystery'`,
+    ).get() as { count: number }).count;
+    const before = countRows();
+    const triggerName = `fail_genre_bind_${novel.id.replaceAll('-', '_')}`;
+
+    try {
+      db.exec(
+        `CREATE TEMP TRIGGER ${triggerName}
+         BEFORE UPDATE OF settings ON novels
+         WHEN OLD.id = '${novel.id}'
+         BEGIN
+           SELECT RAISE(ABORT, 'simulated settings bind failure');
+         END`,
+      );
+      await expect(applyGenrePack(novel.id, 'mystery'))
+        .rejects.toThrow('simulated settings bind failure');
+      expect(countRows()).toBe(before);
+    } finally {
+      db.exec(`DROP TRIGGER IF EXISTS ${triggerName}`);
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('still throws TemplateNotFoundError when the default coordinate is missing too', async () => {
     const { resolveTemplate } = await import('@/lib/ai/prompt-runner');
     const { TemplateNotFoundError } = await import('@/lib/prompt-template');

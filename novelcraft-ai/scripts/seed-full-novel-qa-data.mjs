@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import Database from 'better-sqlite3';
+import { CURRENT_SCHEMA_VERSION } from '../lib/db/schema/version.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -124,8 +125,8 @@ function chapterSummary(n) {
 
 function checkSchema(db) {
   const version = db.prepare('SELECT version FROM _schema_version ORDER BY version DESC LIMIT 1').get()?.version;
-  if (version !== 19) {
-    console.error(`Expected InkMarshal schema v19, found ${version ?? 'none'}. Start the app once with this INKMARSHAL_DATA_DIR before seeding.`);
+  if (version !== CURRENT_SCHEMA_VERSION) {
+    console.error(`Expected InkMarshal schema v${CURRENT_SCHEMA_VERSION}, found ${version ?? 'none'}. Start the app once with this INKMARSHAL_DATA_DIR before seeding.`);
     process.exit(3);
   }
 }

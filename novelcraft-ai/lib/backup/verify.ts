@@ -5,14 +5,17 @@
 //   2. Referential integrity (relation endpoints exist in entries; every outline
 //      chapterNumber has a matching chapter file; conversation/message refs).
 //
-// Compatibility gate: the MAJOR of `formatVersion` must equal the running
-// build's; a MAJOR mismatch is a breaking layout change and is rejected outright.
+// Compatibility gate: current 2.0 plus the explicitly published 1.0 / 1.1
+// formats. Unknown legacy minors, future 2.x minors, and malformed versions are
+// rejected — this build cannot restore layouts it does not understand.
 // `dbSchemaVersion` is informational only (shown in the preview, never blocks).
 //
-// Pre-decompression ZIP resource guard (fflate `unzipSync` filter metadata):
-// refuses oversized / unsafe archives before inflate allocates refused output.
+// ZIP resource guard: central/local metadata is only an early-rejection hint.
+// Every DEFLATE stream is inflated with a hard output ceiling, then its actual
+// length and CRC are checked before any package content is trusted.
 
-import { strFromU8, unzipSync, type UnzipFileInfo } from 'fflate';
+import { crc32, inflateRawSync } from 'node:zlib';
+import { strFromU8 } from 'fflate';
 import { sha256Hex } from '@/lib/backup/build-package';
 import {
   PACKAGE_PATHS,
@@ -40,6 +43,20 @@ export const ZIP_MAX_ENTRIES = 4096;
 export const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES = 64 * 1024 * 1024; // 64 MiB
 export const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024; // 256 MiB
 
+const ZIP_END_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
+const ZIP64_LOCATOR_SIGNATURE = 0x07064b50;
+const ZIP64_EXTRA_FIELD_ID = 0x0001;
+const ZIP64_VERSION = 45;
+const ZIP_END_BYTES = 22;
+const ZIP_CENTRAL_HEADER_BYTES = 46;
+const ZIP_LOCAL_HEADER_BYTES = 30;
+const ZIP_MAX_COMMENT_BYTES = 0xffff;
+const ZIP_DATA_DESCRIPTOR_FLAG = 0x0008;
+const ZIP_REJECTED_FLAGS = 0x0001 | 0x0040;
+
 export interface VerifyIssue {
   /** Machine code so the UI can localize; `detail` is a fallback English string. */
   code:
@@ -47,6 +64,7 @@ export interface VerifyIssue {
     | 'missing_manifest'
     | 'bad_manifest'
     | 'format_incompatible'
+    | 'unsupported_attachments'
     | 'missing_file'
     | 'missing_checksum'
     | 'sha256_mismatch'
@@ -84,18 +102,137 @@ export interface VerifyReport {
   bundle: BackupBundle | null;
 }
 
-function majorOf(version: string): string {
-  return String(version).split('.')[0] ?? '';
+class ZipArchiveError extends Error {
+  readonly issue: VerifyIssue | null;
+
+  constructor(issue: VerifyIssue | null = null) {
+    super(issue?.detail ?? 'Invalid ZIP archive');
+    this.name = 'ZipArchiveError';
+    this.issue = issue;
+  }
 }
 
-function minorOf(version: string): number {
-  const n = Number.parseInt(String(version).split('.')[1] ?? '0', 10);
-  return Number.isFinite(n) ? n : 0;
+interface ZipEntryRange {
+  start: number;
+  end: number;
+}
+
+interface ZipPayload {
+  name: string;
+  method: number;
+  start: number;
+  end: number;
+  declaredUncompressedSize: number;
+  crc: number;
+}
+
+function invalidZip(): never {
+  throw new ZipArchiveError();
+}
+
+function rejectZip(issue: VerifyIssue): never {
+  throw new ZipArchiveError(issue);
+}
+
+function hasZip64ExtraField(extra: Buffer): boolean {
+  let offset = 0;
+  while (offset < extra.length) {
+    if (offset + 4 > extra.length) invalidZip();
+    const fieldId = extra.readUInt16LE(offset);
+    const fieldLength = extra.readUInt16LE(offset + 2);
+    offset += 4;
+    if (offset + fieldLength > extra.length) invalidZip();
+    if (fieldId === ZIP64_EXTRA_FIELD_ID) return true;
+    offset += fieldLength;
+  }
+  return false;
+}
+
+function decodeZipEntryName(nameBytes: Buffer): string {
+  let name: string;
+  try {
+    name = new TextDecoder('utf-8', { fatal: true }).decode(nameBytes);
+  } catch {
+    invalidZip();
+  }
+  if (isUnsafeZipEntryName(name)) {
+    rejectZip({
+      code: 'zip_unsafe_path',
+      detail: `Archive entry name is unsafe: ${name}`,
+      ref: name,
+    });
+  }
+  return name;
+}
+
+function findEndOfCentralDirectory(buffer: Buffer): number {
+  if (buffer.length < ZIP_END_BYTES) invalidZip();
+  const earliest = Math.max(0, buffer.length - ZIP_END_BYTES - ZIP_MAX_COMMENT_BYTES);
+  for (let offset = buffer.length - ZIP_END_BYTES; offset >= earliest; offset -= 1) {
+    if (buffer.readUInt32LE(offset) !== ZIP_END_SIGNATURE) continue;
+    const commentLength = buffer.readUInt16LE(offset + 20);
+    if (offset + ZIP_END_BYTES + commentLength === buffer.length) return offset;
+  }
+  return invalidZip();
+}
+
+function dataDescriptorEnd(
+  buffer: Buffer,
+  start: number,
+  upperBound: number,
+  expectedCrc: number,
+  expectedCompressedSize: number,
+  expectedUncompressedSize: number,
+): number {
+  const matchesAt = (offset: number): boolean =>
+    offset + 12 <= upperBound
+    && buffer.readUInt32LE(offset) === expectedCrc
+    && buffer.readUInt32LE(offset + 4) === expectedCompressedSize
+    && buffer.readUInt32LE(offset + 8) === expectedUncompressedSize;
+
+  if (
+    start + 16 <= upperBound
+    && buffer.readUInt32LE(start) === ZIP_DATA_DESCRIPTOR_SIGNATURE
+    && matchesAt(start + 4)
+  ) {
+    return start + 16;
+  }
+  if (matchesAt(start)) return start + 12;
+  return invalidZip();
+}
+
+function parseFormatVersion(version: string): { major: number; minor: number } | null {
+  const match = /^(\d+)\.(\d+)$/.exec(String(version));
+  if (!match) return null;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor)) return null;
+  return { major, minor };
+}
+
+/**
+ * Accept only formats whose semantics this build explicitly understands.
+ * 1.0 / 1.1 are published legacy contracts; 2.0 is current. Do not use a broad
+ * "older major is safe" rule: a lower major can still be an unknown layout.
+ */
+export function isFormatCompatible(formatVersion: string): boolean {
+  const candidate = parseFormatVersion(formatVersion);
+  if (!candidate) return false;
+  if (candidate.major === 1) return candidate.minor === 0 || candidate.minor === 1;
+  return candidate.major === 2 && candidate.minor === 0;
 }
 
 /** Format 1.1+ requires the fixed history files to be present and checksummed. */
 function requiresHistoryLayout(formatVersion: string): boolean {
-  return majorOf(formatVersion) === majorOf(FORMAT_VERSION) && minorOf(formatVersion) >= 1;
+  const candidate = parseFormatVersion(formatVersion);
+  return candidate !== null
+    && (candidate.major >= 2 || (candidate.major === 1 && candidate.minor >= 1));
+}
+
+/** Format 2.0+ requires an explicit lifecycle state in every chapter file. */
+function requiresChapterProcessingStatus(formatVersion: string): boolean {
+  const candidate = parseFormatVersion(formatVersion);
+  return candidate !== null && candidate.major >= 2;
 }
 
 function parseJson<T>(raw: string): T | undefined {
@@ -145,8 +282,15 @@ function isBackupNovelPayload(value: unknown): value is BackupNovelPayload {
     && isFiniteNumber(value.updatedAt);
 }
 
-function isBackupChapter(value: unknown): value is BackupChapter {
+type SerializedBackupChapter = Omit<BackupChapter, 'processingStatus'> & {
+  processingStatus?: 'content_saved' | 'complete';
+};
+
+function isSerializedBackupChapter(value: unknown): value is SerializedBackupChapter {
   if (!isRecord(value)) return false;
+  const statusOk = value.processingStatus === undefined
+    || value.processingStatus === 'content_saved'
+    || value.processingStatus === 'complete';
   return isFiniteNumber(value.chapterNumber)
     && typeof value.title === 'string'
     && typeof value.content === 'string'
@@ -158,6 +302,7 @@ function isBackupChapter(value: unknown): value is BackupChapter {
     && (value.qualityIssues === null || Array.isArray(value.qualityIssues))
     && (value.generationMeta === null || isRecord(value.generationMeta))
     && (value.snapshots === null || Array.isArray(value.snapshots))
+    && statusOk
     && isFiniteNumber(value.createdAt);
 }
 
@@ -250,86 +395,282 @@ export function isUnsafeZipEntryName(name: string): boolean {
 }
 
 /**
- * Pre-decompression resource guard. Uses fflate's `unzipSync` filter, which
- * runs against central-directory metadata before inflate allocates output.
- * On violation the filter returns false (skips the refused entry) and records
- * a precise {@link VerifyIssue}; the caller must discard any partial output.
+ * Parse and extract a non-ZIP64 archive without trusting its size metadata.
+ * Central and local headers must agree, every payload range must be disjoint,
+ * and DEFLATE output is stopped at the smaller remaining entry/total budget.
  */
 function unzipWithResourceGuard(bytes: Uint8Array): {
   entries: Record<string, Uint8Array> | null;
   issue: VerifyIssue | null;
   zipError: boolean;
 } {
-  let issue: VerifyIssue | null = null;
-  let entryCount = 0;
-  let totalUncompressed = 0;
-  const seenNames = new Set<string>();
+  try {
+    const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const endOffset = findEndOfCentralDirectory(buffer);
+    const diskNumber = buffer.readUInt16LE(endOffset + 4);
+    const centralDisk = buffer.readUInt16LE(endOffset + 6);
+    const diskEntries = buffer.readUInt16LE(endOffset + 8);
+    const totalEntries = buffer.readUInt16LE(endOffset + 10);
+    const centralSize = buffer.readUInt32LE(endOffset + 12);
+    const centralOffset = buffer.readUInt32LE(endOffset + 16);
 
-  const refuse = (next: VerifyIssue): false => {
-    if (!issue) issue = next;
-    return false;
-  };
-
-  const filter = (file: UnzipFileInfo): boolean => {
-    // Once refused, skip every remaining entry so nothing further is allocated.
-    if (issue) return false;
-
-    entryCount += 1;
-    if (entryCount > ZIP_MAX_ENTRIES) {
-      return refuse({
+    if (diskNumber !== 0 || centralDisk !== 0 || diskEntries !== totalEntries) {
+      invalidZip();
+    }
+    if (
+      totalEntries === 0xffff
+      || centralSize === 0xffffffff
+      || centralOffset === 0xffffffff
+      || (
+        endOffset >= 20
+        && buffer.readUInt32LE(endOffset - 20) === ZIP64_LOCATOR_SIGNATURE
+      )
+    ) {
+      invalidZip();
+    }
+    if (totalEntries > ZIP_MAX_ENTRIES) {
+      rejectZip({
         code: 'zip_too_many_entries',
         detail: `Archive has more than ${ZIP_MAX_ENTRIES} entries.`,
-        ref: String(entryCount),
+        ref: String(totalEntries),
       });
     }
 
-    if (isUnsafeZipEntryName(file.name)) {
-      return refuse({
-        code: 'zip_unsafe_path',
-        detail: `Archive entry name is unsafe: ${file.name}`,
-        ref: file.name,
-      });
+    const centralEnd = centralOffset + centralSize;
+    if (
+      !Number.isSafeInteger(centralEnd)
+      || centralOffset > endOffset
+      || centralEnd !== endOffset
+    ) {
+      invalidZip();
     }
 
-    if (seenNames.has(file.name)) {
-      return refuse({
-        code: 'zip_duplicate_name',
-        detail: `Archive contains duplicate entry name: ${file.name}`,
-        ref: file.name,
-      });
-    }
-    seenNames.add(file.name);
+    let cursor = centralOffset;
+    let declaredTotal = 0;
+    const seenNames = new Set<string>();
+    const localRanges: ZipEntryRange[] = [];
+    const payloads: ZipPayload[] = [];
 
-    if (file.originalSize > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES) {
-      return refuse({
-        code: 'zip_entry_too_large',
-        detail: `Archive entry exceeds ${ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} uncompressed bytes.`,
-        ref: file.name,
+    for (let index = 0; index < totalEntries; index += 1) {
+      if (
+        cursor + ZIP_CENTRAL_HEADER_BYTES > centralEnd
+        || buffer.readUInt32LE(cursor) !== ZIP_CENTRAL_SIGNATURE
+      ) {
+        invalidZip();
+      }
+
+      const versionNeeded = buffer.readUInt16LE(cursor + 6);
+      const flags = buffer.readUInt16LE(cursor + 8);
+      const method = buffer.readUInt16LE(cursor + 10);
+      const crc = buffer.readUInt32LE(cursor + 16);
+      const compressedSize = buffer.readUInt32LE(cursor + 20);
+      const uncompressedSize = buffer.readUInt32LE(cursor + 24);
+      const nameLength = buffer.readUInt16LE(cursor + 28);
+      const extraLength = buffer.readUInt16LE(cursor + 30);
+      const commentLength = buffer.readUInt16LE(cursor + 32);
+      const diskStart = buffer.readUInt16LE(cursor + 34);
+      const localOffset = buffer.readUInt32LE(cursor + 42);
+      const centralEntryEnd =
+        cursor + ZIP_CENTRAL_HEADER_BYTES + nameLength + extraLength + commentLength;
+
+      if (centralEntryEnd > centralEnd || nameLength === 0) invalidZip();
+      if (
+        versionNeeded >= ZIP64_VERSION
+        || compressedSize === 0xffffffff
+        || uncompressedSize === 0xffffffff
+        || localOffset === 0xffffffff
+        || diskStart === 0xffff
+      ) {
+        invalidZip();
+      }
+      if (diskStart !== 0 || (flags & ZIP_REJECTED_FLAGS) !== 0) invalidZip();
+      if (method !== 0 && method !== 8) invalidZip();
+
+      const nameStart = cursor + ZIP_CENTRAL_HEADER_BYTES;
+      const nameBytes = buffer.subarray(nameStart, nameStart + nameLength);
+      const name = decodeZipEntryName(nameBytes);
+      if (seenNames.has(name)) {
+        rejectZip({
+          code: 'zip_duplicate_name',
+          detail: `Archive contains duplicate entry name: ${name}`,
+          ref: name,
+        });
+      }
+      seenNames.add(name);
+
+      const centralExtraStart = nameStart + nameLength;
+      const centralExtra = buffer.subarray(
+        centralExtraStart,
+        centralExtraStart + extraLength,
+      );
+      if (hasZip64ExtraField(centralExtra)) invalidZip();
+
+      if (uncompressedSize > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES) {
+        rejectZip({
+          code: 'zip_entry_too_large',
+          detail: `Archive entry exceeds ${ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} uncompressed bytes.`,
+          ref: name,
+        });
+      }
+      declaredTotal += uncompressedSize;
+      if (declaredTotal > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        rejectZip({
+          code: 'zip_total_too_large',
+          detail: `Archive total uncompressed size exceeds ${ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes.`,
+          ref: name,
+        });
+      }
+      if (method === 0 && compressedSize !== uncompressedSize) invalidZip();
+
+      if (
+        localOffset + ZIP_LOCAL_HEADER_BYTES > centralOffset
+        || buffer.readUInt32LE(localOffset) !== ZIP_LOCAL_SIGNATURE
+      ) {
+        invalidZip();
+      }
+      const localFlags = buffer.readUInt16LE(localOffset + 6);
+      const localMethod = buffer.readUInt16LE(localOffset + 8);
+      const localCrc = buffer.readUInt32LE(localOffset + 14);
+      const localCompressedSize = buffer.readUInt32LE(localOffset + 18);
+      const localUncompressedSize = buffer.readUInt32LE(localOffset + 22);
+      const localNameLength = buffer.readUInt16LE(localOffset + 26);
+      const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+      const localNameStart = localOffset + ZIP_LOCAL_HEADER_BYTES;
+      const localExtraStart = localNameStart + localNameLength;
+      const dataStart = localExtraStart + localExtraLength;
+      const dataEnd = dataStart + compressedSize;
+      const usesDataDescriptor = (flags & ZIP_DATA_DESCRIPTOR_FLAG) !== 0;
+
+      if (
+        localFlags !== flags
+        || localMethod !== method
+        || localNameLength !== nameLength
+        || dataEnd > centralOffset
+        || !buffer.subarray(localNameStart, localExtraStart).equals(nameBytes)
+      ) {
+        invalidZip();
+      }
+      const localExtra = buffer.subarray(localExtraStart, dataStart);
+      if (hasZip64ExtraField(localExtra)) invalidZip();
+
+      let localEntryEnd = dataEnd;
+      if (usesDataDescriptor) {
+        if (
+          (localCrc !== 0 && localCrc !== crc)
+          || (localCompressedSize !== 0 && localCompressedSize !== compressedSize)
+          || (localUncompressedSize !== 0 && localUncompressedSize !== uncompressedSize)
+        ) {
+          invalidZip();
+        }
+        localEntryEnd = dataDescriptorEnd(
+          buffer,
+          dataEnd,
+          centralOffset,
+          crc,
+          compressedSize,
+          uncompressedSize,
+        );
+      } else if (
+        localCrc !== crc
+        || localCompressedSize !== compressedSize
+        || localUncompressedSize !== uncompressedSize
+      ) {
+        invalidZip();
+      }
+
+      localRanges.push({ start: localOffset, end: localEntryEnd });
+      payloads.push({
+        name,
+        method,
+        start: dataStart,
+        end: dataEnd,
+        declaredUncompressedSize: uncompressedSize,
+        crc,
       });
+      cursor = centralEntryEnd;
     }
 
-    if (totalUncompressed + file.originalSize > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES) {
-      return refuse({
-        code: 'zip_total_too_large',
-        detail: `Archive total uncompressed size exceeds ${ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes.`,
-        ref: file.name,
-      });
+    if (cursor !== centralEnd) invalidZip();
+    localRanges.sort((left, right) => left.start - right.start);
+    for (let index = 1; index < localRanges.length; index += 1) {
+      if (localRanges[index].start < localRanges[index - 1].end) invalidZip();
     }
-    totalUncompressed += file.originalSize;
-    return true;
-  };
 
-  try {
-    const entries = unzipSync(bytes, { filter });
-    if (issue) return { entries: null, issue, zipError: false };
+    const entries = Object.create(null) as Record<string, Uint8Array>;
+    let actualTotal = 0;
+    for (const payload of payloads) {
+      const compressed = buffer.subarray(payload.start, payload.end);
+      const remainingTotal = ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES - actualTotal;
+      const outputLimit = Math.min(
+        ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
+        remainingTotal,
+      );
+      let uncompressed: Buffer;
+      if (payload.method === 0) {
+        uncompressed = compressed;
+      } else {
+        try {
+          uncompressed = inflateRawSync(compressed, {
+            // The extra byte distinguishes an exact-limit payload from one that
+            // must be rejected without allowing unbounded inflate work.
+            maxOutputLength: outputLimit + 1,
+          });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
+            if (remainingTotal < ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES) {
+              rejectZip({
+                code: 'zip_total_too_large',
+                detail: `Archive total uncompressed size exceeds ${ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes.`,
+                ref: payload.name,
+              });
+            }
+            rejectZip({
+              code: 'zip_entry_too_large',
+              detail: `Archive entry exceeds ${ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} uncompressed bytes.`,
+              ref: payload.name,
+            });
+          }
+          invalidZip();
+        }
+      }
+
+      if (uncompressed.byteLength > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES) {
+        rejectZip({
+          code: 'zip_entry_too_large',
+          detail: `Archive entry exceeds ${ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} uncompressed bytes.`,
+          ref: payload.name,
+        });
+      }
+      if (actualTotal + uncompressed.byteLength > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        rejectZip({
+          code: 'zip_total_too_large',
+          detail: `Archive total uncompressed size exceeds ${ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes.`,
+          ref: payload.name,
+        });
+      }
+      if (
+        uncompressed.byteLength !== payload.declaredUncompressedSize
+        || crc32(uncompressed) !== payload.crc
+      ) {
+        invalidZip();
+      }
+
+      actualTotal += uncompressed.byteLength;
+      // Do not leak Node Buffer's view-only `.slice()` semantics to downstream
+      // SHA code, which expects a standard Uint8Array whose `.slice()` copies
+      // exactly this entry window.
+      entries[payload.name] = new Uint8Array(
+        uncompressed.buffer,
+        uncompressed.byteOffset,
+        uncompressed.byteLength,
+      );
+    }
     return { entries, issue: null, zipError: false };
-  } catch {
-    // Some malformed archives can still make fflate throw after the filter has
-    // already refused a resource or path violation. Preserve the more precise
-    // refusal instead of degrading it to a generic "not a zip" result.
-    return issue
-      ? { entries: null, issue, zipError: false }
-      : { entries: null, issue: null, zipError: true };
+  } catch (error) {
+    if (error instanceof ZipArchiveError && error.issue) {
+      return { entries: null, issue: error.issue, zipError: false };
+    }
+    return { entries: null, issue: null, zipError: true };
   }
 }
 
@@ -388,7 +729,7 @@ export async function verifyBackupPackage(bytes: Uint8Array): Promise<VerifyRepo
     };
   }
 
-  const formatCompatible = majorOf(manifest.formatVersion) === majorOf(FORMAT_VERSION);
+  const formatCompatible = isFormatCompatible(manifest.formatVersion);
   if (!formatCompatible) {
     errors.push({
       code: 'format_incompatible',
@@ -538,24 +879,42 @@ export async function verifyBackupPackage(bytes: Uint8Array): Promise<VerifyRepo
 
   // Chapters: read every chapters/NNNN.json the zip carries.
   const chapters: BackupChapter[] = [];
+  const processingStatusRequired = requiresChapterProcessingStatus(manifest.formatVersion);
   for (const path of Object.keys(entries)) {
     if (!path.startsWith(PACKAGE_PATHS.chaptersDir) || !path.endsWith('.json')) continue;
     const ch = parseJson<unknown>(strFromU8(entries[path]));
-    if (!isBackupChapter(ch)) {
+    if (
+      !isSerializedBackupChapter(ch)
+      || (processingStatusRequired && ch.processingStatus === undefined)
+    ) {
       errors.push({ code: 'corrupt_section', detail: `Chapter file ${path} is corrupt.`, ref: path });
       continue;
     }
-    chapters.push(ch);
+    chapters.push({
+      ...ch,
+      // Published 1.x packages pre-date this lifecycle contract. Treat every
+      // legacy chapter as complete even if an unknown extra field is present;
+      // only a 2.x version signal may carry content_saved semantics.
+      processingStatus: processingStatusRequired ? ch.processingStatus! : 'complete',
+    });
   }
   chapters.sort((a, b) => a.chapterNumber - b.chapterNumber);
 
-  // Attachments (optional, forward-compat).
+  // Attachments: layout reserved, but this build cannot restore them — reject
+  // nonempty packages rather than verify OK and silently drop on restore.
   const attachments: BackupAttachment[] = [];
   for (const path of Object.keys(entries)) {
     if (!path.startsWith(PACKAGE_PATHS.attachmentsDir)) continue;
     const name = path.slice(PACKAGE_PATHS.attachmentsDir.length);
     if (!name) continue;
     attachments.push({ name, contentsBase64: Buffer.from(entries[path]).toString('base64') });
+  }
+  if (attachments.length > 0) {
+    errors.push({
+      code: 'unsupported_attachments',
+      detail: `This build cannot restore package attachments (${attachments.length} file(s)). Re-export without attachments or use a build that supports them.`,
+      ref: PACKAGE_PATHS.attachmentsDir,
+    });
   }
 
   // --- Secret re-scan (defense in depth; should be a no-op if extract worked) ---

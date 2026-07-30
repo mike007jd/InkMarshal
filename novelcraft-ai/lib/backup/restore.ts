@@ -12,8 +12,9 @@
 // never a half-restored book. After commit we run reorderOutlineAtomic to
 // resync the outline sort order + chapterNumber + vault mirror.
 //
-// Format 1.0 bundles arrive with empty history / volumeSummaries (verify
-// normalizes missing sections); 1.1 bundles carry the full remapped history.
+// Format 1.0 bundles arrive with empty history / volumeSummaries; published
+// 1.x bundles without chapter lifecycle state arrive normalized to `complete`.
+// Format 2.0 carries an explicit lifecycle state for every chapter.
 
 import { getDb } from '@/lib/db/connection';
 import { nowIso } from '@/lib/utils';
@@ -72,6 +73,25 @@ function safeStringArray(raw: string | null | undefined): string[] {
  * mapping so a hand-edited package can never produce orphans.
  */
 export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<RestoreResult> {
+  // Fail closed before any DB mutation: this build does not restore attachments.
+  // Verify also rejects nonempty attachments; this is defense in depth for a
+  // hand-built / pre-verified bundle that would otherwise report success and drop them.
+  if ((bundle.attachments?.length ?? 0) > 0) {
+    throw new Error(
+      `Restore aborted: this build cannot restore package attachments (${bundle.attachments.length} file(s)). Re-export without attachments or use a build that supports them.`,
+    );
+  }
+  for (const chapter of bundle.chapters) {
+    if (
+      chapter.processingStatus !== 'content_saved'
+      && chapter.processingStatus !== 'complete'
+    ) {
+      throw new Error(
+        `Restore aborted: chapter ${chapter.chapterNumber} has no valid processing status.`,
+      );
+    }
+  }
+
   const db = getDb();
   const now = nowIso();
   const newNovelId = crypto.randomUUID();
@@ -204,8 +224,8 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
        id, novel_id, chapter_number, title, content, original_content,
        word_count, version, summary,
        key_facts, key_facts_v, quality_issues, quality_issues_v,
-       generation_meta, generation_meta_v, snapshots, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       generation_meta, generation_meta_v, snapshots, processing_status, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertEntry = db.prepare(
     `INSERT INTO knowledge_entries
@@ -303,6 +323,7 @@ export async function restoreBundleAsCopy(bundle: BackupBundle): Promise<Restore
         ch.generationMeta === null || ch.generationMeta === undefined ? null : JSON.stringify(ch.generationMeta),
         ch.generationMeta === null || ch.generationMeta === undefined ? null : JSON_COLUMN_VERSIONS.generation_meta,
         ch.snapshots === null || ch.snapshots === undefined ? null : JSON.stringify(ch.snapshots),
+        ch.processingStatus,
         ch.createdAt ? new Date(ch.createdAt).toISOString() : now,
       );
     }

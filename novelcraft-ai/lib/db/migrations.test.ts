@@ -15,7 +15,9 @@ import {
   initializeCurrentSchema,
   legacySchema1Fingerprint,
   publishedSchema18Fingerprint,
-  currentSchema19Fingerprint,
+  publishedSchema19Fingerprint,
+  currentSchemaFingerprint,
+  schema20Fingerprint,
 } from '@/lib/db/migrations';
 import {
   computeSchemaFingerprint,
@@ -32,7 +34,13 @@ import {
   PUBLISHED_SCHEMA_18_SQL_ORACLE_OBJECT_COUNT,
   PUBLISHED_SCHEMA_18_TABLES,
   PUBLISHED_SCHEMA_18_VERSION,
+  PUBLISHED_SCHEMA_19_DDL,
+  PUBLISHED_SCHEMA_19_VERSION,
   SCHEMA_19_OUTBOX_DDL,
+  SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL,
+  SCHEMA_20_DDL,
+  SCHEMA_20_VERSION,
+  SCHEMA_21_CHAT_TURNS_DDL,
   currentSchemaSql,
 } from '@/lib/db/schema';
 
@@ -85,6 +93,25 @@ function seedMisstampedLegacyOutbox(db: Database.Database): void {
   stampVersion(db, 1, 'current_prelaunch_baseline');
 }
 
+/** Exact schema-19 shape (outbox present; chapters lack processing_status). */
+function seedPublishedSchema19(db: Database.Database): void {
+  expect(PUBLISHED_SCHEMA_19_DDL).toContain('knowledge_vault_outbox');
+  expect(PUBLISHED_SCHEMA_19_DDL).not.toContain('processing_status');
+  expect(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL).toContain('processing_status');
+  db.exec(PUBLISHED_SCHEMA_19_DDL);
+  stampVersion(db, PUBLISHED_SCHEMA_19_VERSION, 'current_epoch_v19');
+}
+
+/** Exact schema-20 shape (processing_status present; no chat_turns). */
+function seedSchema20(db: Database.Database): void {
+  expect(SCHEMA_20_DDL).toContain('processing_status');
+  expect(SCHEMA_20_DDL).not.toContain('chat_turns');
+  expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('chat_turns');
+  db.exec(SCHEMA_20_DDL);
+  stampVersion(db, SCHEMA_20_VERSION, 'current_epoch_v20');
+}
+
+
 beforeEach(() => {
   closeDbForTest();
   dataDir = mkdtempSync(path.join(tmpdir(), 'inkmarshal-schema-epoch-'));
@@ -116,9 +143,19 @@ describe('release-oracle schema fingerprints', () => {
     expect(computeSchemaFingerprint(legacy).digest).toBe(legacySchema1Fingerprint().digest);
     legacy.close();
 
+    const schema19 = new Database(':memory:');
+    seedPublishedSchema19(schema19);
+    expect(computeSchemaFingerprint(schema19).digest).toBe(publishedSchema19Fingerprint().digest);
+    schema19.close();
+
+    const schema20 = new Database(':memory:');
+    seedSchema20(schema20);
+    expect(computeSchemaFingerprint(schema20).digest).toBe(schema20Fingerprint().digest);
+    schema20.close();
+
     const current = new Database(':memory:');
     initializeCurrentSchema(current);
-    expect(computeSchemaFingerprint(current).digest).toBe(currentSchema19Fingerprint().digest);
+    expect(computeSchemaFingerprint(current).digest).toBe(currentSchemaFingerprint().digest);
     current.close();
   });
 
@@ -139,10 +176,10 @@ describe('release-oracle schema fingerprints', () => {
   });
 });
 
-describe('current schema epoch 19', () => {
-  it('initializes a fresh database at schema 19 with the current table set', () => {
+describe('current schema epoch 21', () => {
+  it('initializes a fresh database at schema 21 with chat_turns and chapter processing_status', () => {
     const db = getDb();
-    expect(CURRENT_SCHEMA_VERSION).toBe(19);
+    expect(CURRENT_SCHEMA_VERSION).toBe(21);
     expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
     expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
     expect(db.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 1 });
@@ -152,6 +189,23 @@ describe('current schema epoch 19', () => {
     expect(
       db.prepare("SELECT sql FROM sqlite_master WHERE name = 'knowledge_vault_outbox'").get(),
     ).toMatchObject({ sql: expect.stringContaining("status") });
+    expect(
+      db.prepare("SELECT sql FROM sqlite_master WHERE name = 'chapters'").get(),
+    ).toMatchObject({ sql: expect.stringContaining('processing_status') });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+    expect(
+      db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turn_tool_snapshots'",
+      ).get(),
+    ).toEqual({ name: 'chat_turn_tool_snapshots' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_confirmations'").get(),
+    ).toEqual({ name: 'import_confirmations' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'brainstorm_receipts'").get(),
+    ).toEqual({ name: 'brainstorm_receipts' });
   });
 
   it('opens a current-schema database without DDL and idempotently provisions seed rows', () => {
@@ -196,7 +250,7 @@ describe('current schema epoch 19', () => {
   });
 });
 
-describe('published schema 18 → 19', () => {
+describe('published schema 18 → 21', () => {
   it('migrates transactionally, preserves rows, and creates a verified backup', () => {
     const setup = new Database(dbPath());
     seedPublishedSchema18(setup);
@@ -217,10 +271,13 @@ describe('published schema 18 → 19', () => {
     setup.close();
 
     const db = getDb();
-    expect(db.pragma('user_version', { simple: true })).toBe(19);
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
     expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
     expect(db.prepare('SELECT title FROM novels WHERE id = ?').get('n1')).toEqual({ title: 'Shipped Book' });
     expect(db.prepare('SELECT title FROM chapters WHERE id = ?').get('c1')).toEqual({ title: 'One' });
+    expect(db.prepare('SELECT processing_status FROM chapters WHERE id = ?').get('c1')).toEqual({
+      processing_status: 'complete',
+    });
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_vault_outbox'").get(),
     ).toEqual({ name: 'knowledge_vault_outbox' });
@@ -230,6 +287,14 @@ describe('published schema 18 → 19', () => {
       expect.objectContaining({ name: 'status' }),
       expect.objectContaining({ name: 'intent_revision' }),
     ]));
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+    expect(
+      db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turn_tool_snapshots'",
+      ).get(),
+    ).toEqual({ name: 'chat_turn_tool_snapshots' });
 
     const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v18-') && name.endsWith('.bak'));
     expect(backups.length).toBe(1);
@@ -258,7 +323,7 @@ describe('published schema 18 → 19', () => {
     db.close();
   });
 
-  it('warns and proceeds when pre-migration backup fails for additive 18→19', () => {
+  it('warns and proceeds when pre-migration backup fails for additive 18→21', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const db = new Database(':memory:');
     seedPublishedSchema18(db);
@@ -266,14 +331,14 @@ describe('published schema 18 → 19', () => {
       throw new Error('disk full');
     });
     expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
-    expect(db.prepare('SELECT version FROM _schema_version').get()).toEqual({ version: 19 });
+    expect(db.prepare('SELECT version FROM _schema_version').get()).toEqual({ version: CURRENT_SCHEMA_VERSION });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('pre-migration backup failed'));
     db.close();
     warn.mockRestore();
   });
 });
 
-describe('mis-stamped schema 1 legacy-outbox → 19', () => {
+describe('mis-stamped schema 1 legacy-outbox → 21', () => {
   it('promotes with status backfill, preserves rows, and creates a verified backup', () => {
     const setup = new Database(dbPath());
     seedMisstampedLegacyOutbox(setup);
@@ -301,7 +366,7 @@ describe('mis-stamped schema 1 legacy-outbox → 19', () => {
     setup.close();
 
     const db = getDb();
-    expect(db.pragma('user_version', { simple: true })).toBe(19);
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
     expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
     expect(db.prepare('SELECT title FROM novels WHERE id = ?').get('n1')).toEqual({ title: 'Interim Book' });
     expect(
@@ -312,6 +377,79 @@ describe('mis-stamped schema 1 legacy-outbox → 19', () => {
     ).toEqual({ status: 'pending', intent_revision: 1 });
 
     const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v1-') && name.endsWith('.bak'));
+    expect(backups.length).toBe(1);
+  });
+});
+
+
+describe('published schema 19 → 21', () => {
+  it('adds processing_status, defaults existing rows to complete, and preserves chapter prose', () => {
+    const setup = new Database(dbPath());
+    seedPublishedSchema19(setup);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Schema19 Book', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO chapters
+         (id, novel_id, chapter_number, title, content, word_count, version, summary, created_at)
+       VALUES ('c1', 'n1', 1, 'One', 'Body from schema 19', 4, 0, '', ?)`,
+    ).run(now);
+    setup.close();
+
+    const db = getDb();
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
+    expect(db.prepare('SELECT content, processing_status FROM chapters WHERE id = ?').get('c1')).toEqual({
+      content: 'Body from schema 19',
+      processing_status: 'complete',
+    });
+    const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v19-') && name.endsWith('.bak'));
+    expect(backups.length).toBe(1);
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+  });
+});
+
+describe('schema 20 → 21', () => {
+  it('adds chat_turns, preserves chapter processing_status, and creates a verified backup', () => {
+    const setup = new Database(dbPath());
+    seedSchema20(setup);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Schema20 Book', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO chapters
+         (id, novel_id, chapter_number, title, content, word_count, version, summary, processing_status, created_at)
+       VALUES ('c1', 'n1', 1, 'One', 'Body from schema 20', 4, 0, '', 'content_saved', ?)`,
+    ).run(now);
+    setup.close();
+
+    const db = getDb();
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
+    expect(db.prepare('SELECT content, processing_status FROM chapters WHERE id = ?').get('c1')).toEqual({
+      content: 'Body from schema 20',
+      processing_status: 'content_saved',
+    });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_confirmations'").get(),
+    ).toEqual({ name: 'import_confirmations' });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'brainstorm_receipts'").get(),
+    ).toEqual({ name: 'brainstorm_receipts' });
+    const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v20-') && name.endsWith('.bak'));
     expect(backups.length).toBe(1);
   });
 });
@@ -435,12 +573,24 @@ describe('createVerifiedBackup', () => {
 });
 
 describe('frozen DDL independence', () => {
-  it('loads schema-18 from the frozen tagged constant rather than stripping current DDL at runtime', () => {
+  it('loads schema-18/19 from frozen constants rather than stripping current DDL at runtime', () => {
     expect(PUBLISHED_SCHEMA_18_DDL).toContain('CREATE TABLE IF NOT EXISTS users');
     expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('knowledge_vault_outbox');
-    // Current epoch carries outbox status + intent_revision; frozen 18 must not.
+    expect(PUBLISHED_SCHEMA_19_DDL).toContain('knowledge_vault_outbox');
+    expect(PUBLISHED_SCHEMA_19_DDL).not.toContain('processing_status');
     expect(currentSchemaSql).toContain('knowledge_vault_outbox');
     expect(currentSchemaSql).toMatch(/intent_revision\s+INTEGER NOT NULL DEFAULT 1/);
+    expect(currentSchemaSql).toContain('processing_status');
+    expect(currentSchemaSql).toContain('chat_turns');
+    expect(currentSchemaSql).toContain('chat_turn_tool_snapshots');
+    expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('chat_turn_tool_snapshots');
+    expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('import_confirmations');
+    expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('brainstorm_receipts');
+    expect(currentSchemaSql).toContain('import_confirmations');
+    expect(currentSchemaSql).toContain('brainstorm_receipts');
+    expect(SCHEMA_20_DDL).toContain('processing_status');
+    expect(SCHEMA_20_DDL).not.toContain('chat_turns');
+    expect(SCHEMA_20_DDL).not.toContain('import_confirmations');
     expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('knowledge_vault_outbox');
     expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('intent_revision');
   });

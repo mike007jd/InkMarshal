@@ -1,20 +1,37 @@
 import { sql as currentSchemaSql } from '@/lib/db/schema/0001_initial';
 import { LEGACY_SCHEMA_1_DDL } from '@/lib/db/schema/frozen/legacy-schema-1.sql';
 import { PUBLISHED_SCHEMA_18_DDL } from '@/lib/db/schema/frozen/published-schema-18.sql';
+import { PUBLISHED_SCHEMA_19_DDL } from '@/lib/db/schema/frozen/published-schema-19.sql';
+import { SCHEMA_20_DDL } from '@/lib/db/schema/frozen/schema-20.sql';
+import {
+  CURRENT_SCHEMA_DESCRIPTION,
+  CURRENT_SCHEMA_VERSION,
+} from '@/lib/db/schema/version';
+
+export {
+  CURRENT_SCHEMA_DESCRIPTION,
+  CURRENT_SCHEMA_VERSION,
+} from '@/lib/db/schema/version';
 
 /**
  * Current published on-disk schema epoch.
  *
  * Public macOS v0.1.0 / v0.1.1 stamped schema 18 (baseline without
- * `knowledge_vault_outbox`). This build adds the durable outbox (with explicit
- * status) as epoch 19. Some already-distributed interim builds incorrectly
- * stamped the pre-status outbox table set as schema 1; those are accepted and
- * promoted to 19.
+ * `knowledge_vault_outbox`). Schema 19 added the durable outbox (with explicit
+ * status). Some already-distributed interim builds incorrectly stamped the
+ * pre-status outbox table set as schema 1; those are accepted and promoted.
+ * Schema 20 adds an explicit chapter `processing_status` lifecycle.
+ * Schema 21 adds durable ordinary-chat turn receipts (`chat_turns`),
+ * import confirmation receipts, and durable brainstorm undo receipts.
  */
-export const CURRENT_SCHEMA_VERSION = 19;
-
 /** Exact published v0.1.0 / v0.1.1 schema marker. */
 export const PUBLISHED_SCHEMA_18_VERSION = 18;
+
+/** Exact schema-19 marker (outbox present; chapters lack processing_status). */
+export const PUBLISHED_SCHEMA_19_VERSION = 19;
+
+/** Exact schema-20 marker (processing_status present; no chat_turns). */
+export const SCHEMA_20_VERSION = 20;
 
 /**
  * Mis-stamped interim builds that already carry the pre-status-column outbox
@@ -47,9 +64,13 @@ export const CURRENT_SCHEMA_TABLES = [
   'activity_events',
   'ai_runs',
   'app_settings',
+  'brainstorm_receipts',
   'chapter_chat_history',
   'chapters',
+  'chat_turn_tool_snapshots',
+  'chat_turns',
   'conversations',
+  'import_confirmations',
   'knowledge_embeddings',
   'knowledge_entries',
   'knowledge_index',
@@ -75,7 +96,7 @@ export const LEGACY_SCHEMA_1_SQL_ORACLE =
   '917a3bf0d26166eeb777976660a308f167481656778bd40906f0e26e9531a4e5';
 export const LEGACY_SCHEMA_1_SQL_ORACLE_OBJECT_COUNT = 44;
 
-/** Additive DDL applied when promoting published schema 18 → 19. */
+/** Additive DDL applied when promoting published schema 18 → current. */
 export const SCHEMA_19_OUTBOX_DDL = `
 CREATE TABLE IF NOT EXISTS knowledge_vault_outbox (
   entry_id         TEXT PRIMARY KEY,
@@ -96,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_vault_outbox_novel
 `;
 
 /**
- * Promote legacy schema-1 outbox (no status / revision columns) to schema 19.
+ * Promote legacy schema-1 outbox (no status / revision columns) to schema 19+.
  * Every legacy intent remains pending: the old row shape cannot distinguish a
  * completed delete tombstone from a delete that replaced an upsert immediately
  * before a crash. Replaying delete is idempotent; guessing completed could
@@ -112,8 +133,85 @@ ALTER TABLE knowledge_vault_outbox
   ADD COLUMN intent_revision INTEGER NOT NULL DEFAULT 1;
 `;
 
+/**
+ * Additive DDL for schema 19 → 20. Existing rows default to `complete` because
+ * prior completion state is unknowable; AI writers set `content_saved` on new
+ * prose until post-processing commits.
+ */
+export const SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL = `
+ALTER TABLE chapters
+  ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'complete'
+  CHECK (processing_status IN ('content_saved', 'complete'));
+`;
+
+/**
+ * Additive DDL for schema 20 → 21. Ordinary-chat turns gain a durable receipt
+ * so concurrent/sequential retries cannot invoke the model twice. Import
+ * confirmation and brainstorm undo receipts are also durable SQLite state.
+ */
+export const SCHEMA_21_CHAT_TURNS_DDL = `
+CREATE TABLE IF NOT EXISTS chat_turns (
+  novel_id              TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  user_message_id       TEXT NOT NULL,
+  request_hash          TEXT NOT NULL,
+  assistant_message_id  TEXT NOT NULL,
+  status                TEXT NOT NULL
+                        CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
+  brainstorm_receipt_id TEXT,
+  response_text         TEXT,
+  error_code            TEXT,
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  PRIMARY KEY (novel_id, user_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_turns_novel_status ON chat_turns(novel_id, status);
+
+CREATE TABLE IF NOT EXISTS chat_turn_tool_snapshots (
+  novel_id        TEXT NOT NULL,
+  user_message_id TEXT NOT NULL,
+  tool_key        TEXT NOT NULL,
+  snapshot_key    TEXT NOT NULL,
+  payload         TEXT NOT NULL,
+  payload_sha256  TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (novel_id, user_message_id, tool_key, snapshot_key),
+  FOREIGN KEY (novel_id, user_message_id)
+    REFERENCES chat_turns(novel_id, user_message_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS import_confirmations (
+  session_token TEXT PRIMARY KEY,
+  request_hash  TEXT NOT NULL,
+  status        TEXT NOT NULL
+                CHECK (status IN ('pending', 'succeeded')),
+  result_json   TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS brainstorm_receipts (
+  id                 TEXT PRIMARY KEY,
+  novel_id           TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  created_at_ms      INTEGER NOT NULL,
+  expires_at_ms      INTEGER NOT NULL,
+  consumed_at_ms     INTEGER,
+  undo_expires_at_ms INTEGER,
+  undone             INTEGER NOT NULL DEFAULT 0
+                     CHECK (undone IN (0, 1)),
+  profile_json       TEXT,
+  entries_json       TEXT NOT NULL DEFAULT '[]',
+  updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brainstorm_receipts_novel
+  ON brainstorm_receipts(novel_id, created_at_ms DESC);
+`;
+
 export {
   currentSchemaSql,
   LEGACY_SCHEMA_1_DDL,
   PUBLISHED_SCHEMA_18_DDL,
+  PUBLISHED_SCHEMA_19_DDL,
+  SCHEMA_20_DDL,
 };

@@ -28,8 +28,14 @@ export type {
   Message,
   Chapter,
   ChapterLite,
+  ChapterProcessingStatus,
   WritingLockInfo,
   ChapterMetaUpdate,
+} from '@/lib/db-types';
+
+export {
+  CHAPTER_PROCESSING_STATUSES,
+  isChapterProcessingComplete,
 } from '@/lib/db-types';
 
 // Re-export the stage type + policy from the client-safe module so server-side
@@ -62,6 +68,10 @@ export {
   createBlankNovel,
   createNovelWithOpeningMessage,
   updateNovel,
+  patchNovelSettings,
+  claimNovelKbExtraction,
+  renewNovelKbExtractionClaim,
+  updateNovelKbExtractionState,
   applyNovelUpdate,
   deleteNovelCascade,
   getNovelBlueprint,
@@ -105,7 +115,26 @@ export {
   createChapterSnapshot,
   listChapterSnapshots,
   restoreChapterSnapshot,
+  ChapterWriteFenceError,
+  type UpsertChapterOptions,
 } from '@/lib/db/queries-chapter';
+
+export {
+  attachChatTurnBrainstormReceipt,
+  beginChatTurn,
+  cancelChatTurn,
+  CHAT_TURN_MODES,
+  CHAT_TURN_STALE_LEASE_MS,
+  completeChatTurn,
+  failChatTurn,
+  findNovelMessageById,
+  getChatTurn,
+  hashChatTurnRequest,
+  type BeginChatTurnResult,
+  type ChatTurn,
+  type ChatTurnMode,
+  type ChatTurnStatus,
+} from '@/lib/db/queries-chat-turns';
 
 export {
   getKnowledgeEntries,
@@ -113,6 +142,7 @@ export {
   getKnowledgeEntryById,
   createKnowledgeEntry,
   createKnowledgeEntryWithIndex,
+  createKnowledgeEntryWithIndexForImportGeneration,
   updateKnowledgeEntry,
   updateKnowledgeEntryWithIndex,
   deleteKnowledgeEntry,

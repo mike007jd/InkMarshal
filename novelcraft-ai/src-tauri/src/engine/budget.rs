@@ -1,14 +1,24 @@
 //! Resource-budget admission (atomic reservation that closes the spawn TOCTOU)
 //! and coarse RAM footprint estimation for GGUF files / MLX snapshot dirs.
 
-use super::registry::{prune_exited_engines, EngineRegistry};
+use super::registry::{EngineRegistry, ReservationId};
 use super::{EngineFootprint, EngineFormat};
+use crate::SystemMemory;
 use std::path::{Path, PathBuf};
 
-/// OS reserve baked into the available-RAM calculation: even if every running
-/// engine fits inside total RAM, we never advertise the last 4 GB as free —
-/// the host OS, the Next runtime, and the webview all need headroom.
-pub(super) const RESERVED_FOR_OS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Minimum host headroom kept out of the usable pool so the OS, Next runtime,
+/// and webview keep breathing room even when OS-reported available is high.
+const MIN_HOST_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Cap on dynamic headroom so very large hosts are not taxed beyond 8 GiB.
+const MAX_HOST_HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Dynamic host headroom derived from total physical RAM: `total / 8`, clamped
+/// to \[2 GiB, 8 GiB\]. Exposed on the wire as `reservedForOsBytes` so existing
+/// TS consumers keep a stable field name while the value scales with the host.
+pub(super) fn host_headroom_bytes(total_bytes: u64) -> u64 {
+    (total_bytes / 8).clamp(MIN_HOST_HEADROOM_BYTES, MAX_HOST_HEADROOM_BYTES)
+}
 
 /// GGUF in-RAM footprint multiplier vs. file size — covers KV cache + scratch.
 /// 1.15 is conservative-ish for Q4/Q5; intentionally an over-estimate, the UI
@@ -20,74 +30,142 @@ pub(super) const GGUF_FOOTPRINT_MULTIPLIER: f64 = 1.15;
 /// same way. 1.10 is the matching coarse coefficient.
 pub(super) const MLX_FOOTPRINT_MULTIPLIER: f64 = 1.10;
 
-/// Available RAM after subtracting the OS reserve and everything already
-/// committed (running plus reserved). Pure, so the admission decision is
-/// unit-testable without spawning engines. saturating_sub keeps an
-/// over-committed box honest (available=0, never a wrap-around to "18 EB free").
-pub(super) fn budget_available_bytes(total: u64, running_sum: u64, reserved_sum: u64) -> u64 {
-    total
-        .saturating_sub(RESERVED_FOR_OS_BYTES)
-        .saturating_sub(running_sum)
+/// Usable RAM for a new engine: current OS-available physical bytes, minus
+/// dynamic host headroom, minus in-flight (not-yet-materialized) reservations.
+///
+/// Already-resident running engines are **not** subtracted again — the OS
+/// `available_bytes` figure already reflects their resident usage. Only cold
+/// reservations (admitted but still loading) need explicit protection.
+/// saturating_sub keeps an over-committed box honest (usable=0, never a
+/// wrap-around to "18 EB free").
+pub(super) fn budget_available_bytes(
+    available_bytes: u64,
+    headroom_bytes: u64,
+    reserved_sum: u64,
+) -> u64 {
+    available_bytes
+        .saturating_sub(headroom_bytes)
         .saturating_sub(reserved_sum)
 }
 
-/// RAII reservation: the footprint admitted into `registry.1` is removed when
-/// this guard drops, whatever exit path engine_start takes (success, duplicate,
-/// spawn failure, readiness timeout, or panic). During a successful start the
-/// engine is also in the running map for the guard's lifetime, so the budget
-/// briefly counts the footprint in BOTH maps — a safe over-count, never an
-/// under-count that could over-commit.
+/// Structured fail-closed error when the native memory snapshot cannot be
+/// obtained. Shape matches sibling admit errors: `ENGINE_MEMORY_UNAVAILABLE:<json>`.
+pub(super) fn engine_memory_unavailable_error(reason: &str) -> String {
+    let payload = serde_json::json!({ "reason": reason });
+    format!("ENGINE_MEMORY_UNAVAILABLE:{payload}")
+}
+
+/// RAII reservation: the footprint admitted under a unique [`ReservationId`] in
+/// `registry.1` is removed when this guard drops, whatever exit path
+/// engine_start takes (success, duplicate, spawn failure, readiness timeout, or
+/// panic). The guard identity is the reservation id — not `engine_id` — so
+/// dropping one concurrent admission cannot erase another. During cold load the
+/// engine is also in the running map while the reservation remains — admission
+/// math only counts the reservation (OS available already covers resident
+/// pages), so the dual presence is intentional protection for not-yet-faulted
+/// pages, never a double-subtract.
 pub(super) struct ReservationGuard<'a> {
     registry: &'a EngineRegistry,
-    engine_id: String,
+    reservation_id: ReservationId,
 }
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut reserved) = self.registry.1.lock() {
-            reserved.remove(&self.engine_id);
+            reserved.remove(self.reservation_id);
         }
     }
 }
 
-/// Atomically admit an engine of `footprint` bytes. Under the admission lock,
-/// sum the committed RAM (running + already-reserved) and reject if this start
-/// would exceed the budget; otherwise reserve the footprint and return a guard
-/// that frees it on drop. This closes the check→spawn race the advisory TS-side
-/// check cannot: two concurrent starts can no longer both see the same free RAM.
-/// A footprint of 0 (unmeasurable model) is always admitted and contributes 0 —
-/// same honesty caveat as `engine_resource_budget`.
+/// Atomically admit an engine of `footprint` bytes against a provided memory
+/// snapshot. Pure w.r.t. the OS query so unit tests can inject large-total /
+/// low-available hosts without touching real RAM. Under the admission lock,
+/// subtract headroom + already-reserved only; reject if this start would
+/// exceed usable bytes; otherwise reserve and return a guard that frees on drop.
+///
+/// A **genuinely measured** footprint of 0 (e.g. empty model file × multiplier)
+/// is always admitted and contributes 0. Estimation failures must never reach
+/// this function as 0 — use [`footprint_for_admission`] / [`admit_estimated_footprint`]
+/// so unknown size fails closed with `ENGINE_FOOTPRINT_UNKNOWN` before reservation.
+pub(super) fn admit_engine_with_snapshot<'a>(
+    registry: &'a EngineRegistry,
+    footprint: u64,
+    _engine_id: &str,
+    memory: SystemMemory,
+) -> Result<ReservationGuard<'a>, String> {
+    // Lock order: admission (.1) only. Running footprints are not subtracted
+    // (OS available already reflects them); see EngineRegistry docs.
+    // `_engine_id` remains on the admit API for callers / diagnostics; the
+    // reservation map is keyed by a unique [`ReservationId`].
+    let mut reserved = registry
+        .1
+        .lock()
+        .map_err(|_| "engine admission lock poisoned".to_string())?;
+    let reserved_sum = reserved.reserved_sum();
+    let headroom = host_headroom_bytes(memory.total_bytes);
+    let available = budget_available_bytes(memory.available_bytes, headroom, reserved_sum);
+    if footprint > available {
+        return Err(format!(
+            "ENGINE_BUDGET_EXCEEDED:{{\"requiredBytes\":{footprint},\"availableBytes\":{available},\"reservedForOsBytes\":{headroom},\"totalBytes\":{}}}",
+            memory.total_bytes
+        ));
+    }
+    let reservation_id = reserved.insert(footprint);
+    Ok(ReservationGuard {
+        registry,
+        reservation_id,
+    })
+}
+
+/// Admit against an injected memory-query result. Query `Err` maps to
+/// [`engine_memory_unavailable_error`] and never reserves.
+pub(super) fn admit_engine_from_memory_result<'a>(
+    registry: &'a EngineRegistry,
+    footprint: u64,
+    engine_id: &str,
+    memory: Result<SystemMemory, String>,
+) -> Result<ReservationGuard<'a>, String> {
+    let memory = memory.map_err(|reason| engine_memory_unavailable_error(&reason))?;
+    admit_engine_with_snapshot(registry, footprint, engine_id, memory)
+}
+
+/// Atomically admit using a live native memory snapshot. Snapshot failure is
+/// fail-closed — no reservation is taken.
 pub(super) fn admit_engine<'a>(
     registry: &'a EngineRegistry,
     footprint: u64,
     engine_id: &str,
 ) -> Result<ReservationGuard<'a>, String> {
-    // Lock order: admission (.1) first, then running (.0). See EngineRegistry.
-    let mut reserved = registry
-        .1
-        .lock()
-        .map_err(|_| "engine admission lock poisoned".to_string())?;
-    let running_sum: u64 = registry
-        .0
-        .lock()
-        .map(|mut m| {
-            prune_exited_engines(&mut m);
-            m.values().map(|e| e.info.footprint_bytes).sum()
-        })
-        .unwrap_or(0);
-    let reserved_sum: u64 = reserved.values().sum();
-    let total = crate::system_memory_bytes().unwrap_or(0);
-    let available = budget_available_bytes(total, running_sum, reserved_sum);
-    if footprint > available {
-        return Err(format!(
-            "ENGINE_BUDGET_EXCEEDED:{{\"requiredBytes\":{footprint},\"availableBytes\":{available},\"reservedForOsBytes\":{RESERVED_FOR_OS_BYTES},\"totalBytes\":{total}}}"
-        ));
+    admit_engine_from_memory_result(registry, footprint, engine_id, crate::system_memory())
+}
+
+/// Structured fail-closed error when RAM footprint cannot be measured.
+/// Shape matches `ENGINE_BUDGET_EXCEEDED`: `ENGINE_FOOTPRINT_UNKNOWN:<json>`.
+pub(super) fn engine_footprint_unknown_error(reason: &str) -> String {
+    let payload = serde_json::json!({ "reason": reason });
+    format!("ENGINE_FOOTPRINT_UNKNOWN:{payload}")
+}
+
+/// Resolve measured RAM footprint for admission. Estimation failure is
+/// fail-closed — never coerced to 0 — so callers must not reserve or spawn.
+pub(super) fn footprint_for_admission(path: &Path, format: EngineFormat) -> Result<u64, String> {
+    match estimate_footprint_inner(path, format) {
+        Ok(f) => Ok(f.ram_bytes),
+        Err(reason) => Err(engine_footprint_unknown_error(&reason)),
     }
-    reserved.insert(engine_id.to_string(), footprint);
-    Ok(ReservationGuard {
-        registry,
-        engine_id: engine_id.to_string(),
-    })
+}
+
+/// Estimate footprint then atomically admit. On estimate failure the reservation
+/// map is untouched (no admission, no process launch by the caller).
+pub(super) fn admit_estimated_footprint<'a>(
+    registry: &'a EngineRegistry,
+    path: &Path,
+    format: EngineFormat,
+    engine_id: &str,
+) -> Result<(u64, ReservationGuard<'a>), String> {
+    let footprint = footprint_for_admission(path, format)?;
+    let guard = admit_engine(registry, footprint, engine_id)?;
+    Ok((footprint, guard))
 }
 
 pub(super) fn estimate_footprint_inner(

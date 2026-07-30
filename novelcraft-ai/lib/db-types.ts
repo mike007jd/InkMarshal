@@ -107,7 +107,14 @@ export interface ImportMeta {
   importedAt: string;
   originalFilename: string;
   detectedChapters: number;
-  kbExtraction?: 'pending' | 'done' | 'failed';
+  kbExtraction?: 'pending' | 'running' | 'done' | 'failed';
+  /** Fences the optional async extraction to the import generation that launched it. */
+  kbExtractionId?: string;
+  /** Attempt lease prevents duplicate requests within one import generation. */
+  kbExtractionAttemptId?: string;
+  kbExtractionLeaseExpiresAt?: string;
+  /** Durable per-generation slots make crash recovery idempotent. */
+  kbExtractionCompletedSlots?: string[];
 }
 
 /** Front/back-matter section toggle for the publishing workspace. */
@@ -227,6 +234,22 @@ export interface Message {
   createdAt: number;
 }
 
+/**
+ * Persisted chapter processing lifecycle.
+ * - `content_saved`: AI prose is durable but post-processing metadata is not.
+ * - `complete`: summary/facts/quality/generation meta are committed (or the
+ *   chapter was written by a non-AI path that defaults to complete).
+ */
+export type ChapterProcessingStatus = 'content_saved' | 'complete';
+
+export const CHAPTER_PROCESSING_STATUSES = ['content_saved', 'complete'] as const;
+
+export function isChapterProcessingComplete(
+  chapter: { processingStatus?: ChapterProcessingStatus | null },
+): boolean {
+  return (chapter.processingStatus ?? 'complete') === 'complete';
+}
+
 export interface Chapter {
   id: string;
   novelId: string;
@@ -244,6 +267,8 @@ export interface Chapter {
    *  snapshot yet. See {@link ChapterSnapshot}. Optional so test fixtures and
    *  helper builders that pre-date schema v8 stay compatible. */
   snapshots?: ChapterSnapshot[] | null;
+  /** Absent on older fixtures; treat as `complete` via {@link isChapterProcessingComplete}. */
+  processingStatus?: ChapterProcessingStatus;
   createdAt: number;
 }
 
@@ -259,6 +284,8 @@ export interface ChapterMetaUpdate {
   keyFacts?: ChapterKeyFacts | null;
   qualityIssues?: ChapterQualityIssue[] | null;
   generationMeta?: ChapterGenerationMeta | null;
+  /** When set, updated atomically with the other meta columns. */
+  processingStatus?: ChapterProcessingStatus;
 }
 
 // --- Row shapes (snake_case, as returned by aliased SQLite SELECTs) ---
@@ -313,6 +340,7 @@ export interface ChapterRow {
   quality_issues?: ChapterQualityIssue[] | null;
   generation_meta?: ChapterGenerationMeta | null;
   snapshots?: ChapterSnapshot[] | null;
+  processing_status?: ChapterProcessingStatus | null;
   created_at: string;
 }
 
@@ -354,6 +382,10 @@ export function mapMessage(row: MessageRow): Message {
   };
 }
 
+function mapProcessingStatus(raw: unknown): ChapterProcessingStatus {
+  return raw === 'content_saved' ? 'content_saved' : 'complete';
+}
+
 export function mapChapter(row: ChapterRow): Chapter {
   return {
     id: row.id,
@@ -369,6 +401,7 @@ export function mapChapter(row: ChapterRow): Chapter {
     qualityIssues: row.quality_issues ?? null,
     generationMeta: row.generation_meta ?? null,
     snapshots: row.snapshots ?? null,
+    processingStatus: mapProcessingStatus(row.processing_status),
     createdAt: parseTimestamp(row.created_at),
   };
 }
@@ -382,6 +415,7 @@ export function mapChapterLite(row: ChapterRow): ChapterLite {
     wordCount: row.word_count ?? 0,
     version: row.version ?? 0,
     summary: row.summary ?? '',
+    processingStatus: mapProcessingStatus(row.processing_status),
     createdAt: parseTimestamp(row.created_at),
   };
 }

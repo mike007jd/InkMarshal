@@ -22,6 +22,7 @@ mod engine;
 mod health;
 mod http_util;
 mod inkmarshal_home;
+mod manuscript_import;
 mod metadata_db;
 mod model_manager;
 mod secret;
@@ -210,50 +211,135 @@ fn desktop_status(app: tauri::AppHandle) -> DesktopStatus {
         desktop: true,
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        total_memory_bytes: system_memory_bytes(),
+        total_memory_bytes: system_memory().ok().map(|m| m.total_bytes),
         app_data_dir: app_data_dir.map(path_to_string),
         model_dir: model_dir.map(path_to_string),
         model_dir_error,
     }
 }
 
+/// Physical memory snapshot used by engine admission and budget reporting.
+/// Fail-closed callers must treat query errors as hard rejects — never invent
+/// zeros that would look like "no RAM" vs "query failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SystemMemory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
 #[cfg(target_os = "macos")]
-pub(crate) fn system_memory_bytes() -> Option<u64> {
+pub(crate) fn system_memory() -> Result<SystemMemory, String> {
     use std::ffi::CString;
-    let name = CString::new("hw.memsize").ok()?;
-    let mut value: u64 = 0;
+    let name =
+        CString::new("hw.memsize").map_err(|_| "invalid sysctl name for hw.memsize".to_string())?;
+    let mut total: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
-            &mut value as *mut _ as *mut libc::c_void,
+            &mut total as *mut _ as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
             0,
         )
     };
-    if rc == 0 {
-        Some(value)
-    } else {
-        None
+    if rc != 0 || total == 0 {
+        return Err("sysctl hw.memsize failed".to_string());
     }
+
+    // Available physical pages ≈ free + inactive + speculative. Purgeable is
+    // reclaimable under pressure but not always immediately usable, so it is
+    // excluded. Page size comes from sysconf; host_statistics64 supplies counts.
+    // mach_host_self / mach_task_self are declared locally — libc marks its
+    // wrappers deprecated in favor of the mach2 crate, which we deliberately
+    // do not add as a dependency for this single call site.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err("sysconf _SC_PAGESIZE failed".to_string());
+    }
+    let page_size = page_size as u64;
+
+    extern "C" {
+        fn mach_host_self() -> libc::mach_port_t;
+        fn mach_task_self() -> libc::mach_port_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    let mut count: libc::mach_msg_type_number_t = libc::HOST_VM_INFO64_COUNT;
+    let mut vm_stat = unsafe { std::mem::zeroed::<libc::vm_statistics64>() };
+    let host = unsafe { mach_host_self() };
+    let kr = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            &mut vm_stat as *mut _ as libc::host_info64_t,
+            &mut count,
+        )
+    };
+    let _ = unsafe { mach_port_deallocate(mach_task_self(), host) };
+    if kr != libc::KERN_SUCCESS {
+        return Err("host_statistics64 failed".to_string());
+    }
+
+    let available_pages = (vm_stat.free_count as u64)
+        .saturating_add(vm_stat.inactive_count as u64)
+        .saturating_add(vm_stat.speculative_count as u64);
+    let available_bytes = available_pages.saturating_mul(page_size);
+    Ok(SystemMemory {
+        total_bytes: total,
+        available_bytes,
+    })
+}
+
+/// Parse Linux `/proc/meminfo` for MemTotal + MemAvailable (kB → bytes).
+/// Missing either field, or a non-numeric value, fails closed.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn parse_linux_meminfo(raw: &str) -> Result<SystemMemory, String> {
+    let mut total_kb: Option<u64> = None;
+    let mut available_kb: Option<u64> = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| "MemTotal value missing from /proc/meminfo".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "MemTotal value is not a number".to_string())?;
+            total_kb = Some(kb);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| "MemAvailable value missing from /proc/meminfo".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "MemAvailable value is not a number".to_string())?;
+            available_kb = Some(kb);
+        }
+    }
+    let total_kb = total_kb.ok_or_else(|| "MemTotal missing from /proc/meminfo".to_string())?;
+    let available_kb =
+        available_kb.ok_or_else(|| "MemAvailable missing from /proc/meminfo".to_string())?;
+    if total_kb == 0 {
+        return Err("MemTotal is zero".to_string());
+    }
+    Ok(SystemMemory {
+        total_bytes: total_kb.saturating_mul(1024),
+        available_bytes: available_kb.saturating_mul(1024),
+    })
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn system_memory_bytes() -> Option<u64> {
-    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = raw
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    Some(kb * 1024)
+pub(crate) fn system_memory() -> Result<SystemMemory, String> {
+    let raw = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|_| "cannot read /proc/meminfo".to_string())?;
+    parse_linux_meminfo(&raw)
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn system_memory_bytes() -> Option<u64> {
+pub(crate) fn system_memory() -> Result<SystemMemory, String> {
     #[repr(C)]
     struct MemoryStatusEx {
         dw_length: u32,
@@ -282,16 +368,21 @@ pub(crate) fn system_memory_bytes() -> Option<u64> {
         ull_avail_extended_virtual: 0,
     };
     let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-    if ok != 0 {
-        Some(status.ull_total_phys)
-    } else {
-        None
+    if ok == 0 {
+        return Err("GlobalMemoryStatusEx failed".to_string());
     }
+    if status.ull_total_phys == 0 {
+        return Err("GlobalMemoryStatusEx returned zero total physical memory".to_string());
+    }
+    Ok(SystemMemory {
+        total_bytes: status.ull_total_phys,
+        available_bytes: status.ull_avail_phys,
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(crate) fn system_memory_bytes() -> Option<u64> {
-    None
+pub(crate) fn system_memory() -> Result<SystemMemory, String> {
+    Err("system memory query unsupported on this target".to_string())
 }
 
 fn probe_socket(url: &str) -> Result<(), String> {
@@ -1436,6 +1527,7 @@ pub fn run() {
             save_export_file,
             reveal_export_file,
             read_local_file,
+            manuscript_import::stage_manuscript_import,
             secret::keychain_set,
             secret::keychain_get,
             secret::keychain_delete,

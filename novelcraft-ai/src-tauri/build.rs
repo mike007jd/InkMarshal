@@ -6,6 +6,7 @@ const APP_COMMANDS: &[&str] = &[
     "save_export_file",
     "reveal_export_file",
     "read_local_file",
+    "stage_manuscript_import",
     "keychain_set",
     "keychain_get",
     "keychain_delete",

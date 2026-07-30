@@ -27,6 +27,16 @@ describe('proxy production web boundary', () => {
     expect(productionWebBlockKind('/novel/abc', productionDesktop)).toBeNull();
   });
 
+  it('rejects every production-web Next-Action regardless of pathname', () => {
+    const nextAction = new Headers({ 'next-action': '7f9c0deadbeef' });
+    expect(productionWebBlockKind('/', productionWeb, nextAction)).toBe('api');
+    expect(productionWebBlockKind('/api/health', productionWeb, nextAction)).toBe('api');
+    expect(productionWebBlockKind('/novel/abc', productionWeb, nextAction)).toBe('api');
+    expect(productionWebBlockKind('/desktop-studio', productionWeb, nextAction)).toBe('api');
+    // Desktop runtime keeps Server Actions open for session gating instead.
+    expect(productionWebBlockKind('/', productionDesktop, nextAction)).toBeNull();
+  });
+
   it('does not let synthetic prefetch headers bypass API proxy controls', () => {
     const apiMatcher = config.matcher.find(entry => entry.source === '/api/:path*');
 
@@ -100,6 +110,17 @@ describe('desktop session gates pages and Server Actions (AN-SEC-002)', () => {
       nextUrl: { pathname: '/novel/abc' },
       headers: new Headers({ 'next-action': '7f9c0deadbeef' }),
     }, env)).toBe(false);
+  });
+
+  it('rejects a Server Action forwarded from the otherwise-public root route', () => {
+    expect(isDesktopRequestAuthorized({
+      nextUrl: { pathname: '/' },
+      headers: new Headers({ 'next-action': '7f9c0deadbeef' }),
+    }, env)).toBe(false);
+    expect(config.matcher).toContainEqual({
+      source: '/:path*',
+      has: [{ type: 'header', key: 'next-action' }],
+    });
   });
 
   it('rejects a Server Action POST to desktop-studio with a wrong session cookie', () => {

@@ -13,7 +13,8 @@
 // the default template via the resolver's variant fallback, so a pack is a thin
 // stylistic overlay rather than a full fork.
 
-import { getNovel, updateNovel } from '@/lib/db/queries-novel';
+import { patchNovelSettings } from '@/lib/db/queries-novel';
+import { getDb } from '@/lib/db/connection';
 import {
   importVariantPack,
   type VariantPack,
@@ -224,19 +225,27 @@ export async function applyGenrePack(novelId: string, packId: string): Promise<A
   const pack = getGenrePack(packId);
   if (!pack) throw new Error(`Unknown genre pack: ${packId}`);
 
-  const novel = await getNovel(novelId);
-  if (!novel) throw new Error('Novel not found');
-
   const doc: VariantPack = {
     formatVersion: 1,
     variant: pack.variant,
     label: pack.label.en,
     rows: pack.rows,
   };
-  const result = importVariantPack(doc);
+  const db = getDb();
+  return db.transaction(() => {
+    const novelExists = db.prepare('SELECT 1 AS ok FROM novels WHERE id = ?')
+      .get(novelId) as { ok: number } | undefined;
+    if (!novelExists) throw new Error('Novel not found');
 
-  const settings = { ...(novel.settings ?? {}), promptVariant: pack.variant };
-  await updateNovel(novelId, { settings });
-
-  return { variant: result.variant, inserted: result.inserted, versionedOver: result.versionedOver };
+    const result = importVariantPack(doc);
+    const updated = patchNovelSettings(novelId, {
+      promptVariant: pack.variant,
+    });
+    if (!updated) throw new Error('Novel not found');
+    return {
+      variant: result.variant,
+      inserted: result.inserted,
+      versionedOver: result.versionedOver,
+    };
+  }).immediate();
 }

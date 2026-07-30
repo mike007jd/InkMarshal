@@ -13,13 +13,17 @@ export interface StartWritingBatchStopInput extends StartWritingBatchParams {
   chapterNumber: number;
 }
 
-export function missingChapterNumbers(
+export function missingChapterNumbers<T>(
   blueprint: Array<{ chapterNumber: number }>,
-  existingByNumber: ReadonlyMap<number, unknown>,
+  existingByNumber: ReadonlyMap<number, T>,
+  isComplete: (value: T) => boolean = () => true,
 ): number[] {
   return blueprint
     .map(chapter => chapter.chapterNumber)
-    .filter(chapterNumber => !existingByNumber.has(chapterNumber));
+    .filter(chapterNumber => {
+      const existing = existingByNumber.get(chapterNumber);
+      return existing === undefined || !isComplete(existing);
+    });
 }
 
 export function parseStartWritingBatchParams(searchParams: URLSearchParams): StartWritingBatchParams | { error: string } {

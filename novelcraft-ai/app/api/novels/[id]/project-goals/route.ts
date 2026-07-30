@@ -2,9 +2,8 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireNovelOwner } from '@/lib/local-auth';
 import { getDb } from '@/lib/db/connection';
-import { toJsonText } from '@/lib/db/json-columns';
+import { fromJsonTextLenient, toJsonText } from '@/lib/db/json-columns';
 import { recordActivityEvent } from '@/lib/db/queries-activity';
-import { getNovel } from '@/lib/db';
 import { nowIso, safeParseJson, sanitizeError } from '@/lib/utils';
 import type { NovelSettings, WorkStatus } from '@/lib/db-types';
 
@@ -53,35 +52,31 @@ export async function PATCH(
     if (parsed.error) return parsed.error;
     const patch = projectGoalsSchema.parse(parsed.data);
 
-    // Re-read inside the request to merge against the freshest settings bag
-    // (ownerCheck.novel is from the same request, but read again for symmetry
-    // with the write below and to avoid relying on its freshness).
-    const novel = await getNovel(id);
-    if (!novel) {
-      return NextResponse.json({ error: 'Novel not found' }, { status: 404 });
-    }
-    const current: NovelSettings = novel.settings ?? {};
-    const prevWorkStatus = current.workStatus ?? null;
-
-    const next: NovelSettings = { ...current };
-    applyGoalField(next, patch, 'deadline');
-    applyGoalField(next, patch, 'dailyWordGoal');
-    applyGoalField(next, patch, 'weeklyWordGoal');
-    applyGoalField(next, patch, 'workStatus');
-
-    const nextWorkStatus = next.workStatus ?? null;
-    const workStatusChanged =
-      Object.prototype.hasOwnProperty.call(patch, 'workStatus') &&
-      nextWorkStatus !== prevWorkStatus;
-
     const db = getDb();
-    const now = nowIso();
     const write = db.transaction(() => {
-      db.prepare('UPDATE novels SET settings = ?, updated_at = ? WHERE id = ?').run(
-        toJsonText(next),
-        now,
-        id,
-      );
+      const row = db.prepare('SELECT settings FROM novels WHERE id = ?').get(id) as
+        | { settings: string | null }
+        | undefined;
+      if (!row) return null;
+      const current = fromJsonTextLenient<NovelSettings>(row.settings) ?? {};
+      const prevWorkStatus = current.workStatus ?? null;
+      const next: NovelSettings = { ...current };
+      applyGoalField(next, patch, 'deadline');
+      applyGoalField(next, patch, 'dailyWordGoal');
+      applyGoalField(next, patch, 'weeklyWordGoal');
+      applyGoalField(next, patch, 'workStatus');
+
+      const nextWorkStatus = next.workStatus ?? null;
+      const workStatusChanged =
+        Object.prototype.hasOwnProperty.call(patch, 'workStatus') &&
+        nextWorkStatus !== prevWorkStatus;
+      if (JSON.stringify(next) !== JSON.stringify(current)) {
+        db.prepare('UPDATE novels SET settings = ?, updated_at = ? WHERE id = ?').run(
+          Object.keys(next).length === 0 ? null : toJsonText(next),
+          nowIso(),
+          id,
+        );
+      }
       if (workStatusChanged) {
         recordActivityEvent(db, {
           novelId: id,
@@ -90,18 +85,22 @@ export async function PATCH(
           meta: { from: prevWorkStatus, to: nextWorkStatus },
         });
       }
+      return { next, workStatusChanged };
     });
-    write();
+    const result = write.immediate();
+    if (!result) {
+      return NextResponse.json({ error: 'Novel not found' }, { status: 404 });
+    }
 
     return NextResponse.json({
       ok: true,
       settings: {
-        deadline: next.deadline ?? null,
-        dailyWordGoal: next.dailyWordGoal ?? null,
-        weeklyWordGoal: next.weeklyWordGoal ?? null,
-        workStatus: next.workStatus ?? null,
+        deadline: result.next.deadline ?? null,
+        dailyWordGoal: result.next.dailyWordGoal ?? null,
+        weeklyWordGoal: result.next.weeklyWordGoal ?? null,
+        workStatus: result.next.workStatus ?? null,
       },
-      workStatusChanged,
+      workStatusChanged: result.workStatusChanged,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

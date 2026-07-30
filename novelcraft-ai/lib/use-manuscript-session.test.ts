@@ -208,6 +208,43 @@ describe('manuscript session transport integration', () => {
     expect(result.current.writingRunState.phase).toBe('paused');
   });
 
+  it('refreshes novel and chapters when the latest run pauses', async () => {
+    stubManuscriptFetch(fetchMock);
+    writingSessionMock.startWritingSession.mockImplementationOnce(async (args) => {
+      const { signal } = args as { signal?: AbortSignal };
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new DOMException('Paused', 'AbortError'));
+        }, { once: true });
+      });
+    });
+    const { result } = renderHook(
+      () => useManuscriptSession({ novelId: 'novel-1', autostart: false }),
+      { wrapper },
+    );
+    await flushSessionEffects();
+    const baselineFetches = fetchMock.mock.calls.length;
+
+    let startPromise: Promise<void>;
+    act(() => {
+      startPromise = result.current.startWriting();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      result.current.pauseWriting();
+      await startPromise!;
+    });
+
+    // Pause settlement must refresh both novel and chapters (same as failure).
+    expect(fetchMock.mock.calls.length).toBe(baselineFetches + 2);
+    const pausedUrls = fetchMock.mock.calls
+      .slice(baselineFetches)
+      .map(([url]) => String(url));
+    expect(pausedUrls.some(url => url.endsWith('/chapters'))).toBe(true);
+    expect(pausedUrls.some(url => !url.endsWith('/chapters'))).toBe(true);
+    expect(result.current.writingRunState.phase).toBe('paused');
+  });
+
   it('refreshes durable state when opening the writing stream fails', async () => {
     stubManuscriptFetch(fetchMock);
     writingSessionMock.startWritingSession.mockRejectedValueOnce(

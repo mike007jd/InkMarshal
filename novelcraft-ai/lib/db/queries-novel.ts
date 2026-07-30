@@ -15,6 +15,7 @@ import {
   type Message,
   type NovelBlueprint,
   type NovelRow,
+  type ImportMeta,
   type NovelSettings,
   type WritingLockInfo,
 } from '@/lib/db-types';
@@ -138,17 +139,13 @@ export async function trashNovel(id: string, userId: string): Promise<Novel | nu
   const novel = await getNovel(id);
   if (!novel || novel.userId !== userId) return null;
   if (isNovelTrashed(novel)) return novel;
-  return updateNovel(id, {
-    settings: { ...(novel.settings ?? {}), trashedAt: nowIso() },
-  });
+  return patchNovelSettings(id, { trashedAt: nowIso() });
 }
 
 export async function restoreTrashedNovel(id: string, userId: string): Promise<Novel | null> {
   const novel = await getNovel(id);
   if (!novel || novel.userId !== userId || !isNovelTrashed(novel)) return null;
-  const settings = { ...(novel.settings ?? {}) };
-  delete settings.trashedAt;
-  return updateNovel(id, { settings });
+  return patchNovelSettings(id, {}, ['trashedAt']);
 }
 
 export async function deleteTrashedNovelPermanently(id: string, userId: string): Promise<boolean> {
@@ -303,6 +300,188 @@ export async function updateNovel(
   internal = true,
 ): Promise<Novel | null> {
   return applyNovelUpdate(getDb(), id, data, internal);
+}
+
+export type KbExtractionClaimResult =
+  | { status: 'claimed'; attemptId: string; completedSlots: string[] }
+  | { status: 'superseded' | 'completed' | 'in_progress' };
+
+function runImmediateOrNested<T>(
+  db: ReturnType<typeof getDb>,
+  operation: () => T,
+): T {
+  return db.inTransaction
+    ? operation()
+    : db.transaction(operation).immediate();
+}
+
+function getNovelSyncForKbMutation(
+  db: ReturnType<typeof getDb>,
+  id: string,
+): Novel | null {
+  const row = db.prepare('SELECT * FROM novels WHERE id = ?').get(id) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? mapNovel(hydrateNovelRow(row)) : null;
+}
+
+type PatchableNovelSettings = Omit<NovelSettings, 'importMeta'>;
+type PatchableNovelSettingsKey = keyof PatchableNovelSettings;
+
+/**
+ * Merge user-facing settings against the latest row under an IMMEDIATE write
+ * lock. Internal import orchestration metadata is excluded from the API by
+ * type, so a delayed UI write cannot roll back leases or durable slot receipts.
+ */
+export function patchNovelSettings(
+  id: string,
+  patch: Partial<PatchableNovelSettings>,
+  clearKeys: readonly PatchableNovelSettingsKey[] = [],
+): Novel | null {
+  const db = getDb();
+  return runImmediateOrNested(db, () => {
+    const novel = getNovelSyncForKbMutation(db, id);
+    if (!novel) return null;
+
+    // `Omit` is not an exact-object runtime boundary: a wider NovelSettings
+    // variable can still be passed structurally. Strip the internal key before
+    // spreading so no caller can overwrite the extraction state machine.
+    const { importMeta: _internal, ...safePatch } = patch as NovelSettings;
+    const next: NovelSettings = { ...(novel.settings ?? {}), ...safePatch };
+    for (const key of clearKeys as readonly (keyof NovelSettings)[]) {
+      if (key !== 'importMeta') delete next[key];
+    }
+    const persisted = Object.keys(next).length === 0 ? null : next;
+    if (JSON.stringify(persisted) === JSON.stringify(novel.settings)) {
+      return novel;
+    }
+    return applyNovelUpdate(db, id, { settings: persisted }, true);
+  });
+}
+
+/**
+ * Atomically claim one extraction attempt. An active lease blocks duplicate
+ * POSTs; an expired attempt can be recovered without reusing its write token.
+ */
+export function claimNovelKbExtraction(
+  id: string,
+  expectedKbExtractionId: string,
+  leaseMs: number,
+  atMs = Date.now(),
+): KbExtractionClaimResult {
+  const db = getDb();
+  return runImmediateOrNested(db, () => {
+    const novel = getNovelSyncForKbMutation(db, id);
+    const meta = novel?.settings?.importMeta;
+    if (!novel || meta?.kbExtractionId !== expectedKbExtractionId) {
+      return { status: 'superseded' };
+    }
+    if (meta.kbExtraction === 'done') return { status: 'completed' };
+    if (
+      meta.kbExtraction === 'running'
+      && meta.kbExtractionAttemptId
+      && parseTimestamp(meta.kbExtractionLeaseExpiresAt) > atMs
+    ) {
+      return { status: 'in_progress' };
+    }
+
+    const attemptId = crypto.randomUUID();
+    applyNovelUpdate(db, id, {
+      settings: {
+        ...novel.settings,
+        importMeta: {
+          ...meta,
+          kbExtraction: 'running',
+          kbExtractionAttemptId: attemptId,
+          kbExtractionLeaseExpiresAt: new Date(atMs + leaseMs).toISOString(),
+        },
+      },
+    });
+    return {
+      status: 'claimed',
+      attemptId,
+      completedSlots: Array.isArray(meta.kbExtractionCompletedSlots)
+        ? meta.kbExtractionCompletedSlots.filter(
+            (slot): slot is string => typeof slot === 'string',
+          )
+        : [],
+    };
+  });
+}
+
+/** Renew only the attempt that still owns the current import generation. */
+export function renewNovelKbExtractionClaim(
+  id: string,
+  expectedKbExtractionId: string,
+  expectedAttemptId: string,
+  leaseMs: number,
+  atMs = Date.now(),
+): boolean {
+  const db = getDb();
+  return runImmediateOrNested(db, () => {
+    const novel = getNovelSyncForKbMutation(db, id);
+    const meta = novel?.settings?.importMeta;
+    if (
+      !novel
+      || meta?.kbExtractionId !== expectedKbExtractionId
+      || meta.kbExtraction !== 'running'
+      || meta.kbExtractionAttemptId !== expectedAttemptId
+      || parseTimestamp(meta.kbExtractionLeaseExpiresAt) <= atMs
+    ) {
+      return false;
+    }
+    db.prepare('UPDATE novels SET settings = ? WHERE id = ?').run(
+      toJsonText({
+        ...novel.settings,
+        importMeta: {
+          ...meta,
+          kbExtractionLeaseExpiresAt: new Date(atMs + leaseMs).toISOString(),
+        },
+      }),
+      id,
+    );
+    return true;
+  });
+}
+
+/**
+ * Settle only the attempt that still owns the generation, merging against the
+ * latest settings under the write lock so unrelated user edits survive.
+ */
+export function updateNovelKbExtractionState(
+  id: string,
+  expectedKbExtractionId: string,
+  expectedAttemptId: string,
+  state: Extract<ImportMeta['kbExtraction'], 'done' | 'failed'>,
+  atMs = Date.now(),
+): boolean {
+  const db = getDb();
+  return runImmediateOrNested(db, () => {
+    const novel = getNovelSyncForKbMutation(db, id);
+    const meta = novel?.settings?.importMeta;
+    if (
+      !novel
+      || meta?.kbExtractionId !== expectedKbExtractionId
+      || meta.kbExtraction !== 'running'
+      || meta.kbExtractionAttemptId !== expectedAttemptId
+      || parseTimestamp(meta.kbExtractionLeaseExpiresAt) <= atMs
+    ) {
+      return false;
+    }
+    const settledMeta = {
+      ...meta,
+      kbExtraction: state,
+    };
+    delete settledMeta.kbExtractionAttemptId;
+    delete settledMeta.kbExtractionLeaseExpiresAt;
+    applyNovelUpdate(db, id, {
+      settings: {
+        ...novel.settings,
+        importMeta: settledMeta,
+      },
+    });
+    return true;
+  });
 }
 
 /**

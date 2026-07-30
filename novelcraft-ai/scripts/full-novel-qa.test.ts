@@ -2,7 +2,14 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+vi.mock('next/headers', () => ({
+  headers: async () => new Headers({
+    'x-inkmarshal-desktop-session': process.env.INKMARSHAL_DESKTOP_SESSION ?? '',
+  }),
+  cookies: async () => ({ get: () => undefined }),
+}));
 
 const NOVEL_ID = 'qa-full-novel-scale';
 const SETTINGS_KEY = 'inkmarshal_settings';
@@ -14,6 +21,7 @@ const requiresQaEnv = process.env.npm_lifecycle_event === 'qa:full-novel-coverag
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;
 const PREV_EMBED_BASE_URL = process.env.INKMARSHAL_EMBED_BASE_URL;
 const PREV_RUNTIME = process.env.INKMARSHAL_RUNTIME;
+const PREV_SESSION = process.env.INKMARSHAL_DESKTOP_SESSION;
 
 function assertHarnessPaths(dataDir: string): void {
   const resolvedDataDir = path.resolve(dataDir);
@@ -77,6 +85,7 @@ runQa('full-novel QA harness', () => {
     process.env.INKMARSHAL_DATA_DIR = qaDataDir;
     process.env.INKMARSHAL_EMBED_BASE_URL = '';
     process.env.INKMARSHAL_RUNTIME = 'desktop';
+    process.env.INKMARSHAL_DESKTOP_SESSION = 'full-novel-qa-desktop-session-token-000000000000000000000000';
     rmSync(exportDir, { recursive: true, force: true });
     mkdirSync(exportDir, { recursive: true });
   });
@@ -90,6 +99,8 @@ runQa('full-novel QA harness', () => {
     else process.env.INKMARSHAL_EMBED_BASE_URL = PREV_EMBED_BASE_URL;
     if (PREV_RUNTIME === undefined) delete process.env.INKMARSHAL_RUNTIME;
     else process.env.INKMARSHAL_RUNTIME = PREV_RUNTIME;
+    if (PREV_SESSION === undefined) delete process.env.INKMARSHAL_DESKTOP_SESSION;
+    else process.env.INKMARSHAL_DESKTOP_SESSION = PREV_SESSION;
   });
 
   it('exports TXT, DOCX, and PDF, then re-parses the TXT as an import smoke', async () => {

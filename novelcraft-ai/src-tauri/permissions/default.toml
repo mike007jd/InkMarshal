@@ -19,6 +19,7 @@ permissions = [
   "allow-save-export-file",
   "allow-reveal-export-file",
   "allow-read-local-file",
+  "allow-stage-manuscript-import",
   "allow-keychain-status",
   "allow-runtime-health",
   "allow-ollama-list-tags",

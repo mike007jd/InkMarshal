@@ -6,6 +6,7 @@ import {
   getKnowledgeEntryById,
   getActiveNovel,
   createKnowledgeEntryWithIndex as dbCreateKnowledgeEntryWithIndex,
+  createKnowledgeEntryWithIndexForImportGeneration as dbCreateKnowledgeEntryForImportGeneration,
   deleteKnowledgeEntry as dbDeleteKnowledgeEntry,
   getKnowledgeEntriesByNovel,
   createKnowledgeRelationWithSourceIndex as dbCreateKnowledgeRelationWithSourceIndex,
@@ -106,7 +107,13 @@ async function verifyRelationEndpointOwnership(
   return { source: source!, target: target! };
 }
 
-export async function createKnowledgeEntry(novelId: string, input: unknown) {
+async function createKnowledgeEntryInternal(
+  novelId: string,
+  input: unknown,
+  expectedKbExtractionId?: string,
+  expectedKbExtractionAttemptId?: string,
+  expectedKbExtractionSlot?: string,
+) {
   const user = await getUser();
   if (!user?.id) throw new Error('Local user context missing');
 
@@ -130,7 +137,7 @@ export async function createKnowledgeEntry(novelId: string, input: unknown) {
     updatedAt: now,
   });
 
-  await dbCreateKnowledgeEntryWithIndex({
+  const data = {
     id,
     novelId,
     type: parsed.type,
@@ -141,11 +148,63 @@ export async function createKnowledgeEntry(novelId: string, input: unknown) {
     tags: JSON.stringify(tags),
     createdAt: now,
     updatedAt: now,
-  }, index);
+  };
+  const importWrite = expectedKbExtractionId
+    ? await dbCreateKnowledgeEntryForImportGeneration(
+        data,
+        index,
+        expectedKbExtractionId,
+        expectedKbExtractionAttemptId!,
+        expectedKbExtractionSlot!,
+      )
+    : null;
+  if (expectedKbExtractionId && !importWrite) return null;
+  if (importWrite?.status === 'replayed') return { created: false as const };
+  if (!expectedKbExtractionId) {
+    await dbCreateKnowledgeEntryWithIndex(data, index);
+  }
   await trySyncKnowledgeEntryToVault(novelId, id, 'createKnowledgeEntry');
   scheduleEmbeddingRefresh(id);
 
-  return { id, novelId, type: parsed.type, title: parsed.title };
+  return {
+    created: true as const,
+    id,
+    novelId,
+    type: parsed.type,
+    title: parsed.title,
+  };
+}
+
+export async function createKnowledgeEntry(novelId: string, input: unknown) {
+  const created = await createKnowledgeEntryInternal(novelId, input);
+  if (!created || !created.created) {
+    throw new Error('Knowledge entry creation was unexpectedly fenced.');
+  }
+  const { created: _created, ...entry } = created;
+  return entry;
+}
+
+export async function createKnowledgeEntryForImportGeneration(
+  novelId: string,
+  expectedKbExtractionId: string,
+  expectedKbExtractionAttemptId: string,
+  expectedKbExtractionSlot: string,
+  input: unknown,
+) {
+  if (
+    !isUuid(expectedKbExtractionId)
+    || !isUuid(expectedKbExtractionAttemptId)
+    || !/^(?:style|chunk:[0-5])$/.test(expectedKbExtractionSlot)
+  ) {
+    throw new Error('Invalid knowledge extraction generation.');
+  }
+  return createKnowledgeEntryInternal(
+    novelId,
+    input,
+    expectedKbExtractionId,
+    expectedKbExtractionAttemptId,
+    expectedKbExtractionSlot,
+  );
 }
 
 export async function updateKnowledgeEntry(entryId: string, updates: unknown) {

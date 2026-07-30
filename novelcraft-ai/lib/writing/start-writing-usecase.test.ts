@@ -15,7 +15,10 @@ const steps = vi.hoisted(() => ({
   runValidate: vi.fn(),
   runRalphRevision: vi.fn(),
 }));
-const orch = vi.hoisted(() => ({ writeChapter: vi.fn() }));
+const orch = vi.hoisted(() => ({
+  writeChapter: vi.fn(),
+  completeSavedChapterPostProcessing: vi.fn(),
+}));
 const usage = vi.hoisted(() => ({
   createAIUsageSession: vi.fn(),
   aiUsageErrorResponse: vi.fn(() => null as Response | null),
@@ -26,6 +29,8 @@ const db = vi.hoisted(() => ({
   updateChapterMeta: vi.fn(async () => {}),
   updateNovel: vi.fn(async () => ({})),
   upsertChapter: vi.fn(async () => ({})),
+  isChapterProcessingComplete: (chapter: { processingStatus?: string | null }) =>
+    (chapter.processingStatus ?? 'complete') === 'complete',
 }));
 const ai = vi.hoisted(() => ({
   adaptiveDigestParams: vi.fn(() => ({ recentWindow: 2, tailCharsPerChapter: 1500, maxBatchChars: 80_000 })),
@@ -65,7 +70,12 @@ function writtenOutcome(chapterNumber: number) {
     summary: 's',
     keyFacts: null,
     generationMeta: {},
-    savedChapter: { chapterNumber, title: `C${chapterNumber}`, content: 'body' },
+    savedChapter: {
+      chapterNumber,
+      title: `C${chapterNumber}`,
+      content: 'body',
+      processingStatus: 'complete' as const,
+    },
   };
 }
 
@@ -311,12 +321,18 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     });
   });
 
-  it('keeps a chapter saved before lock loss in progress without claiming post-processing completed', async () => {
+  it('keeps content_saved prose after lock loss without counting it complete', async () => {
     steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
     orch.writeChapter.mockResolvedValue({
       ...writtenOutcome(1),
       status: 'lock_failed',
       errorMessage: 'Writing lock lost after saving the chapter.',
+      savedChapter: {
+        chapterNumber: 1,
+        title: 'C1',
+        content: 'body',
+        processingStatus: 'content_saved',
+      },
     });
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const { ctx, jobs, sink } = makeCtx();
@@ -324,27 +340,56 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     await executeStartWriting(ctx, sink);
 
     expect(db.updateNovel).toHaveBeenNthCalledWith(1, 'n1', { stage: 'autonomous_writing', progress: 5 });
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
-    expect(db.updateNovel).not.toHaveBeenCalledWith('n1', { stage: 'ready_for_greenlight', progress: 0 });
-    expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
+    // Progress stays at the zero-complete bookmark (15), not 90.
+    expect(db.updateNovel).toHaveBeenCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
+    expect(jobs.bumpProgress).not.toHaveBeenCalled();
     expectFinalized(jobs, 'failed', 'lock_failed', 'Writing lock lost after saving the chapter.', {
-      stage: 'autonomous_writing', progress: 90,
+      stage: 'autonomous_writing', progress: 15,
     });
     expect(sink.emit.mock.calls.filter(([frame]) => frame.type === 'error')).toHaveLength(1);
-    expect(sink.emit).toHaveBeenCalledWith({
-      type: 'error',
-      error: 'Writing lock lost after saving the chapter.',
-    });
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
     expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'done' }));
   });
 
-  it('counts a saved chapter before failing on its usage record', async () => {
+  it('does not count incomplete prose when chapter usage recording fails after save', async () => {
     steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
     orch.writeChapter.mockResolvedValue({
       ...writtenOutcome(1),
       status: 'saved_failed',
       errorMessage: 'usage ledger unavailable',
+      savedChapter: {
+        chapterNumber: 1,
+        title: 'C1',
+        content: 'body',
+        processingStatus: 'content_saved',
+      },
+    });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx();
+
+    await executeStartWriting(ctx, sink);
+
+    expect(jobs.bumpProgress).not.toHaveBeenCalled();
+    expect(db.updateNovel).toHaveBeenCalledWith('n1', { stage: 'autonomous_writing', progress: 15 });
+    expectFinalized(jobs, 'failed', 'error', 'usage ledger unavailable', {
+      stage: 'autonomous_writing', progress: 15,
+    });
+    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: 'usage ledger unavailable' });
+    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
+  });
+
+  it('keeps completion when usage settlement fails after metadata committed', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.writeChapter.mockResolvedValue({
+      ...writtenOutcome(1),
+      status: 'saved_failed',
+      errorMessage: 'post-generation usage settlement failed',
+      savedChapter: {
+        chapterNumber: 1,
+        title: 'C1',
+        content: 'body',
+        processingStatus: 'complete',
+      },
     });
     const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
     const { ctx, jobs, sink } = makeCtx();
@@ -352,12 +397,49 @@ describe('executeStartWriting — writing_jobs wiring', () => {
     await executeStartWriting(ctx, sink);
 
     expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
-    expect(db.updateNovel).toHaveBeenLastCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
-    expectFinalized(jobs, 'failed', 'error', 'usage ledger unavailable', {
+    expect(db.updateNovel).toHaveBeenCalledWith('n1', { stage: 'autonomous_writing', progress: 90 });
+    expectFinalized(jobs, 'failed', 'error', 'post-generation usage settlement failed', {
       stage: 'autonomous_writing', progress: 90,
     });
-    expect(sink.emit).toHaveBeenCalledWith({ type: 'error', error: 'usage ledger unavailable' });
-    expect(sink.emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
+  });
+
+  it('repairs content_saved chapters on resume without calling writeChapter', async () => {
+    steps.loadOrGenerateBlueprint.mockResolvedValue(blueprint(1));
+    orch.completeSavedChapterPostProcessing.mockResolvedValue({
+      ...writtenOutcome(1),
+      summary: 'repaired',
+      savedChapter: {
+        chapterNumber: 1,
+        title: 'C1',
+        content: 'saved prose',
+        processingStatus: 'complete',
+      },
+    });
+    const { executeStartWriting } = await import('@/lib/writing/start-writing-usecase');
+    const { ctx, jobs, sink } = makeCtx({
+      existingChapters: [{
+        chapterNumber: 1,
+        title: 'C1',
+        content: 'saved prose',
+        processingStatus: 'content_saved',
+      }] as never,
+    });
+
+    await executeStartWriting(ctx, sink);
+
+    expect(orch.writeChapter).not.toHaveBeenCalled();
+    expect(orch.completeSavedChapterPostProcessing).toHaveBeenCalledTimes(1);
+    expect(orch.completeSavedChapterPostProcessing).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        savedChapter: expect.objectContaining({
+          content: 'saved prose',
+          processingStatus: 'content_saved',
+        }),
+      }),
+    );
+    expect(jobs.bumpProgress).toHaveBeenCalledWith(1, 1);
+    expect(sink.emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'chapter_done' }));
   });
 
   it('emits one truthful failure when the atomic terminal settlement fails', async () => {

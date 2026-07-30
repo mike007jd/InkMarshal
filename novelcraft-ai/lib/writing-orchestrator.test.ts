@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  completeSavedChapterPostProcessing,
   writeChapter,
   type WriteChapterDeps,
   type WriteChapterInput,
@@ -37,11 +38,12 @@ function deferred(): SummarizeOutcome & ValidateOutcome {
   };
 }
 
-function fakeChapter(content: string): Chapter {
+function fakeChapter(content: string, processingStatus: Chapter['processingStatus'] = 'content_saved'): Chapter {
   return {
     id: 'c1', novelId: 'n1', chapterNumber: 1, title: 'Ch1', content,
     originalContent: null, wordCount: content.split(/\s+/).length, version: 1,
-    summary: '', keyFacts: null, qualityIssues: null, generationMeta: null, createdAt: 0,
+    summary: '', keyFacts: null, qualityIssues: null, generationMeta: null,
+    processingStatus, createdAt: 0,
   };
 }
 
@@ -71,9 +73,14 @@ function harness(overrides: Partial<WriteChapterDeps> = {}, opts: {
   const recordUsage = vi.fn(async () => { order.push('recordUsage'); });
   const fail = vi.fn(async () => { order.push('fail'); });
   const cancel = vi.fn(async () => { order.push('cancel'); });
-  const upsertChapter = vi.fn(async (_n: number, _t: string, content: string) => {
+  const upsertChapter = vi.fn(async (
+    _n: number,
+    _t: string,
+    content: string,
+    options?: { processingStatus?: 'content_saved' | 'complete' },
+  ) => {
     order.push('upsertChapter');
-    return fakeChapter(content);
+    return fakeChapter(content, options?.processingStatus ?? 'content_saved');
   });
   const streamChapterContinuation = vi.fn(stream(opts.continuationChunks ?? [''], opts.continuationFinish));
   const revise = vi.fn(async () => opts.revise?.() ?? { content: 'revised', recordUsage: vi.fn(async () => {}), failUsage: vi.fn(async () => {}), cancelUsage: vi.fn(async () => {}) });
@@ -339,5 +346,142 @@ describe('writeChapter', () => {
     await writeChapter(h.deps, input());
     const writing = h.frames.filter(f => f.type === 'writing');
     expect(writing.map(f => (f as { chunk: string }).chunk)).toEqual(['alpha ', 'beta ', 'gamma delta']);
+  });
+
+  it('persists AI prose as content_saved and marks complete only with metadata', async () => {
+    const h = harness();
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(h.upsertChapter).toHaveBeenCalledWith(
+      1,
+      'Ch1',
+      expect.any(String),
+      { processingStatus: 'content_saved' },
+    );
+    expect(h.deps.updateChapterMeta).toHaveBeenCalledWith(1, expect.objectContaining({
+      processingStatus: 'complete',
+    }));
+    expect(outcome.status).toBe('written');
+    expect(outcome.savedChapter?.processingStatus).toBe('complete');
+  });
+
+  it('keeps content_saved when usage recording throws after the initial content save', async () => {
+    const h = harness();
+    h.recordUsage.mockRejectedValueOnce(new Error('usage ledger unavailable'));
+
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(outcome.status).toBe('saved_failed');
+    expect(outcome.savedChapter?.processingStatus).toBe('content_saved');
+    expect(h.deps.updateChapterMeta).not.toHaveBeenCalled();
+    expect(h.upsertChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps content_saved when renewLock returns false after the initial content save', async () => {
+    const h = harness({}, { renewLock: async () => false });
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(outcome.status).toBe('lock_failed');
+    expect(outcome.savedChapter?.processingStatus).toBe('content_saved');
+    expect(h.deps.updateChapterMeta).not.toHaveBeenCalled();
+    expect(h.upsertChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps content_saved when the lease is lost during post-processing', async () => {
+    const renewLock = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const h = harness({}, { renewLock });
+
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(renewLock).toHaveBeenCalledTimes(2);
+    expect(outcome.status).toBe('lock_failed');
+    expect(outcome.savedChapter?.processingStatus).toBe('content_saved');
+    expect(h.deps.updateChapterMeta).not.toHaveBeenCalled();
+  });
+
+  it('repairs incomplete metadata on resume without regenerating prose after cancel during summarize', async () => {
+    const draft = 'the quick brown fox jumps over the lazy dog and then keeps on running through the open field ';
+    let cancelAfterUpsert = false;
+    let summarizeCalls = 0;
+    let resolveSummarize!: (value: SummarizeOutcome) => void;
+    const summarizeGate = new Promise<SummarizeOutcome>(resolve => {
+      resolveSummarize = resolve;
+    });
+
+    const first = harness({
+      summarize: async () => {
+        summarizeCalls += 1;
+        return summarizeGate;
+      },
+      isCancelled: () => cancelAfterUpsert,
+    }, { draftChunks: [draft] });
+
+    // Hold summarize, then cancel after content is durable.
+    const firstPromise = writeChapter(first.deps, input());
+    await vi.waitFor(() => expect(first.upsertChapter).toHaveBeenCalledTimes(1));
+    cancelAfterUpsert = true;
+    resolveSummarize(deferred());
+    const aborted = await firstPromise;
+
+    expect(aborted.status).toBe('aborted');
+    expect(aborted.savedChapter?.processingStatus).toBe('content_saved');
+    expect(aborted.content).toBe(draft);
+    expect(first.deps.updateChapterMeta).not.toHaveBeenCalled();
+    expect(summarizeCalls).toBe(1);
+
+    // Fresh resume: post-process saved prose only.
+    const updateChapterMeta = vi.fn(async () => {});
+    const streamChapter = vi.fn(() => {
+      throw new Error('resume must not regenerate chapter prose');
+    });
+    const resume = harness({
+      updateChapterMeta,
+      streamChapter: streamChapter as WriteChapterDeps['streamChapter'],
+      summarize: async () => ({
+        ...deferred(),
+        summary: 'repaired summary',
+      }),
+    });
+    const repaired = await completeSavedChapterPostProcessing(resume.deps, {
+      plan: PLAN,
+      savedChapter: aborted.savedChapter!,
+      targetWordsPerChapter: 4,
+      language: 'en',
+      earlierDigest: 'digest',
+      progress: 15,
+    });
+
+    expect(streamChapter).not.toHaveBeenCalled();
+    expect(resume.upsertChapter).not.toHaveBeenCalled();
+    expect(repaired.status).toBe('written');
+    expect(repaired.content).toBe(draft);
+    expect(repaired.summary).toBe('repaired summary');
+    expect(repaired.savedChapter?.processingStatus).toBe('complete');
+    expect(updateChapterMeta).toHaveBeenCalledWith(1, expect.objectContaining({
+      summary: 'repaired summary',
+      processingStatus: 'complete',
+    }));
+  });
+
+  it('does not regress completion when post-meta usage settlement fails', async () => {
+    const failedRecordUsage = vi.fn(async () => {
+      throw new Error('summarize usage ledger unavailable');
+    });
+    const h = harness({
+      summarize: async () => ({
+        ...deferred(),
+        recordUsage: failedRecordUsage,
+      }),
+    });
+
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(outcome.status).toBe('saved_failed');
+    expect(outcome.savedChapter?.processingStatus).toBe('complete');
+    expect(h.deps.updateChapterMeta).toHaveBeenCalledWith(1, expect.objectContaining({
+      processingStatus: 'complete',
+    }));
   });
 });

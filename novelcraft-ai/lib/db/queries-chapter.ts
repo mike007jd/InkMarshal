@@ -17,6 +17,7 @@ import {
   type Chapter,
   type ChapterLite,
   type ChapterMetaUpdate,
+  type ChapterProcessingStatus,
   type ChapterRow,
   type ChapterSnapshot,
   type Message,
@@ -56,6 +57,7 @@ export function hydrateChapterRow(r: Record<string, unknown>): ChapterRow {
     // Snapshots is an unversioned JSON list — lenient parse so a corrupt row
     // degrades to "no snapshots" rather than blowing up the chapter read.
     snapshots: fromJsonTextLenient<ChapterSnapshot[]>(r.snapshots),
+    processing_status: (r.processing_status as ChapterProcessingStatus | null | undefined) ?? 'complete',
     created_at: r.created_at as string,
   };
 }
@@ -72,7 +74,7 @@ export async function getChaptersLite(novelId: string): Promise<ChapterLite[]> {
   const db = getDb();
   const rows = db
     .prepare(
-      'SELECT id, novel_id, chapter_number, title, word_count, version, summary, created_at FROM chapters WHERE novel_id = ? ORDER BY chapter_number ASC',
+      'SELECT id, novel_id, chapter_number, title, word_count, version, summary, processing_status, created_at FROM chapters WHERE novel_id = ? ORDER BY chapter_number ASC',
     )
     .all(novelId) as Record<string, unknown>[];
   return rows.map(r =>
@@ -86,9 +88,36 @@ export async function getChaptersLite(novelId: string): Promise<ChapterLite[]> {
       word_count: r.word_count as number,
       version: r.version as number,
       summary: (r.summary as string | null) ?? '',
+      processing_status: (r.processing_status as ChapterProcessingStatus | null | undefined) ?? 'complete',
       created_at: r.created_at as string,
     }),
   );
+}
+
+/** Token/version fence rejected a late writer chapter mutation. */
+export class ChapterWriteFenceError extends Error {
+  readonly code = 'CHAPTER_WRITE_FENCE' as const;
+
+  constructor(message = 'Chapter write rejected: writing lock or version fence lost.') {
+    super(message);
+    this.name = 'ChapterWriteFenceError';
+  }
+}
+
+export interface UpsertChapterOptions {
+  /**
+   * AI generation must pass `content_saved` so resume can finish metadata
+   * without regenerating prose. Manual/import callers leave the default
+   * `complete`.
+   */
+  processingStatus?: ChapterProcessingStatus;
+  /**
+   * When set, the write is fenced: the same SQL mutation requires this token
+   * to still own the novel writing lock (and `expectedVersion` when overwriting).
+   */
+  writingLockToken?: string;
+  /** Required with `writingLockToken` when the chapter row already exists. */
+  expectedVersion?: number;
 }
 
 export async function upsertChapter(
@@ -96,34 +125,121 @@ export async function upsertChapter(
   chapterNumber: number,
   title: string,
   content: string,
+  options?: UpsertChapterOptions,
 ): Promise<Chapter> {
   const db = getDb();
   const wordCount = countWords(content);
   const now = nowIso();
+  const processingStatus: ChapterProcessingStatus = options?.processingStatus ?? 'complete';
+  const lockToken = options?.writingLockToken;
+  const expectedVersion = options?.expectedVersion;
 
   // Capture prior length before the upsert so the AI word delta on a
   // re-generation is net (new − old), not the full new length.
   const prev = db
-    .prepare('SELECT word_count FROM chapters WHERE novel_id = ? AND chapter_number = ?')
-    .get(novelId, chapterNumber) as { word_count: number } | undefined;
+    .prepare('SELECT word_count, version FROM chapters WHERE novel_id = ? AND chapter_number = ?')
+    .get(novelId, chapterNumber) as { word_count: number; version: number } | undefined;
   const prevWords = prev?.word_count ?? 0;
 
   const write = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO chapters (
-         id, novel_id, chapter_number, title, content, original_content,
-         word_count, version, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(novel_id, chapter_number) DO UPDATE SET
-         title = excluded.title,
-         content = excluded.content,
-         -- An upsert-on-conflict is a fresh generation: clear any stale
-         -- revert-baseline so a later revertChapterToOriginalContent can't
-         -- restore content from a previous draft lineage.
-         original_content = NULL,
-         word_count = excluded.word_count,
-         version = COALESCE(chapters.version, 0) + 1`,
-    ).run(crypto.randomUUID(), novelId, chapterNumber, title, content, null, wordCount, 0, now);
+    if (lockToken) {
+      if (prev) {
+        if (expectedVersion === undefined) {
+          throw new ChapterWriteFenceError(
+            'Fenced chapter overwrite requires an expected version.',
+          );
+        }
+        const info = db.prepare(
+          `UPDATE chapters SET
+             title = ?,
+             content = ?,
+             original_content = NULL,
+             word_count = ?,
+             version = ?,
+             processing_status = ?
+           WHERE novel_id = ?
+             AND chapter_number = ?
+             AND version = ?
+             AND EXISTS (
+               SELECT 1 FROM novels n
+                WHERE n.id = chapters.novel_id
+                  AND n.writing_lock_token = ?
+                  AND n.writing_lock_expires_at >= ?
+             )`,
+        ).run(
+          title,
+          content,
+          wordCount,
+          expectedVersion + 1,
+          processingStatus,
+          novelId,
+          chapterNumber,
+          expectedVersion,
+          lockToken,
+          now,
+        );
+        if (info.changes === 0) {
+          throw new ChapterWriteFenceError();
+        }
+      } else {
+        const info = db.prepare(
+          `INSERT INTO chapters (
+             id, novel_id, chapter_number, title, content, original_content,
+             word_count, version, processing_status, created_at
+           )
+           SELECT ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?
+            WHERE EXISTS (
+              SELECT 1 FROM novels n
+               WHERE n.id = ?
+                 AND n.writing_lock_token = ?
+                 AND n.writing_lock_expires_at >= ?
+            )`,
+        ).run(
+          crypto.randomUUID(),
+          novelId,
+          chapterNumber,
+          title,
+          content,
+          wordCount,
+          processingStatus,
+          now,
+          novelId,
+          lockToken,
+          now,
+        );
+        if (info.changes === 0) {
+          throw new ChapterWriteFenceError();
+        }
+      }
+    } else {
+      db.prepare(
+        `INSERT INTO chapters (
+           id, novel_id, chapter_number, title, content, original_content,
+           word_count, version, processing_status, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(novel_id, chapter_number) DO UPDATE SET
+           title = excluded.title,
+           content = excluded.content,
+           -- An upsert-on-conflict is a fresh generation: clear any stale
+           -- revert-baseline so a later revertChapterToOriginalContent can't
+           -- restore content from a previous draft lineage.
+           original_content = NULL,
+           word_count = excluded.word_count,
+           version = COALESCE(chapters.version, 0) + 1,
+           processing_status = excluded.processing_status`,
+      ).run(
+        crypto.randomUUID(),
+        novelId,
+        chapterNumber,
+        title,
+        content,
+        null,
+        wordCount,
+        0,
+        processingStatus,
+        now,
+      );
+    }
     touchNovelUpdatedAt(db, novelId);
     try {
       recordActivityEvent(db, {
@@ -410,6 +526,7 @@ export async function updateChapterMeta(
   novelId: string,
   chapterNumber: number,
   meta: ChapterMetaUpdate,
+  options?: { writingLockToken?: string; expectedVersion?: number },
 ): Promise<void> {
   const db = getDb();
   const setParts: string[] = [];
@@ -436,12 +553,34 @@ export async function updateChapterMeta(
         ELSE json_remove(generation_meta, '$.summaryStale') END`,
     );
   }
+  if (meta.processingStatus !== undefined) {
+    setParts.push('processing_status = ?');
+    values.push(meta.processingStatus);
+  }
   if (setParts.length === 0) return;
 
   values.push(novelId, chapterNumber);
-  const info = db.prepare(
-    `UPDATE chapters SET ${setParts.join(', ')} WHERE novel_id = ? AND chapter_number = ?`,
-  ).run(...values);
+  let sql = `UPDATE chapters SET ${setParts.join(', ')} WHERE novel_id = ? AND chapter_number = ?`;
+  if (options?.writingLockToken) {
+    if (options.expectedVersion === undefined) {
+      throw new ChapterWriteFenceError(
+        'Fenced chapter metadata write requires an expected version.',
+      );
+    }
+    sql += ` AND version = ? AND EXISTS (
+      SELECT 1 FROM novels n
+       WHERE n.id = chapters.novel_id
+         AND n.writing_lock_token = ?
+         AND n.writing_lock_expires_at >= ?
+    )`;
+    values.push(options.expectedVersion, options.writingLockToken, nowIso());
+  }
+  const info = db.prepare(sql).run(...values);
+  if (options?.writingLockToken && info.changes === 0) {
+    throw new ChapterWriteFenceError(
+      'Chapter metadata write rejected: writing lock or version fence lost.',
+    );
+  }
   if (info.changes > 0) touchNovelUpdatedAt(db, novelId);
 }
 
@@ -784,58 +923,58 @@ export async function addMessageWithId(
   conversationId?: string | null,
 ): Promise<Message> {
   const db = getDb();
-  const existing = db
-    .prepare('SELECT * FROM messages WHERE id = ? AND novel_id = ?')
-    .get(id, novelId) as Record<string, unknown> | undefined;
-
-  if (existing) {
-    const existingRole = existing.role as Message['role'];
-    const existingConversationId = (existing.conversation_id as string | null) ?? null;
-    if (
-      existingRole !== role ||
-      existing.content !== content ||
-      existingConversationId !== (conversationId ?? null)
-    ) {
-      throw new Error('Message id collision');
-    }
-    return mapMessage({
-      id: existing.id as string,
-      novel_id: existing.novel_id as string,
-      role: existingRole,
-      content: existing.content as string,
-      conversation_id: existingConversationId,
-      created_at: existing.created_at as string,
-    });
-  }
-
+  const conversationIdValue = conversationId ?? null;
   const now = nowIso();
-  db.transaction(() => {
-    if (conversationId) {
+
+  return db.transaction(() => {
+    if (conversationIdValue) {
       const conversation = db
         .prepare('SELECT id FROM conversations WHERE id = ? AND novel_id = ?')
-        .get(conversationId, novelId);
+        .get(conversationIdValue, novelId);
       if (!conversation) throw new Error('Conversation not found');
     }
 
-    db.prepare(
+    const write = db.prepare(
       `INSERT INTO messages (id, novel_id, role, content, conversation_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(id, novelId, role, content, conversationId ?? null, now);
-    if (conversationId) {
-      db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ? AND novel_id = ?')
-        .run(now, conversationId, novelId);
-    }
-    touchNovelUpdatedAt(db, novelId);
-  })();
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run(id, novelId, role, content, conversationIdValue, now);
 
-  return mapMessage({
-    id,
-    novel_id: novelId,
-    role,
-    content,
-    conversation_id: conversationId ?? null,
-    created_at: now,
-  });
+    const row = db
+      .prepare('SELECT * FROM messages WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error('Message insert failed');
+    }
+
+    const existingRole = row.role as Message['role'];
+    const existingConversationId = (row.conversation_id as string | null) ?? null;
+    if (
+      row.novel_id !== novelId
+      || existingRole !== role
+      || row.content !== content
+      || existingConversationId !== conversationIdValue
+    ) {
+      throw new Error('Message id collision');
+    }
+
+    if (write.changes > 0) {
+      if (conversationIdValue) {
+        db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ? AND novel_id = ?')
+          .run(now, conversationIdValue, novelId);
+      }
+      touchNovelUpdatedAt(db, novelId);
+    }
+
+    return mapMessage({
+      id: row.id as string,
+      novel_id: row.novel_id as string,
+      role: existingRole,
+      content: row.content as string,
+      conversation_id: existingConversationId,
+      created_at: row.created_at as string,
+    });
+  })();
 }
 
 /**

@@ -1,6 +1,13 @@
 import { NextResponse } from 'next/server';
 import { requireNovelOwner } from '@/lib/local-auth';
-import { addMessageWithId } from '@/lib/db';
+import {
+  addMessageWithId,
+  cancelChatTurn,
+  failChatTurn,
+  findNovelMessageById,
+  hashChatTurnRequest,
+} from '@/lib/db';
+import { persistChatTurnAssistantMessage } from '@/lib/db/queries-chat-turns';
 import { type ChatMessage } from '@/lib/ai';
 import { buildAIContext } from '@/lib/ai-context-builder';
 import { formatTokensHeader } from '@/lib/token-budget';
@@ -18,6 +25,11 @@ import {
   parseNovelChatUIMessages,
   type NovelChatUIMessage,
 } from '@/lib/chat-ui-message';
+import {
+  acquireChatTurnOrRespond,
+  chatTurnCollisionResponse,
+  deterministicAssistantMessageId,
+} from '@/lib/chat-turn-helpers';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -60,11 +72,44 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   };
   const originalMessages = requestMessages.length > 0 ? requestMessages : [userMessage];
 
+  const existingUserRow = findNovelMessageById(novelId, userMessage.id);
+  if (existingUserRow && (
+    existingUserRow.role !== 'user'
+    || existingUserRow.content !== content
+    || existingUserRow.conversationId !== convId
+  )) {
+    return chatTurnCollisionResponse();
+  }
+
+  const responseMessageId = deterministicAssistantMessageId(userMessage.id);
+  const requestHash = hashChatTurnRequest({
+    content,
+    mode: 'conversation',
+    conversationId: convId,
+  });
+  const claim = await acquireChatTurnOrRespond({
+    novelId,
+    userMessageId: userMessage.id,
+    requestHash,
+    assistantMessageId: responseMessageId,
+    originalMessages,
+    conversationId: convId,
+  });
+  if (claim.kind === 'response') return claim.response;
+  const claimToken = claim.turn.claimToken;
+  if (!claimToken) throw new Error('Acquired chat turn is missing its claim token');
+
   let aiUsage;
   try {
     aiUsage = await createAIUsageSession(req, { userId: user.id, operation: 'chat' });
     aiUsage.addPromptText(content);
   } catch (error) {
+    failChatTurn({
+      novelId,
+      userMessageId: userMessage.id,
+      claimToken,
+      errorCode: 'ai_usage',
+    });
     const response = aiUsageErrorResponse(error);
     if (response) return response as NextResponse;
     throw error;
@@ -91,18 +136,31 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     ]);
     if (!resolvedContext) {
       await aiUsage.fail();
+      failChatTurn({
+        novelId,
+        userMessageId: userMessage.id,
+        claimToken,
+        errorCode: 'novel_missing',
+      });
       return NextResponse.json({ error: 'Novel not found' }, { status: 404 });
     }
     contextResult = resolvedContext;
+    const userAlreadyInChain = contextMessages.some(message => message.id === userMessage.id);
     chatHistory = [
       ...contextMessages.map(m => ({
         role: m.role as ChatMessage['role'],
         content: m.content,
       })),
-      { role: 'user' as const, content },
+      ...(userAlreadyInChain ? [] : [{ role: 'user' as const, content }]),
     ];
   } catch (error) {
     await aiUsage.fail();
+    failChatTurn({
+      novelId,
+      userMessageId: userMessage.id,
+      claimToken,
+      errorCode: 'context_build',
+    });
     throw error;
   }
   aiUsage.addPromptText(contextResult.systemPrompt + JSON.stringify(chatHistory));
@@ -118,11 +176,50 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     preset: resolvePreset('chat', readCreativityHeader(req)),
     originalMessages,
     submittedUserMessage: userMessage,
-    responseMessageId: crypto.randomUUID(),
+    responseMessageId,
+    activeClaim: {
+      novelId,
+      userMessageId: userMessage.id,
+      claimToken,
+    },
     stoppedLabel,
     persistence: {
       persistUser: messageId => addMessageWithId(novelId, messageId, 'user', content, convId),
-      persistAssistant: (messageId, text) => addMessageWithId(novelId, messageId, 'assistant', text, convId),
+      persistAssistant: async (messageId, text) => {
+        const message = persistChatTurnAssistantMessage({
+          novelId,
+          userMessageId: userMessage.id,
+          claimToken,
+          assistantMessageId: messageId,
+          responseText: text,
+          conversationId: convId,
+        });
+        if (!message) throw new Error('Chat turn claim lost before assistant persistence');
+        return message;
+      },
+      persistStoppedAssistant: async (messageId, text) => {
+        const message = persistChatTurnAssistantMessage({
+          novelId,
+          userMessageId: userMessage.id,
+          claimToken,
+          assistantMessageId: messageId,
+          responseText: text,
+          conversationId: convId,
+        });
+        if (!message) throw new Error('Chat turn claim lost before assistant persistence');
+        return message;
+      },
+      markFailed: async () => {
+        failChatTurn({
+          novelId,
+          userMessageId: userMessage.id,
+          claimToken,
+          errorCode: 'provider_failed',
+        });
+      },
+      markCancelled: async () => {
+        cancelChatTurn({ novelId, userMessageId: userMessage.id, claimToken });
+      },
     },
     headers: {
       'X-Context-Pressure': budget.pressure,

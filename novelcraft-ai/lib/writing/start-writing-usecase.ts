@@ -174,11 +174,14 @@ export async function executeStartWriting(
   try {
     log(START_WRITING_EVENTS.begin, { stage: novel.stage, messages: ctx.messageCount });
 
+    const completeCountAtStart = existingChapters.filter(
+      c => (c.processingStatus ?? 'complete') === 'complete',
+    ).length;
     sink.emit({
       type: 'phase',
       phase: 'preparing',
       progress: Math.max(0, novel.progress),
-      completedChapters: existingChapters.length,
+      completedChapters: completeCountAtStart,
       message: isZhLocale(language) ? '正在准备写作上下文…' : 'Preparing writing context...',
     });
     await updateNovel(id, { stage: 'autonomous_writing', progress: 5 });
@@ -187,7 +190,7 @@ export async function executeStartWriting(
       type: 'phase',
       phase: 'planning',
       progress: 5,
-      completedChapters: existingChapters.length,
+      completedChapters: completeCountAtStart,
       message: isZhLocale(language) ? '正在规划章节蓝图…' : 'Planning chapter blueprint...',
     });
     sink.emit({ type: 'progress', progress: 5, message: isZhLocale(language) ? '正在规划章节蓝图…' : 'Planning chapter blueprint...' });
@@ -207,8 +210,18 @@ export async function executeStartWriting(
     sink.emit({ type: 'blueprint', blueprint, total: blueprint.chapters.length });
 
     // We hold the lock; existingChapters is authoritative for the duration.
+    // Only `processingStatus === 'complete'` counts as done / skippable.
+    // Incomplete (`content_saved`) chapters are repaired by the batch executor
+    // without regenerating prose.
     const existingByNumber = new Map(existingChapters.map(c => [c.chapterNumber, c]));
-    const chaptersToWrite = selectChapterPlansToWrite(blueprint.chapters, existingChapters);
+    const incompleteExisting = existingChapters.filter(c => c.processingStatus === 'content_saved');
+    const chaptersToGenerate = selectChapterPlansToWrite(blueprint.chapters, existingChapters);
+    const chaptersToWrite = [
+      ...blueprint.chapters.filter(plan =>
+        incompleteExisting.some(ch => ch.chapterNumber === plan.chapterNumber),
+      ),
+      ...chaptersToGenerate,
+    ];
     // Outline-projected blueprints carry targetWordsPerChapter === 0 when no
     // per-chapter word targets were authored (projectBlueprintFromOutline).
     // Floor it from the novel's intended length so the length gate
@@ -217,7 +230,10 @@ export async function executeStartWriting(
     const targetWordsPerChapter = blueprint.targetWordsPerChapter > 0
       ? blueprint.targetWordsPerChapter
       : getTargetWordsPerChapter(novel.targetWords || 80_000, Math.max(1, blueprint.chapters.length));
-    completedChapters = blueprint.chapters.filter(c => existingByNumber.has(c.chapterNumber)).length;
+    completedChapters = blueprint.chapters.filter(c => {
+      const existing = existingByNumber.get(c.chapterNumber);
+      return existing != null && (existing.processingStatus ?? 'complete') === 'complete';
+    }).length;
     const progressForCompleted = (count: number) =>
       15 + Math.floor((count / blueprint.chapters.length) * 75);
     latestProgress = progressForCompleted(completedChapters);
@@ -250,7 +266,11 @@ export async function executeStartWriting(
     // send a structured event so the client can switch to its
     // "next chapter / edit blueprint / rewrite current" UI.
     if (abortedReason === 'batch_complete') {
-      const missing = missingChapterNumbers(blueprint.chapters, existingByNumber);
+      const missing = missingChapterNumbers(
+        blueprint.chapters,
+        existingByNumber,
+        chapter => (chapter.processingStatus ?? 'complete') === 'complete',
+      );
       const remaining = missing.length;
       const nextChapter = missing[0] ?? null;
       const finalizeMessage = isZhLocale(language)
@@ -319,7 +339,11 @@ export async function executeStartWriting(
       // but if some future code path drops us here without finishing the
       // book, treat it as a batch_complete rather than promoting to
       // whole_book_unification by mistake.
-      const missing = missingChapterNumbers(blueprint.chapters, existingByNumber);
+      const missing = missingChapterNumbers(
+        blueprint.chapters,
+        existingByNumber,
+        chapter => (chapter.processingStatus ?? 'complete') === 'complete',
+      );
       const remaining = missing.length;
       abortedReason = 'batch_complete';
       await settlePausedRun();

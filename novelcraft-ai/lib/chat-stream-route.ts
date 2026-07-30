@@ -5,11 +5,20 @@ import type { Message } from '@/lib/db-types';
 import { createAIStreamLifecycle, createUsageSettlement, type AIUsageSession } from '@/lib/ai-usage';
 import { serializeAIError } from '@/lib/ai-error';
 import { getUIMessageText, type NovelChatUIMessage } from '@/lib/chat-ui-message';
+import {
+  createChatTurnActiveClaimLease,
+  type ChatTurnActiveClaim,
+  type ChatTurnActiveClaimLeaseOptions,
+} from '@/lib/chat-turn-lease';
 
 export interface ChatTurnPersistence {
   persistUser(id: string): Promise<Message>;
   persistAssistant(id: string, text: string): Promise<Message>;
   persistStoppedAssistant?(id: string, text: string): Promise<Message | null>;
+  /** Durable turn receipt: provider error while still running. */
+  markFailed?(): Promise<void>;
+  /** Durable turn receipt: aborted without a persisted assistant reply. */
+  markCancelled?(): Promise<void>;
 }
 
 export interface StreamChatTurnArgs {
@@ -22,6 +31,10 @@ export interface StreamChatTurnArgs {
   originalMessages: NovelChatUIMessage[];
   submittedUserMessage: NovelChatUIMessage;
   responseMessageId: string;
+  /** Token-bound active claim shared by ordinary, brainstorm, and conversation streams. */
+  activeClaim: ChatTurnActiveClaim;
+  /** Optional lease overrides (tests / diagnostics). */
+  claimLease?: Pick<ChatTurnActiveClaimLeaseOptions, 'deadlineMs' | 'heartbeatMs' | 'renewClaim'>;
   stoppedLabel?: string;
   headers?: HeadersInit;
   tools?: ToolSet;
@@ -39,13 +52,20 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
     originalMessages,
     submittedUserMessage,
     responseMessageId,
+    activeClaim,
+    claimLease,
     stoppedLabel,
     headers,
     tools,
     stopWhen,
   } = args;
 
-  const lifecycle = createAIStreamLifecycle(requestSignal);
+  const activeClaimLease = createChatTurnActiveClaimLease({
+    ...activeClaim,
+    requestSignal,
+    ...claimLease,
+  });
+  const lifecycle = createAIStreamLifecycle(activeClaimLease.signal);
   const usage = createUsageSettlement(aiUsage);
   let assistantMessage: Message | null = null;
   let userPersisted = false;
@@ -57,8 +77,11 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
     await persistence.persistUser(submittedUserMessage.id);
   };
 
+  const shouldSkipWorkerSideEffects = () => activeClaimLease.hasLostClaim();
+
   let result: ReturnType<typeof streamText>;
   try {
+    activeClaimLease.start();
     await persistUserOnce();
     result = streamText({
       model: aiUsage.model,
@@ -69,26 +92,89 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
       ...preset,
       abortSignal: lifecycle.signal,
       onFinish: async ({ text, usage: modelUsage, finishReason }) => {
-        aiUsage.addPartialOutput(text);
-        if (lifecycle.isCancelled()) {
-          await usage.cancelOnce(modelUsage);
-          return;
+        try {
+          if (shouldSkipWorkerSideEffects()) {
+            await usage.cancelOnce(modelUsage);
+            return;
+          }
+          aiUsage.addPartialOutput(text);
+          if (lifecycle.isCancelled()) {
+            await usage.cancelOnce(modelUsage);
+            if (!text.trim()) {
+              await persistence.markCancelled?.().catch((error) => {
+                console.error('Failed to mark cancelled chat turn:', error);
+              });
+            }
+            return;
+          }
+          try {
+            if (text.trim()) {
+              assistantMessage = await persistence.persistAssistant(responseMessageId, text);
+            } else {
+              await persistence.markFailed?.().catch((error) => {
+                console.error('Failed to mark empty-provider chat turn failed:', error);
+              });
+            }
+            await usage.recordOnce(modelUsage, finishReason);
+          } catch (error) {
+            // SDK may swallow onFinish errors before onError. Guarantee one
+            // terminal usage settlement for every assistant persistence outcome.
+            if (shouldSkipWorkerSideEffects()) {
+              await usage.cancelOnce(modelUsage);
+            } else {
+              await usage.failOnce();
+              await persistence.markFailed?.().catch((markError) => {
+                console.error('Failed to mark failed chat turn after persist error:', markError);
+              });
+            }
+            console.error('Failed to persist assistant chat turn:', error);
+          }
+        } finally {
+          activeClaimLease.dispose();
         }
-        if (text.trim()) {
-          assistantMessage = await persistence.persistAssistant(responseMessageId, text);
-        }
-        await usage.recordOnce(modelUsage, finishReason);
       },
       onError: async () => {
-        if (lifecycle.isCancelled()) await usage.cancelOnce();
-        else await usage.failOnce();
+        try {
+          if (shouldSkipWorkerSideEffects()) {
+            await usage.cancelOnce();
+            return;
+          }
+          if (lifecycle.isCancelled()) {
+            await usage.cancelOnce();
+            await persistence.markCancelled?.().catch((error) => {
+              console.error('Failed to mark cancelled chat turn:', error);
+            });
+          } else {
+            await usage.failOnce();
+            await persistence.markFailed?.().catch((error) => {
+              console.error('Failed to mark failed chat turn:', error);
+            });
+          }
+        } finally {
+          activeClaimLease.dispose();
+        }
       },
     });
   } catch (error) {
     const wasCancelled = lifecycle.isCancelled();
+    const lostClaim = shouldSkipWorkerSideEffects();
     lifecycle.cancel();
-    if (wasCancelled) await usage.cancelOnce();
-    else await usage.failOnce();
+    activeClaimLease.dispose();
+    if (lostClaim) {
+      await usage.cancelOnce();
+      throw error;
+    }
+    if (wasCancelled) {
+      await usage.cancelOnce();
+      await persistence.markCancelled?.().catch((markError) => {
+        console.error('Failed to mark cancelled chat turn:', markError);
+      });
+    } else {
+      await usage.failOnce();
+      await persistence.markFailed?.().catch((markError) => {
+        console.error('Failed to mark failed chat turn:', markError);
+      });
+    }
     throw error;
   }
 
@@ -102,37 +188,59 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
     assistantMessage = await persistStopped(responseMessageId, content);
   };
 
-  return result.toUIMessageStreamResponse<NovelChatUIMessage>({
-    originalMessages,
-    generateMessageId: () => responseMessageId,
-    // AI SDK's UI stream transports errors as strings. Encode a versioned,
-    // sanitized payload so the renderer can localize the category without
-    // exposing provider response bodies or credentials.
-    onError: error => serializeAIError(error),
-    onFinish: async ({ responseMessage, isAborted }) => {
-      if (!isAborted) return;
-      await usage.cancelOnce();
-      await persistStoppedAssistantOnce(getUIMessageText(responseMessage)).catch((error) => {
-        console.error('Failed to persist stopped assistant message:', error);
-      });
-    },
-    // Required by AI SDK abort handling: tee + independently consume the SSE
-    // stream so onFinish({ isAborted: true }) still runs after the client Stop
-    // cancels the response body (see ai docs stopping-streams / stream-abort-handling).
-    consumeSseStream: consumeStream,
-    messageMetadata: ({ part }) => {
-      if (part.type === 'start') {
-        return { persisted: false };
-      }
-      if (part.type === 'finish' && assistantMessage) {
-        return {
-          persisted: true,
-          createdAt: assistantMessage.createdAt,
-          conversationId: assistantMessage.conversationId ?? null,
-        };
-      }
-      return undefined;
-    },
-    headers,
-  });
+  try {
+    return result.toUIMessageStreamResponse<NovelChatUIMessage>({
+      originalMessages,
+      generateMessageId: () => responseMessageId,
+      // AI SDK's UI stream transports errors as strings. Encode a versioned,
+      // sanitized payload so the renderer can localize the category without
+      // exposing provider response bodies or credentials.
+      onError: error => serializeAIError(error),
+      onFinish: async ({ responseMessage, isAborted }) => {
+        try {
+          if (shouldSkipWorkerSideEffects()) {
+            await usage.cancelOnce();
+            return;
+          }
+          if (!isAborted) return;
+          await usage.cancelOnce();
+          const stoppedText = getUIMessageText(responseMessage);
+          try {
+            await persistStoppedAssistantOnce(stoppedText);
+            if (!stoppedText.trim()) {
+              await persistence.markCancelled?.();
+            }
+          } catch (error) {
+            console.error('Failed to persist stopped assistant message:', error);
+            await persistence.markCancelled?.().catch((markError) => {
+              console.error('Failed to mark cancelled chat turn:', markError);
+            });
+          }
+        } finally {
+          activeClaimLease.dispose();
+        }
+      },
+      // Required by AI SDK abort handling: tee + independently consume the SSE
+      // stream so onFinish({ isAborted: true }) still runs after the client Stop
+      // cancels the response body (see ai docs stopping-streams / stream-abort-handling).
+      consumeSseStream: consumeStream,
+      messageMetadata: ({ part }) => {
+        if (part.type === 'start') {
+          return { persisted: false };
+        }
+        if (part.type === 'finish' && assistantMessage) {
+          return {
+            persisted: true,
+            createdAt: assistantMessage.createdAt,
+            conversationId: assistantMessage.conversationId ?? null,
+          };
+        }
+        return undefined;
+      },
+      headers,
+    });
+  } catch (error) {
+    activeClaimLease.dispose();
+    throw error;
+  }
 }

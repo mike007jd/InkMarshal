@@ -98,9 +98,9 @@ function proposalReviewStateFromExistingProfile(novel: Novel): InterviewState {
  * current profile summaries and existing Story Deck coverage are already
  * complete. Never inserts/updates knowledge cards and never falls back to title.
  */
-export async function approveExistingBrainstormAtomic(
+export function approveExistingBrainstormAtomicSync(
   novelId: string,
-): Promise<ApproveExistingBrainstormResult> {
+): ApproveExistingBrainstormResult {
   const db = getDb();
   const tx = db.transaction((): ApproveExistingBrainstormResult => {
     const currentRow = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as
@@ -146,6 +146,12 @@ export async function approveExistingBrainstormAtomic(
   return tx();
 }
 
+export async function approveExistingBrainstormAtomic(
+  novelId: string,
+): Promise<ApproveExistingBrainstormResult> {
+  return approveExistingBrainstormAtomicSync(novelId);
+}
+
 function normalizedTitle(value: string): string {
   return value.trim().toLowerCase();
 }
@@ -160,16 +166,15 @@ function sameEntry(
 }
 
 /**
- * Commits the approved profile, the complete structured Story Deck, and the
- * ready stage in one SQLite transaction. If any write throws, none of the
- * visible brainstorm completion state is committed.
+ * Synchronous finalize body. Safe to nest inside an outer SQLite transaction
+ * (savepoint) so claim fencing, receipts, and ledger completion stay atomic.
  */
-export async function finalizeBrainstormAtomic(args: {
+export function finalizeBrainstormAtomicSync(args: {
   novelId: string;
   profile: Partial<Novel>;
   entries: readonly BrainstormFinalizationEntry[];
   preserveExistingStoryDeck?: boolean;
-}): Promise<FinalizeBrainstormResult> {
+}): FinalizeBrainstormResult {
   const submittedCoverage = args.entries.reduce<Record<BrainstormFinalizationEntry['type'], number>>(
     (counts, entry) => {
       counts[entry.type] += 1;
@@ -278,4 +283,18 @@ export async function finalizeBrainstormAtomic(args: {
     return { ok: true, beforeNovel, novel, mutations, coverage };
   });
   return tx();
+}
+
+/**
+ * Commits the approved profile, the complete structured Story Deck, and the
+ * ready stage in one SQLite transaction. If any write throws, none of the
+ * visible brainstorm completion state is committed.
+ */
+export async function finalizeBrainstormAtomic(args: {
+  novelId: string;
+  profile: Partial<Novel>;
+  entries: readonly BrainstormFinalizationEntry[];
+  preserveExistingStoryDeck?: boolean;
+}): Promise<FinalizeBrainstormResult> {
+  return finalizeBrainstormAtomicSync(args);
 }
