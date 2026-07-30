@@ -19,15 +19,20 @@ import type {
 
 /**
  * Package format version. INDEPENDENT of the SQLite `dbSchemaVersion`: it
- * versions the on-disk `.inkmarshal` layout, not the database. Verify refuses a
- * package whose MAJOR differs from {@link FORMAT_VERSION} (a breaking layout
- * change); MINOR bumps stay forward/backward readable.
+ * versions the on-disk `.inkmarshal` layout, not the database.
  *
  * 1.1 adds book-owned canonical history (conversations / messages /
  * chapter-chat + volume summaries) while remaining able to verify and restore
  * existing 1.0 packages (missing new sections decode as empty).
+ *
+ * 2.0 makes chapter `processingStatus` required. That lifecycle state changes
+ * whether resume must finish post-processing before a chapter is counted as
+ * complete, so an older 1.1 build must reject the package instead of silently
+ * restoring `content_saved` prose as complete. This build still accepts the
+ * published 1.0 / 1.1 formats through an explicit compatibility policy in
+ * verify.ts; unknown legacy or future versions remain fail-closed.
  */
-export const FORMAT_VERSION = '1.1';
+export const FORMAT_VERSION = '2.0';
 
 /** Canonical package file/dir names. Single source for build + verify + restore. */
 export const PACKAGE_PATHS = {
@@ -144,6 +149,11 @@ export interface BackupChapter {
   qualityIssues: ChapterQualityIssue[] | null;
   generationMeta: ChapterGenerationMeta | null;
   snapshots: ChapterSnapshot[] | null;
+  /**
+   * Required in format 2.0. The verifier normalizes a missing value from
+   * published 1.x packages to `complete` before constructing BackupBundle.
+   */
+  processingStatus: 'content_saved' | 'complete';
   createdAt: number;
 }
 
@@ -227,8 +237,9 @@ export interface BackupChapterChat {
   createdAt: string;
 }
 
-/** One binary attachment (attachments/<name>). Forward-compat: no DB table
- *  produces these yet, so the array is empty today but the layout reserves it. */
+/** One binary attachment (attachments/<name>). Layout is reserved, but this
+ *  build does not restore attachments — verify and restore reject a nonempty
+ *  list rather than report success and drop them. */
 export interface BackupAttachment {
   name: string;
   contentsBase64: string;

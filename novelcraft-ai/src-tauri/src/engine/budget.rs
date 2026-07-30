@@ -55,8 +55,11 @@ impl Drop for ReservationGuard<'_> {
 /// would exceed the budget; otherwise reserve the footprint and return a guard
 /// that frees it on drop. This closes the check→spawn race the advisory TS-side
 /// check cannot: two concurrent starts can no longer both see the same free RAM.
-/// A footprint of 0 (unmeasurable model) is always admitted and contributes 0 —
-/// same honesty caveat as `engine_resource_budget`.
+///
+/// A **genuinely measured** footprint of 0 (e.g. empty model file × multiplier)
+/// is always admitted and contributes 0. Estimation failures must never reach
+/// this function as 0 — use [`footprint_for_admission`] / [`admit_estimated_footprint`]
+/// so unknown size fails closed with `ENGINE_FOOTPRINT_UNKNOWN` before reservation.
 pub(super) fn admit_engine<'a>(
     registry: &'a EngineRegistry,
     footprint: u64,
@@ -88,6 +91,35 @@ pub(super) fn admit_engine<'a>(
         registry,
         engine_id: engine_id.to_string(),
     })
+}
+
+/// Structured fail-closed error when RAM footprint cannot be measured.
+/// Shape matches `ENGINE_BUDGET_EXCEEDED`: `ENGINE_FOOTPRINT_UNKNOWN:<json>`.
+pub(super) fn engine_footprint_unknown_error(reason: &str) -> String {
+    let payload = serde_json::json!({ "reason": reason });
+    format!("ENGINE_FOOTPRINT_UNKNOWN:{payload}")
+}
+
+/// Resolve measured RAM footprint for admission. Estimation failure is
+/// fail-closed — never coerced to 0 — so callers must not reserve or spawn.
+pub(super) fn footprint_for_admission(path: &Path, format: EngineFormat) -> Result<u64, String> {
+    match estimate_footprint_inner(path, format) {
+        Ok(f) => Ok(f.ram_bytes),
+        Err(reason) => Err(engine_footprint_unknown_error(&reason)),
+    }
+}
+
+/// Estimate footprint then atomically admit. On estimate failure the reservation
+/// map is untouched (no admission, no process launch by the caller).
+pub(super) fn admit_estimated_footprint<'a>(
+    registry: &'a EngineRegistry,
+    path: &Path,
+    format: EngineFormat,
+    engine_id: &str,
+) -> Result<(u64, ReservationGuard<'a>), String> {
+    let footprint = footprint_for_admission(path, format)?;
+    let guard = admit_engine(registry, footprint, engine_id)?;
+    Ok((footprint, guard))
 }
 
 pub(super) fn estimate_footprint_inner(

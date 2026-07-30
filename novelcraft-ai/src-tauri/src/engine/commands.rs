@@ -3,7 +3,7 @@
 //! queries / stop verbs over the registry.
 
 use super::budget::{
-    admit_engine, budget_available_bytes, estimate_footprint_inner,
+    admit_estimated_footprint, budget_available_bytes, estimate_footprint_inner,
     normalize_engine_model_path_for_match, validate_engine_model_path, RESERVED_FOR_OS_BYTES,
 };
 use super::log::{
@@ -80,21 +80,15 @@ pub async fn engine_start(
         ));
     }
 
-    // Pre-compute the footprint once so we (a) cache it on the running engine
-    // for cheap `engine_status` / `engine_resource_budget` polling, and (b)
-    // enforce the resource budget atomically right here. We do NOT fail-fast on
-    // estimation errors — the engine may still be usable even if we can't measure
-    // it (e.g. a model the user manually placed without standard permissions).
-    // Fall through with footprint=0, which is always admitted (contributes 0).
-    let footprint = estimate_footprint_inner(&model_path, args.format)
-        .map(|f| f.ram_bytes)
-        .unwrap_or(0);
-
-    // Atomic admission: reject an over-budget start in Rust (the TS-side check is
-    // only an advisory UX fast-path). The reservation is released the instant the
-    // engine enters the running map (below); on every failing exit path —
-    // duplicate, spawn failure, or readiness timeout — the guard frees it on drop.
-    let reservation = admit_engine(&registry, footprint, &engine_id)?;
+    // Measure footprint then admit atomically. Estimation failure is fail-closed
+    // (`ENGINE_FOOTPRINT_UNKNOWN`) — never coerce unknown size to 0 and admit.
+    // A genuinely measured zero may still be admitted (contributes 0). The
+    // reservation is released the instant the engine enters the running map
+    // (below); on every failing exit path — duplicate, spawn failure, or
+    // readiness timeout — the guard frees it on drop. The TS-side budget check
+    // remains an advisory UX fast-path only.
+    let (footprint, reservation) =
+        admit_estimated_footprint(&registry, &model_path, args.format, &engine_id)?;
 
     let port = pick_free_port()?;
     let mut cmd = Command::new(&bin);

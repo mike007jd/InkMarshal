@@ -1,6 +1,6 @@
 'use client';
 
-// ChapterSplitEditor (W2-1) — preview + hand-correction of detected chapters.
+// ChapterSplitEditor — preview + hand-correction of detected chapters.
 //
 // The deterministic detector is never the final word: this panel lets the
 // author fix boundaries before anything is written. Per chapter you can:
@@ -9,10 +9,7 @@
 //   - split a chapter at a chosen paragraph (missed boundary),
 //   - in merge mode, pick the dedupe action (skip / overwrite / append).
 //
-// Auto-detected boundaries (inferred from bold lines / regex, not real heading
-// styles) are badged so the user double-checks them. All edits are local state
-// owned by the parent wizard via `onChange`; this component is presentational +
-// edit-affordances only.
+// Edits mutate compact `parts` references; full prose stays server-side.
 
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Scissors, ArrowUpToLine, Sparkles } from 'lucide-react';
@@ -27,17 +24,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { renumberCandidates } from '@/lib/import/detect-chapters';
+import { mergePreviewUp, splitPreviewAt } from '@/lib/import/preview';
 import type {
-  ChapterCandidate,
   DedupeAction,
   DedupeResult,
+  ImportPreviewChapter,
 } from '@/lib/import/types';
 import type { ImportEditorCopy } from '@/components/studio/import/import-copy';
 
 interface ChapterSplitEditorProps {
-  candidates: ChapterCandidate[];
-  onChange: (next: ChapterCandidate[]) => void;
+  chapters: ImportPreviewChapter[];
+  onChange: (next: ImportPreviewChapter[]) => void;
   /** Merge mode: dedupe report keyed by candidate id + the chosen actions. */
   dedupe?: DedupeResult[];
   actions?: Record<string, DedupeAction>;
@@ -46,7 +43,7 @@ interface ChapterSplitEditorProps {
 }
 
 export function ChapterSplitEditor({
-  candidates,
+  chapters,
   onChange,
   dedupe,
   actions,
@@ -70,52 +67,26 @@ export function ChapterSplitEditor({
   };
 
   const updateTitle = (index: number, title: string) => {
-    const next = candidates.map((c, i) => (i === index ? { ...c, title } : c));
+    const next = chapters.map((c, i) => (i === index ? { ...c, title } : c));
     onChange(next);
   };
 
   const mergeUp = (index: number) => {
-    if (index === 0) return;
-    const next = [...candidates];
-    const prev = next[index - 1];
-    const cur = next[index];
-    next[index - 1] = {
-      ...prev,
-      content: [prev.content, cur.content].filter(Boolean).join('\n\n'),
-    };
-    next.splice(index, 1);
-    onChange(renumberCandidates(next));
+    onChange(mergePreviewUp(chapters, index));
   };
 
   const splitAt = (index: number, paragraphIndex: number) => {
-    const cur = candidates[index];
-    const paras = cur.content.split(/\n\n+/);
-    if (paragraphIndex <= 0 || paragraphIndex >= paras.length) return;
-    const head = paras.slice(0, paragraphIndex).join('\n\n');
-    const tail = paras.slice(paragraphIndex).join('\n\n');
-    const next = [...candidates];
-    next[index] = { ...cur, content: head };
-    next.splice(index + 1, 0, {
-      ...cur,
-      id: `${cur.id}-split`,
-      title: '',
-      content: tail,
-      inferred: false,
-    });
-    onChange(renumberCandidates(next));
+    onChange(splitPreviewAt(chapters, index, paragraphIndex));
   };
 
   return (
     <div className="space-y-2">
-      {candidates.map((cand, index) => {
-        // A volume header renders above a chapter when its volume differs from
-        // the previous chapter's — a pure function of the list (no render-time
-        // mutation).
-        const showVolume = index === 0 || candidates[index - 1].volumeTitle !== cand.volumeTitle;
+      {chapters.map((cand, index) => {
+        const showVolume = index === 0 || chapters[index - 1].volumeTitle !== cand.volumeTitle;
         const isOpen = expanded.has(cand.id);
         const dd = dedupeById.get(cand.id);
         const action = actions?.[cand.id] ?? dd?.defaultAction;
-        const paras = cand.content.split(/\n\n+/).filter(Boolean);
+        const paras = cand.paragraphs;
 
         return (
           <div key={cand.id}>
@@ -226,7 +197,7 @@ export function ChapterSplitEditor({
                       )}
                       {pIndex === 0 && <span className="w-3 shrink-0" />}
                       <p className="min-w-0 flex-1 whitespace-pre-wrap text-xs leading-relaxed text-book-ink-secondary">
-                        {para.length > 280 ? `${para.slice(0, 280)}…` : para}
+                        {para}
                       </p>
                     </div>
                   ))}

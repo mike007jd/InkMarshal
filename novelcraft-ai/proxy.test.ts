@@ -102,6 +102,17 @@ describe('desktop session gates pages and Server Actions (AN-SEC-002)', () => {
     }, env)).toBe(false);
   });
 
+  it('rejects a Server Action forwarded from the otherwise-public root route', () => {
+    expect(isDesktopRequestAuthorized({
+      nextUrl: { pathname: '/' },
+      headers: new Headers({ 'next-action': '7f9c0deadbeef' }),
+    }, env)).toBe(false);
+    expect(config.matcher).toContainEqual({
+      source: '/:path*',
+      has: [{ type: 'header', key: 'next-action' }],
+    });
+  });
+
   it('rejects a Server Action POST to desktop-studio with a wrong session cookie', () => {
     expect(isDesktopRequestAuthorized({
       nextUrl: { pathname: '/desktop-studio/settings' },

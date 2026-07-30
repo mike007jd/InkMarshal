@@ -5,13 +5,20 @@ import {
   type SchemaFingerprint,
 } from '@/lib/db/schema-fingerprint';
 import {
+  CURRENT_SCHEMA_DESCRIPTION,
   CURRENT_SCHEMA_VERSION,
   LEGACY_SCHEMA_1_DDL,
   MISSTAMPED_CURRENT_SHAPE_VERSION,
   PUBLISHED_SCHEMA_18_DDL,
   PUBLISHED_SCHEMA_18_VERSION,
+  PUBLISHED_SCHEMA_19_DDL,
+  PUBLISHED_SCHEMA_19_VERSION,
   SCHEMA_19_OUTBOX_DDL,
   SCHEMA_19_OUTBOX_STATUS_PROMOTION_DDL,
+  SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL,
+  SCHEMA_20_DDL,
+  SCHEMA_20_VERSION,
+  SCHEMA_21_CHAT_TURNS_DDL,
   currentSchemaSql,
 } from '@/lib/db/schema';
 
@@ -111,7 +118,9 @@ function buildReferenceFingerprint(
 
 let cachedPublished18Fingerprint: SchemaFingerprint | null = null;
 let cachedLegacy1Fingerprint: SchemaFingerprint | null = null;
-let cachedCurrent19Fingerprint: SchemaFingerprint | null = null;
+let cachedPublished19Fingerprint: SchemaFingerprint | null = null;
+let cachedSchema20Fingerprint: SchemaFingerprint | null = null;
+let cachedCurrentFingerprint: SchemaFingerprint | null = null;
 
 export function publishedSchema18Fingerprint(): SchemaFingerprint {
   cachedPublished18Fingerprint ??= buildReferenceFingerprint(
@@ -131,13 +140,31 @@ export function legacySchema1Fingerprint(): SchemaFingerprint {
   return cachedLegacy1Fingerprint;
 }
 
-export function currentSchema19Fingerprint(): SchemaFingerprint {
-  cachedCurrent19Fingerprint ??= buildReferenceFingerprint(
-    currentSchemaSql,
-    CURRENT_SCHEMA_VERSION,
+export function publishedSchema19Fingerprint(): SchemaFingerprint {
+  cachedPublished19Fingerprint ??= buildReferenceFingerprint(
+    PUBLISHED_SCHEMA_19_DDL,
+    PUBLISHED_SCHEMA_19_VERSION,
     'current_epoch_v19',
   );
-  return cachedCurrent19Fingerprint;
+  return cachedPublished19Fingerprint;
+}
+
+export function schema20Fingerprint(): SchemaFingerprint {
+  cachedSchema20Fingerprint ??= buildReferenceFingerprint(
+    SCHEMA_20_DDL,
+    SCHEMA_20_VERSION,
+    'current_epoch_v20',
+  );
+  return cachedSchema20Fingerprint;
+}
+
+export function currentSchemaFingerprint(): SchemaFingerprint {
+  cachedCurrentFingerprint ??= buildReferenceFingerprint(
+    currentSchemaSql,
+    CURRENT_SCHEMA_VERSION,
+    CURRENT_SCHEMA_DESCRIPTION,
+  );
+  return cachedCurrentFingerprint;
 }
 
 function fingerprintsMatch(actual: SchemaFingerprint, expected: SchemaFingerprint): boolean {
@@ -187,7 +214,7 @@ export function assertCurrentSchema(db: Database.Database): void {
   }
 
   const actual = computeSchemaFingerprint(db);
-  if (!fingerprintsMatch(actual, currentSchema19Fingerprint())) {
+  if (!fingerprintsMatch(actual, currentSchemaFingerprint())) {
     throw new IncompatibleDatabaseSchemaError(
       'the structural schema fingerprint does not match the current baseline.',
     );
@@ -195,7 +222,12 @@ export function assertCurrentSchema(db: Database.Database): void {
   assertIntegrity(db);
 }
 
-export type SchemaOpenPlan = 'current' | 'schema18_to_19' | 'misstamped1_to_19';
+export type SchemaOpenPlan =
+  | 'current'
+  | 'schema18_to_21'
+  | 'misstamped1_to_21'
+  | 'schema19_to_21'
+  | 'schema20_to_21';
 
 /**
  * Read-only classification for an existing database. Throws without mutating
@@ -218,7 +250,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
   }
 
   if (version === CURRENT_SCHEMA_VERSION) {
-    if (!fingerprintsMatch(actual, currentSchema19Fingerprint())) {
+    if (!fingerprintsMatch(actual, currentSchemaFingerprint())) {
       throw new IncompatibleDatabaseSchemaError(
         'the structural schema fingerprint does not match the current baseline.',
       );
@@ -232,7 +264,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 18 structural fingerprint does not match the published v0.1.0/v0.1.1 shape.',
       );
     }
-    return 'schema18_to_19';
+    return 'schema18_to_21';
   }
 
   if (version === MISSTAMPED_CURRENT_SHAPE_VERSION) {
@@ -241,12 +273,32 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 1 structural fingerprint is not the already-distributed legacy outbox shape.',
       );
     }
-    return 'misstamped1_to_19';
+    return 'misstamped1_to_21';
+  }
+
+  if (version === PUBLISHED_SCHEMA_19_VERSION) {
+    if (!fingerprintsMatch(actual, publishedSchema19Fingerprint())) {
+      throw new IncompatibleDatabaseSchemaError(
+        'schema 19 structural fingerprint does not match the exact pre-lifecycle shape.',
+      );
+    }
+    return 'schema19_to_21';
+  }
+
+  if (version === SCHEMA_20_VERSION) {
+    if (!fingerprintsMatch(actual, schema20Fingerprint())) {
+      throw new IncompatibleDatabaseSchemaError(
+        'schema 20 structural fingerprint does not match the exact pre-chat-turns shape.',
+      );
+    }
+    return 'schema20_to_21';
   }
 
   throw new IncompatibleDatabaseSchemaError(
     `found schema ${version}; only published schema ${PUBLISHED_SCHEMA_18_VERSION}, ` +
       `mis-stamped legacy-outbox schema ${MISSTAMPED_CURRENT_SHAPE_VERSION}, ` +
+      `exact schema ${PUBLISHED_SCHEMA_19_VERSION}, ` +
+      `exact schema ${SCHEMA_20_VERSION}, ` +
       `or current schema ${CURRENT_SCHEMA_VERSION} can be opened.`,
   );
 }
@@ -259,13 +311,21 @@ function applyPromotion(
   try {
     db.exec('BEGIN IMMEDIATE');
     transactionOpen = true;
-    if (kind === 'schema18_to_19') {
+    if (kind === 'schema18_to_21') {
       db.exec(SCHEMA_19_OUTBOX_DDL);
-      stampSchemaVersion(db, 'current_epoch_v19');
-    } else {
+      db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
+      db.exec(SCHEMA_21_CHAT_TURNS_DDL);
+    } else if (kind === 'misstamped1_to_21') {
       db.exec(SCHEMA_19_OUTBOX_STATUS_PROMOTION_DDL);
-      stampSchemaVersion(db, 'current_epoch_v19');
+      db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
+      db.exec(SCHEMA_21_CHAT_TURNS_DDL);
+    } else if (kind === 'schema19_to_21') {
+      db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
+      db.exec(SCHEMA_21_CHAT_TURNS_DDL);
+    } else {
+      db.exec(SCHEMA_21_CHAT_TURNS_DDL);
     }
+    stampSchemaVersion(db, CURRENT_SCHEMA_DESCRIPTION);
     db.exec('COMMIT');
     transactionOpen = false;
   } catch (error) {
@@ -276,11 +336,18 @@ function applyPromotion(
   }
 }
 
+function fromVersionForPlan(kind: Exclude<SchemaOpenPlan, 'current'>): number {
+  if (kind === 'schema18_to_21') return PUBLISHED_SCHEMA_18_VERSION;
+  if (kind === 'misstamped1_to_21') return MISSTAMPED_CURRENT_SHAPE_VERSION;
+  if (kind === 'schema19_to_21') return PUBLISHED_SCHEMA_19_VERSION;
+  return SCHEMA_20_VERSION;
+}
+
 /**
  * Validate an existing nonempty database and, when it is an exact published
- * schema 18 or exact legacy schema-1 outbox database, promote it
- * transactionally to schema 19. Unknown legacy shapes and future versions fail
- * closed. Never reinterprets speculative intermediate versions.
+ * schema 18, exact legacy schema-1 outbox, exact schema 19, or exact schema 20
+ * database, promote it transactionally to schema 21. Unknown legacy shapes and
+ * future versions fail closed. Never reinterprets speculative intermediate versions.
  */
 export function ensureCurrentSchema(
   db: Database.Database,
@@ -292,9 +359,7 @@ export function ensureCurrentSchema(
     return;
   }
 
-  const fromVersion = kind === 'schema18_to_19'
-    ? PUBLISHED_SCHEMA_18_VERSION
-    : MISSTAMPED_CURRENT_SHAPE_VERSION;
+  const fromVersion = fromVersionForPlan(kind);
 
   // Additive promotion: a backup failure warns and proceeds so a backup-dir
   // hiccup cannot wedge startup on published user data. Destructive steps are
@@ -324,7 +389,7 @@ export function initializeCurrentSchema(
     db.exec(SCHEMA_VERSION_DDL);
     db.prepare(
       'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
-    ).run(CURRENT_SCHEMA_VERSION, 'current_epoch_v19', new Date().toISOString());
+    ).run(CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION, new Date().toISOString());
     db.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
     bootstrapRows();
     db.exec('COMMIT');

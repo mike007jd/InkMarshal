@@ -228,7 +228,9 @@ export function useManuscriptSession(opts: {
         || !transportRef.current.isLatestRun(outcome.runId)
       ) return;
       if (outcome.partial) setLiveChapter(outcome.partial);
-      await Promise.allSettled([fetchNovel()]);
+      // Refresh novel + chapters so content_saved prose from the paused run
+      // appears in the manuscript list without waiting for a full reload.
+      await Promise.allSettled([fetchNovel(), fetchChapters()]);
       return;
     }
     if (outcome.kind !== 'failed') return;

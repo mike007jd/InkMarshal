@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
-
-const DESKTOP_SESSION_ENV = 'INKMARSHAL_DESKTOP_SESSION'
-const DESKTOP_SESSION_COOKIE = 'inkmarshal_desktop_session'
+import {
+  DESKTOP_SESSION_COOKIE,
+  hasValidDesktopSessionCredential,
+} from '@/lib/desktop-session-auth'
 
 const DESKTOP_ONLY_PAGE_RE = /^\/(?:desktop-studio|novel)(?:\/|$)/
 const PUBLIC_WEB_API_RE = /^\/api\/health\/?$/
@@ -10,31 +11,16 @@ function isProductionWebRuntime(env: Record<string, string | undefined> = proces
   return env.NODE_ENV === 'production' && env.INKMARSHAL_RUNTIME !== 'desktop'
 }
 
-function desktopSessionToken(env: Record<string, string | undefined> = process.env): string | null {
-  if (env.INKMARSHAL_RUNTIME !== 'desktop') return null
-  const token = env[DESKTOP_SESSION_ENV]?.trim()
-  return token && token.length >= 32 ? token : null
-}
-
-function timingSafeEqualString(a: string | undefined, b: string): boolean {
-  if (!a || a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < b.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  }
-  return diff === 0
-}
-
-function hasValidDesktopSession(
+function desktopSessionCredentials(
   request: {
     headers: Pick<Headers, 'get'>
     cookies?: { get(name: string): { value: string } | undefined }
   },
-  expected: string,
-): boolean {
-  const header = request.headers.get('x-inkmarshal-desktop-session')?.trim()
-  const cookie = request.cookies?.get(DESKTOP_SESSION_COOKIE)?.value?.trim()
-  return timingSafeEqualString(header, expected) || timingSafeEqualString(cookie, expected)
+): { header?: string; cookie?: string } {
+  return {
+    header: request.headers.get('x-inkmarshal-desktop-session') ?? undefined,
+    cookie: request.cookies?.get(DESKTOP_SESSION_COOKIE)?.value,
+  }
 }
 
 /**
@@ -72,13 +58,12 @@ export function isDesktopRequestAuthorized(
 
   const isApi = pathname.startsWith('/api/')
   const isDesktopPage = DESKTOP_ONLY_PAGE_RE.test(pathname)
+  const isServerAction = request.headers.get('next-action') !== null
   // Anything that is neither a local API nor a desktop-only page (root/assets)
   // carries no local data — leave it open.
-  if (!isApi && !isDesktopPage) return true
+  if (!isApi && !isDesktopPage && !isServerAction) return true
 
-  const expected = desktopSessionToken(env)
-  if (!expected) return false
-  return hasValidDesktopSession(request, expected)
+  return hasValidDesktopSessionCredential(desktopSessionCredentials(request), env)
 }
 
 export function productionWebBlockKind(
@@ -109,6 +94,10 @@ export async function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
+    {
+      source: '/:path*',
+      has: [{ type: 'header', key: 'next-action' }],
+    },
     {
       source: '/api/:path*',
     },

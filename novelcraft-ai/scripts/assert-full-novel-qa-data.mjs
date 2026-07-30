@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import Database from 'better-sqlite3';
+import { CURRENT_SCHEMA_VERSION } from '../lib/db/schema/version.ts';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -91,7 +92,7 @@ function main() {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     const schemaVersion = scalar(db, 'SELECT version FROM _schema_version ORDER BY version DESC LIMIT 1');
-    assert(schemaVersion === 19, 'Expected current schema v19', { schemaVersion });
+    assert(schemaVersion === CURRENT_SCHEMA_VERSION, `Expected current schema v${CURRENT_SCHEMA_VERSION}`, { schemaVersion });
 
     const novel = db.prepare(
       'SELECT id, title, series_id, vault_version FROM novels WHERE id = ?',

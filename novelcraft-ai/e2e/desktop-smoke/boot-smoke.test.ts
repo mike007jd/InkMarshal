@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { CURRENT_SCHEMA_VERSION } from '@/lib/db/schema';
 
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;
 const PREV_RUNTIME = process.env.INKMARSHAL_RUNTIME;
@@ -39,7 +40,7 @@ describe('desktop boot smoke (automated-unit)', () => {
     const { createNovel, getNovel } = await import('@/lib/db');
     try {
       const db = getDb();
-      expect(db.pragma('user_version', { simple: true })).toBe(19);
+      expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
       // The DB file was actually created on disk under the data dir.
       expect(existsSync(path.join(tmpDir, 'inkmarshal.db'))).toBe(true);
 

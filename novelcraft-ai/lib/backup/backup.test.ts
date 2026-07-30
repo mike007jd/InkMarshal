@@ -242,7 +242,7 @@ describe('export → package layout', () => {
     expect(names).toContain('history/messages.json');
     expect(names).toContain('history/chapter-chat.json');
 
-    expect(manifest.formatVersion).toBe('1.1');
+    expect(manifest.formatVersion).toBe('2.0');
     expect(manifest.counts.chapters).toBe(2);
     expect(manifest.counts.outline).toBe(2);
     expect(manifest.counts.knowledgeRelations).toBe(1);
@@ -390,7 +390,81 @@ describe('verify — integrity', () => {
     expect(report.ok).toBe(false);
   });
 
-  it('rejects missing or partially malformed volume summaries in format 1.1', async () => {
+  it('accepts current 2.0 and rejects unknown legacy or future formats', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const { bytes } = await build.buildBackupPackage(bundle);
+
+    const current = await verify.verifyBackupPackage(bytes);
+    expect(current.formatCompatible).toBe(true);
+    expect(current.ok).toBe(true);
+    expect(current.manifest?.formatVersion).toBe('2.0');
+
+    const { zipSync } = await import('fflate');
+    for (const unsupportedVersion of [
+      '1.2',
+      '1.9',
+      '2.1',
+      '2.9',
+      '3.0',
+      '2.x',
+      '2',
+      '2.0.0',
+    ]) {
+      const entries = unzipSync(bytes);
+      const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+        formatVersion: string;
+      };
+      manifest.formatVersion = unsupportedVersion;
+      entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+      const report = await verify.verifyBackupPackage(zipSync(entries, { level: 6 }));
+      expect(report.formatCompatible).toBe(false);
+      expect(report.ok).toBe(false);
+      expect(report.errors).toContainEqual(
+        expect.objectContaining({ code: 'format_incompatible', ref: unsupportedVersion }),
+      );
+    }
+  });
+
+  it('requires processingStatus in every 2.0 chapter payload', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const entries = unzipSync(bytes);
+    const chapterPath = 'chapters/0001.json';
+    const chapter = JSON.parse(strFromU8(entries[chapterPath])) as Record<string, unknown>;
+    delete chapter.processingStatus;
+
+    const report = await verify.verifyBackupPackage(
+      await replacePackagedJson(bytes, chapterPath, chapter),
+    );
+    expect(report.ok).toBe(false);
+    expect(report.bundle).toBeNull();
+    expect(report.errors).toContainEqual(expect.objectContaining({
+      code: 'corrupt_section',
+      ref: chapterPath,
+    }));
+  });
+
+  it('rejects nonempty attachments instead of verifying them as restorable', async () => {
+    const { extract, build, verify } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    bundle.attachments = [
+      { name: 'cover.bin', contentsBase64: Buffer.from('attachment-bytes').toString('base64') },
+    ];
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(false);
+    expect(report.bundle).toBeNull();
+    expect(report.errors).toContainEqual(
+      expect.objectContaining({ code: 'unsupported_attachments' }),
+    );
+  });
+
+  it('rejects missing or partially malformed volume summaries in format 1.1+', async () => {
     const { extract, build, verify } = await mods();
     const { novelId } = await buildRichNovel();
     const bundle = await extract.extractBackupBundle(novelId);
@@ -576,6 +650,34 @@ describe('verify — integrity', () => {
 });
 
 describe('restore — create a copy', () => {
+  it('rejects nonempty attachments before any DB mutation', async () => {
+    const { db, extract, restore, connection } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const gdb = connection.getDb();
+    const novelsBefore = (
+      gdb.prepare('SELECT COUNT(*) AS n FROM novels').get() as { n: number }
+    ).n;
+
+    await expect(
+      restore.restoreBundleAsCopy({
+        ...bundle,
+        attachments: [
+          {
+            name: 'cover.bin',
+            contentsBase64: Buffer.from('attachment-bytes').toString('base64'),
+          },
+        ],
+      }),
+    ).rejects.toThrow(/cannot restore package attachments/i);
+
+    const novelsAfter = (
+      gdb.prepare('SELECT COUNT(*) AS n FROM novels').get() as { n: number }
+    ).n;
+    expect(novelsAfter).toBe(novelsBefore);
+    expect(await db.getNovel(novelId)).toBeDefined();
+  });
+
   it('mints a new novelId, matches counts, and leaves the original untouched', async () => {
     const { db, extract, build, verify, restore } = await mods();
     const { novelId } = await buildRichNovel();
@@ -641,6 +743,30 @@ describe('restore — create a copy', () => {
     expect(originalAfter!.title).toBe(originalBefore!.title);
     expect((await db.getChapters(novelId)).length).toBe(originalChaptersBefore.length);
     expect((await db.getKnowledgeEntriesByNovel(novelId)).length).toBe(originalEntriesBefore.length);
+  });
+
+  it('round-trips content_saved under an explicit 2.0 version signal', async () => {
+    const { db, extract, build, verify, restore } = await mods();
+    const { novelId } = await buildRichNovel();
+    await db.updateChapterMeta(novelId, 1, { processingStatus: 'content_saved' });
+
+    const bundle = await extract.extractBackupBundle(novelId);
+    expect(bundle.chapters.find(ch => ch.chapterNumber === 1)?.processingStatus)
+      .toBe('content_saved');
+
+    const { bytes, manifest } = await build.buildBackupPackage(bundle);
+    expect(manifest.formatVersion).toBe('2.0');
+    expect(manifest.formatVersion.split('.')[0]).not.toBe('1');
+    const packagedChapter = JSON.parse(
+      strFromU8(unzipSync(bytes)['chapters/0001.json']),
+    ) as Record<string, unknown>;
+    expect(packagedChapter.processingStatus).toBe('content_saved');
+
+    const report = await verify.verifyBackupPackage(bytes);
+    expect(report.ok).toBe(true);
+    const result = await restore.restoreBundleAsCopy(report.bundle!);
+    expect((await db.getChapter(result.novelId, 1))?.processingStatus)
+      .toBe('content_saved');
   });
 
   it('remaps outline parentId links into the restored entry id space', async () => {
@@ -823,7 +949,48 @@ describe('restore — create a copy', () => {
   });
 });
 
-describe('format 1.0 backward compatibility', () => {
+describe('published 1.x backward compatibility', () => {
+  it('normalizes v1.1 chapters to complete without a lifecycle contract', async () => {
+    const { db, extract, build, verify, restore } = await mods();
+    const { novelId } = await buildRichNovel();
+    const bundle = await extract.extractBackupBundle(novelId);
+    const { bytes } = await build.buildBackupPackage(bundle);
+    const entries = unzipSync(bytes);
+    const manifest = JSON.parse(strFromU8(entries['manifest.json'])) as {
+      formatVersion: string;
+      sha256: Record<string, string>;
+    };
+    const { sha256Hex } = await import('@/lib/backup/build-package');
+    for (const chapterPath of Object.keys(entries).filter(path =>
+      path.startsWith('chapters/') && path.endsWith('.json')
+    )) {
+      const chapter = JSON.parse(strFromU8(entries[chapterPath])) as Record<string, unknown>;
+      if (chapterPath === 'chapters/0001.json') {
+        // An unknown extra field cannot smuggle 2.0 lifecycle semantics under a
+        // 1.1 version signal; published 1.x chapters are complete by contract.
+        chapter.processingStatus = 'content_saved';
+      } else {
+        delete chapter.processingStatus;
+      }
+      entries[chapterPath] = new TextEncoder().encode(JSON.stringify(chapter));
+      manifest.sha256[chapterPath] = await sha256Hex(entries[chapterPath]);
+    }
+    manifest.formatVersion = '1.1';
+    entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest));
+    const { zipSync } = await import('fflate');
+
+    const report = await verify.verifyBackupPackage(zipSync(entries, { level: 6 }));
+    expect(report.formatCompatible).toBe(true);
+    expect(report.ok).toBe(true);
+    expect(report.bundle!.chapters.every(ch => ch.processingStatus === 'complete'))
+      .toBe(true);
+
+    const result = await restore.restoreBundleAsCopy(report.bundle!);
+    expect((await db.getChapters(result.novelId)).every(
+      chapter => chapter.processingStatus === 'complete',
+    )).toBe(true);
+  });
+
   it('verifies and restores a v1.0 package without history files / volumeSummaries as empty history', async () => {
     const { db, extract, build, verify, restore, connection } = await mods();
     const { novelId } = await buildRichNovel();
@@ -839,6 +1006,13 @@ describe('format 1.0 backward compatibility', () => {
     delete entries['history/conversations.json'];
     delete entries['history/messages.json'];
     delete entries['history/chapter-chat.json'];
+    for (const chapterPath of Object.keys(entries).filter(path =>
+      path.startsWith('chapters/') && path.endsWith('.json')
+    )) {
+      const chapter = JSON.parse(strFromU8(entries[chapterPath])) as Record<string, unknown>;
+      delete chapter.processingStatus;
+      entries[chapterPath] = new TextEncoder().encode(JSON.stringify(chapter));
+    }
     const novel = JSON.parse(strFromU8(entries['novel.json'])) as Record<string, unknown>;
     delete novel.volumeSummaries;
     entries['novel.json'] = new TextEncoder().encode(JSON.stringify(novel, null, 2));
@@ -855,9 +1029,14 @@ describe('format 1.0 backward compatibility', () => {
     delete manifest.sha256['history/conversations.json'];
     delete manifest.sha256['history/messages.json'];
     delete manifest.sha256['history/chapter-chat.json'];
-    // Re-hash novel.json after volumeSummaries removal.
+    // Re-hash the legacy payloads after removing newer fields.
     const { sha256Hex } = await import('@/lib/backup/build-package');
     manifest.sha256['novel.json'] = await sha256Hex(entries['novel.json']);
+    for (const chapterPath of Object.keys(entries).filter(path =>
+      path.startsWith('chapters/') && path.endsWith('.json')
+    )) {
+      manifest.sha256[chapterPath] = await sha256Hex(entries[chapterPath]);
+    }
     entries['manifest.json'] = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
     const { zipSync } = await import('fflate');
     const v10Bytes = zipSync(entries, { level: 6 });

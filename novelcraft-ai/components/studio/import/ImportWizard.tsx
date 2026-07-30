@@ -1,14 +1,14 @@
 'use client';
 
-// ImportWizard (W2-1) — the modal that walks an author through bringing an
+// ImportWizard — the modal that walks an author through bringing an
 // existing manuscript into the studio:
 //
-//   pick → parse (server action) → preview & correct (ChapterSplitEditor)
-//        → confirm (server action transaction) → optional background KB extract.
+//   pick (native stage) → open session (server) → preview & correct
+//        → confirm (compact refs) → optional background KB extract.
 //
-// The wizard owns all transient state (candidates, edits, dedupe decisions); the
-// server actions are pure round-trips. i18n is the self-contained `importCopy`
-// table — the shared bundle is untouched per the W2-1 constraint.
+// Full prose never leaves the server session; the wizard only holds bounded
+// previews + reconstruction `parts`. i18n is the self-contained `importCopy`
+// table.
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { FileUp, AlertTriangle } from 'lucide-react';
@@ -34,18 +34,19 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { isTauriRuntime, readLocalFile } from '@/lib/desktop-runtime';
+import { isTauriRuntime, stageManuscriptImport } from '@/lib/desktop-runtime';
 import { buildAIRequestHeaders } from '@/lib/streaming-client';
-import { parseImportedFile, importPlanToNovel } from '@/app/actions/import';
-import { renumberCandidates } from '@/lib/import/detect-chapters';
+import {
+  openImportSessionAction,
+  confirmImportSessionAction,
+} from '@/app/actions/import';
+import { renumberPreviewChapters } from '@/lib/import/preview';
 import { ChapterSplitEditor } from '@/components/studio/import/ChapterSplitEditor';
 import { importCopy } from '@/components/studio/import/import-copy';
 import type {
-  ChapterCandidate,
   DedupeAction,
   DedupeResult,
-  ImportPlan,
-  ImportSource,
+  ImportPreviewChapter,
 } from '@/lib/import/types';
 
 interface NovelOption {
@@ -87,10 +88,10 @@ type DedupeState =
   | { status: 'error' };
 
 /** Bind a dedupe report to the exact target + candidate set it describes. */
-function dedupeFingerprint(targetNovelId: string, candidates: ChapterCandidate[]): string {
+function dedupeFingerprint(targetNovelId: string, chapters: ImportPreviewChapter[]): string {
   return JSON.stringify([
     targetNovelId,
-    candidates.map(c => [c.id, c.chapterNumber, c.title, c.wordCount]),
+    chapters.map(c => [c.id, c.chapterNumber, c.title, c.wordCount, c.parts]),
   ]);
 }
 
@@ -117,10 +118,9 @@ function ImportWizardBody({
   const [error, setError] = useState<string | null>(null);
   const [kbEnabled, setKbEnabled] = useState(true);
 
-  const [source, setSource] = useState<ImportSource>('txt');
-  const [filename, setFilename] = useState('');
+  const [sessionToken, setSessionToken] = useState('');
   const [novelTitle, setNovelTitle] = useState('');
-  const [candidates, setCandidates] = useState<ChapterCandidate[]>([]);
+  const [chapters, setChapters] = useState<ImportPreviewChapter[]>([]);
   const [dedupeState, setDedupeState] = useState<DedupeState>({ status: 'idle' });
   const [actions, setActions] = useState<Record<string, DedupeAction>>({});
   // Monotonic request id: a late response from an older target/candidate set
@@ -136,12 +136,12 @@ function ImportWizardBody({
   );
 
   const totalWords = useMemo(
-    () => candidates.reduce((sum, c) => sum + c.wordCount, 0),
-    [candidates],
+    () => chapters.reduce((sum, c) => sum + c.wordCount, 0),
+    [chapters],
   );
   const currentFingerprint = useMemo(
-    () => dedupeFingerprint(targetNovelId, candidates),
-    [targetNovelId, candidates],
+    () => dedupeFingerprint(targetNovelId, chapters),
+    [targetNovelId, chapters],
   );
   // The merge confirm is gated on a COMPLETE report for the exact target +
   // candidate set currently on screen — nothing older, nothing partial.
@@ -171,19 +171,18 @@ function ImportWizardBody({
       .sort((a, b) => a - b);
   }, [actions, dedupeReport]);
 
-  // Recompute the merge dedupe report against `targetId`. We no longer hold the
-  // source bytes, so the report is rebuilt from the in-memory candidates via the
-  // dedicated /import/dedupe endpoint (the server owns the target's chapters).
-  // Driven from the mode/target change handlers (not an effect) so the network
-  // round-trip is an explicit user action, never a render side effect.
+  // Recompute the merge dedupe report against `targetId` via compact parts +
+  // session token (server reconstructs prose). Driven from mode/target change
+  // handlers (not an effect) so the network round-trip is an explicit user
+  // action, never a render side effect.
   const runDedupe = useCallback(
-    async (targetId: string, reportCandidates: ChapterCandidate[]) => {
-      if (!targetId || reportCandidates.length === 0) return;
-      const fingerprint = dedupeFingerprint(targetId, reportCandidates);
+    async (targetId: string, reportChapters: ImportPreviewChapter[], token: string) => {
+      if (!targetId || reportChapters.length === 0 || !token) return;
+      const fingerprint = dedupeFingerprint(targetId, reportChapters);
       const seq = ++dedupeSeqRef.current;
       setDedupeState({ status: 'loading', fingerprint });
       try {
-        const report = await fetchDedupeReport(targetId, reportCandidates);
+        const report = await fetchDedupeReport(targetId, token, reportChapters);
         if (dedupeSeqRef.current !== seq) return; // superseded by a newer request
         setDedupeState({ status: 'ready', fingerprint, report });
         const nextActions: Record<string, DedupeAction> = {};
@@ -200,7 +199,7 @@ function ImportWizardBody({
   const selectMode = (nextMode: 'new' | 'merge') => {
     setMode(nextMode);
     if (nextMode === 'merge') {
-      if (targetNovelId) void runDedupe(targetNovelId, candidates);
+      if (targetNovelId) void runDedupe(targetNovelId, chapters, sessionToken);
     } else {
       // New-import mode needs no report; discard any merge decisions so they
       // can never leak into a later confirm.
@@ -214,7 +213,7 @@ function ImportWizardBody({
     setTargetNovelId(nextTarget);
     if (mode === 'merge') {
       setActions({});
-      if (nextTarget) void runDedupe(nextTarget, candidates);
+      if (nextTarget) void runDedupe(nextTarget, chapters, sessionToken);
       else {
         dedupeSeqRef.current += 1;
         setDedupeState({ status: 'idle' });
@@ -222,12 +221,12 @@ function ImportWizardBody({
     }
   };
 
-  // Any candidate edit (title, merge, split — renumbering included) invalidates
+  // Any chapter edit (title, merge, split — renumbering included) invalidates
   // the report computed for the old set: decisions are dropped and the merge
   // confirm stays locked until the user re-checks.
-  const handleCandidatesChange = (next: ChapterCandidate[]) => {
-    const renumbered = renumberCandidates(next);
-    setCandidates(renumbered);
+  const handleChaptersChange = (next: ImportPreviewChapter[]) => {
+    const renumbered = renumberPreviewChapters(next);
+    setChapters(renumbered);
     if (mode === 'merge') {
       dedupeSeqRef.current += 1;
       setDedupeState(prev => (prev.status === 'idle' ? prev : { status: 'stale' }));
@@ -243,22 +242,20 @@ function ImportWizardBody({
     setError(null);
     setBusy(true);
     try {
-      const picked = await readLocalFile(['txt', 'md', 'docx']);
-      if (!picked) return; // user dismissed the dialog
-      const name = picked.path.split(/[\\/]/).pop() ?? 'manuscript';
-      const result = await parseImportedFile({
-        filename: name,
-        contentsBase64: picked.contentsBase64,
+      const staged = await stageManuscriptImport();
+      if (!staged) return; // user dismissed the dialog
+      const result = await openImportSessionAction({
+        token: staged.token,
+        basename: staged.basename,
       });
-      setSource(result.source);
-      setFilename(result.filename);
+      setSessionToken(result.sessionToken);
       setNovelTitle(result.suggestedTitle);
-      setCandidates(result.candidates);
+      setChapters(result.chapters);
       setStep('preview');
       // Launched against a specific novel (from its "…" menu): run the merge
       // dedupe immediately so the preview opens with the report populated.
       if (mode === 'merge' && targetNovelId) {
-        void runDedupe(targetNovelId, result.candidates);
+        void runDedupe(targetNovelId, result.chapters, result.sessionToken);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : copy.parseFailed);
@@ -274,32 +271,28 @@ function ImportWizardBody({
       mode === 'merge'
       && (!targetNovelId || !dedupeReport || duplicateOverwriteTargets.length > 0)
     ) return;
+    if (!sessionToken) return;
     setBusy(true);
     setError(null);
 
     const runKb = kbEnabled;
-    const plan: ImportPlan = {
-      source,
-      filename,
-      novelTitle: novelTitle.trim() || copy.novelTitlePlaceholder,
-      chapters: candidates.map(c => ({
-        chapterNumber: c.chapterNumber,
-        title: c.title,
-        content: c.content,
-      })),
-    };
 
     try {
-      const result = await importPlanToNovel({
-        plan,
+      const result = await confirmImportSessionAction({
+        sessionToken,
         mode,
         targetNovelId: mode === 'merge' ? targetNovelId : undefined,
+        novelTitle: novelTitle.trim() || copy.novelTitlePlaceholder,
+        chapters: chapters.map(c => ({
+          title: c.title,
+          parts: c.parts,
+        })),
         dedupeDecisions:
           mode === 'merge'
-            ? // Exactly one decision per current candidate, from the report
-              // whose fingerprint matches the candidate set being submitted.
+            ? // Exactly one decision per current chapter, from the report
+              // whose fingerprint matches the chapter set being submitted.
               dedupeReport!.map(d => {
-                const cand = candidates.find(c => c.id === d.candidateId);
+                const cand = chapters.find(c => c.id === d.candidateId);
                 return {
                   chapterNumber: cand?.chapterNumber ?? 0,
                   action: actions[d.candidateId] ?? d.defaultAction,
@@ -335,7 +328,7 @@ function ImportWizardBody({
         )}
         {step === 'preview' && (
           <DialogDescription className="text-book-ink-secondary">
-            {copy.previewHeading(candidates.length, totalWords)}
+            {copy.previewHeading(chapters.length, totalWords)}
           </DialogDescription>
         )}
       </DialogHeader>
@@ -435,7 +428,7 @@ function ImportWizardBody({
               <Button
                 variant="ghost"
                 type="button"
-                onClick={() => void runDedupe(targetNovelId, candidates)}
+                onClick={() => void runDedupe(targetNovelId, chapters, sessionToken)}
                 disabled={busy}
                 className="h-auto shrink-0 border border-book-danger-border bg-book-bg-card px-2 py-1 text-xs"
               >
@@ -454,7 +447,7 @@ function ImportWizardBody({
               <Button
                 variant="ghost"
                 type="button"
-                onClick={() => void runDedupe(targetNovelId, candidates)}
+                onClick={() => void runDedupe(targetNovelId, chapters, sessionToken)}
                 disabled={busy}
                 className="h-auto shrink-0 border border-book-warning-border bg-book-bg-card px-2 py-1 text-xs"
               >
@@ -482,8 +475,8 @@ function ImportWizardBody({
 
           <div className="min-h-0 flex-1 overflow-y-auto pr-1">
             <ChapterSplitEditor
-              candidates={candidates}
-              onChange={handleCandidatesChange}
+              chapters={chapters}
+              onChange={handleChaptersChange}
               dedupe={mode === 'merge' ? dedupeReport : undefined}
               actions={actions}
               onActionChange={(id, action) =>
@@ -552,30 +545,30 @@ function ImportWizardBody({
 }
 
 /**
- * Recompute the dedupe report for the current candidates against a target
- * novel. Uses the import server action's parse path is unsuitable (needs file
- * bytes), so we call a thin dedicated endpoint via the action layer: the
- * server reads the target's chapters and runs the pure `dedupeCandidates`.
+ * Recompute the dedupe report for the current compact chapter refs against a
+ * target novel. The server reconstructs exact prose from the opaque session.
  */
 async function fetchDedupeReport(
   targetNovelId: string,
-  candidates: ChapterCandidate[],
+  sessionToken: string,
+  chapters: ImportPreviewChapter[],
 ): Promise<DedupeResult[]> {
   const res = await fetch(`/api/novels/${targetNovelId}/import/dedupe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      candidates: candidates.map(c => ({
+      sessionToken,
+      chapters: chapters.map(c => ({
         id: c.id,
         title: c.title,
-        content: c.content,
+        parts: c.parts,
       })),
     }),
   });
   if (!res.ok) throw new Error(`dedupe ${res.status}`);
   const raw: unknown = await res.json();
-  const expectedIds = new Set(candidates.map(candidate => candidate.id));
-  if (expectedIds.size !== candidates.length || !Array.isArray(raw) || raw.length !== candidates.length) {
+  const expectedIds = new Set(chapters.map(chapter => chapter.id));
+  if (expectedIds.size !== chapters.length || !Array.isArray(raw) || raw.length !== chapters.length) {
     throw new Error('incomplete dedupe report');
   }
 

@@ -77,6 +77,7 @@ export const DESKTOP_COMMANDS = {
   stopOthersForPath: 'stop_others_for_path',
   revealExportFile: 'reveal_export_file',
   readLocalFile: 'read_local_file',
+  stageManuscriptImport: 'stage_manuscript_import',
 } as const;
 
 async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -365,13 +366,31 @@ export interface LocalFileRead {
  * Read a user-chosen local file through a native open dialog. The user picks
  * each file explicitly (the dialog runs Rust-side), so no arbitrary path is ever
  * read — `read_local_file` mirrors `save_export_file`'s safety model. Pass the
- * allowed extensions (e.g. `['txt','md','docx']`); returns `null` if the user
- * dismissed the dialog. Shared by manuscript import, backup restore, and
- * template-pack import.
+ * allowed extensions (e.g. `['inkmarshal']` / `['json']`); returns `null` if the
+ * user dismissed the dialog. Shared by backup restore and template-pack import.
+ * Manuscript import must use `stageManuscriptImport` instead (opaque token).
  */
 export async function readLocalFile(extensions: string[]): Promise<LocalFileRead | null> {
   requireTauri('readLocalFile');
   return invokeTauri<LocalFileRead | null>(DESKTOP_COMMANDS.readLocalFile, { extensions });
+}
+
+export interface StagedManuscriptImport {
+  /** Cryptographically unguessable session token (64 hex chars). */
+  token: string;
+  /** Sanitized basename only — never an absolute path. */
+  basename: string;
+}
+
+/**
+ * Stage a user-chosen manuscript (txt/md/docx, ≤25 MiB) under the app-owned
+ * `import-sessions/` directory via a native open dialog. Returns only an
+ * opaque token + basename so multi-megabyte bytes never cross IPC or the
+ * Server Action body limit.
+ */
+export async function stageManuscriptImport(): Promise<StagedManuscriptImport | null> {
+  requireTauri('stageManuscriptImport');
+  return invokeTauri<StagedManuscriptImport | null>(DESKTOP_COMMANDS.stageManuscriptImport);
 }
 
 /** One `*.inkmarshal` backup file already on disk in the chosen backup folder. */

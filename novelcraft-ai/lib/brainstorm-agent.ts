@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { tool } from 'ai';
 import { z } from 'zod';
 
@@ -25,8 +26,14 @@ import {
 import { isInStages, type NovelStage } from '@/lib/novel-stages';
 import type { KnowledgeType } from '@/lib/types/knowledge';
 import {
+  brainstormProfileSnapshot,
+  type BrainstormProfileSnapshot,
+  durableBrainstormSnapshot,
+  type DurableBrainstormToolContext,
   recordBrainstormEntryMutation,
   recordBrainstormProfileMutation,
+  recordBrainstormProfileSnapshotMutation,
+  runDurableBrainstormTool,
 } from '@/lib/brainstorm-receipts';
 
 const EDITABLE_BRAINSTORM_STAGES: readonly NovelStage[] = [
@@ -70,6 +77,10 @@ const finalizeBrainstormSchema = z.object({
 function trimOptional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
 function storyDeckData(type: StoryDeckType, summary: string, details: Record<string, string>) {
@@ -117,7 +128,10 @@ function storyDeckData(type: StoryDeckType, summary: string, details: Record<str
 }
 
 function greenlightProposalState(
-  novel: Novel,
+  novel: Pick<
+    Novel,
+    'genre' | 'targetWords' | 'storySummary' | 'characterSummary' | 'arcSummary'
+  >,
   input: z.infer<typeof updateBrainstormProfileSchema>,
 ): InterviewState {
   const collectedProfile = {
@@ -171,6 +185,27 @@ async function upsertStoryDeckEntry(
 }
 
 type FinalizeBrainstormInput = z.infer<typeof finalizeBrainstormSchema>;
+
+async function reconcileBrainstormEntryEffects(
+  novelId: string,
+  entries: readonly KnowledgeEntryRow[],
+): Promise<void> {
+  await Promise.allSettled(entries.map(async entry => {
+    await syncIndexFromEntry({
+      id: entry.id,
+      novelId,
+      type: entry.type as KnowledgeType,
+      title: entry.title,
+      summary: entry.summary,
+      data: JSON.parse(entry.data) as Record<string, unknown>,
+      tags: JSON.parse(entry.tags) as string[],
+      updatedAt: entry.updated_at,
+    });
+    await trySyncKnowledgeEntryToVault(novelId, entry.id, 'brainstormAgent.finalizeBrainstorm');
+    await clearStaleEmbedding(entry.id, novelId);
+    scheduleEmbeddingRefresh(entry.id);
+  }));
+}
 
 async function commitFinalizedBrainstorm(
   novelId: string,
@@ -227,22 +262,10 @@ async function commitFinalizedBrainstorm(
     }
   }
 
-  await Promise.allSettled(result.mutations.map(async mutation => {
-    const entry = mutation.after;
-    await syncIndexFromEntry({
-      id: entry.id,
-      novelId,
-      type: entry.type as KnowledgeType,
-      title: entry.title,
-      summary: entry.summary,
-      data: JSON.parse(entry.data) as Record<string, unknown>,
-      tags: JSON.parse(entry.tags) as string[],
-      updatedAt: entry.updated_at,
-    });
-    await trySyncKnowledgeEntryToVault(novelId, entry.id, 'brainstormAgent.finalizeBrainstorm');
-    await clearStaleEmbedding(entry.id, novelId);
-    scheduleEmbeddingRefresh(entry.id);
-  }));
+  await reconcileBrainstormEntryEffects(
+    novelId,
+    result.mutations.map(mutation => mutation.after),
+  );
 
   return { ok: true as const, coverage: result.coverage };
 }
@@ -443,16 +466,111 @@ export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): 
     : `You are running a novel Brainstorm. Do not use a fixed questionnaire, open with a checklist, or force the user through slots in order. Cover length, genre, references, point of view, world, characters, central conflict, ending direction, and target reader feeling naturally, asking at most one high-value follow-up at a time.\n\nOnly facts explicitly stated by the user may be written to the Brainstorm profile or Story Deck with tools. Inferences, gap-filling, and creative ideas must be labeled as suggestions and require explicit approval. When the complete writing brief is ready, call finalizeBrainstorm once with the profile and at least one character, world, and outline entry. End the turn immediately after that tool and never continue into manuscript prose.`;
 }
 
-export function createBrainstormTools(novelId: string, receiptId?: string) {
+function storyDeckInputMatchesRow(
+  entry: z.infer<typeof storyDeckEntrySchema>,
+  row: KnowledgeEntryRow | undefined,
+): row is KnowledgeEntryRow {
+  if (!row) return false;
+  const data = storyDeckData(entry.type, entry.summary.trim(), entry.details);
+  return row.title === entry.title.trim()
+    && row.summary === buildKnowledgeEntrySummary(entry.type, data)
+    && row.data === JSON.stringify(data)
+    && row.tags === JSON.stringify(['brainstorm']);
+}
+
+function entryKey(entry: Pick<KnowledgeEntryRow, 'type' | 'title'>): string {
+  return `${entry.type}:${entry.title.trim().toLowerCase()}`;
+}
+
+function knowledgeEntriesFingerprint(entries: readonly KnowledgeEntryRow[]): string {
+  return createHash('sha256')
+    .update(JSON.stringify([...entries].sort((left, right) =>
+      `${left.type}\0${left.title}\0${left.id}`.localeCompare(
+        `${right.type}\0${right.title}\0${right.id}`,
+      )
+    )))
+    .digest('hex');
+}
+
+function sameBrainstormProfile(
+  novel: Novel | null | undefined,
+  snapshot: BrainstormProfileSnapshot | null,
+): boolean {
+  return Boolean(
+    novel
+    && snapshot
+    && Object.entries(snapshot).every(
+      ([field, value]) => sameJsonValue(novel[field as keyof Novel], value),
+    ),
+  );
+}
+
+function profileAfterSnapshot(
+  before: BrainstormProfileSnapshot,
+  update: Record<string, unknown>,
+): BrainstormProfileSnapshot {
+  return { ...before, ...update };
+}
+
+interface KnowledgeSnapshotReference {
+  snapshotKey: string;
+}
+
+function externalizeKnowledgeBeforeEntries<
+  T extends { beforeEntries: KnowledgeEntryRow[] },
+>(prepared: T) {
+  const stored = prepared.beforeEntries.map(entry => ({
+    entry,
+    snapshot: durableBrainstormSnapshot(entry),
+  }));
+  return {
+    preparedData: {
+      ...prepared,
+      beforeEntries: stored.map(({ snapshot }) => ({
+        snapshotKey: snapshot.snapshotKey,
+      })),
+    },
+    snapshots: stored.map(({ snapshot }) => snapshot),
+  };
+}
+
+function hydrateKnowledgeBeforeEntries<
+  T extends { beforeEntries: KnowledgeEntryRow[] },
+>(
+  preparedData: unknown,
+  readSnapshot: <TValue>(snapshotKey: string) => TValue,
+): T {
+  const stored = preparedData as Omit<T, 'beforeEntries'> & {
+    beforeEntries: KnowledgeSnapshotReference[];
+  };
+  return {
+    ...stored,
+    beforeEntries: stored.beforeEntries.map(reference =>
+      readSnapshot<KnowledgeEntryRow>(reference.snapshotKey)
+    ),
+  } as T;
+}
+
+function normalizeDurableToolContext(
+  receiptOrContext?: string | DurableBrainstormToolContext,
+): { receiptId?: string; durable?: DurableBrainstormToolContext } {
+  if (typeof receiptOrContext === 'string') return { receiptId: receiptOrContext };
+  return {
+    receiptId: receiptOrContext?.receiptId,
+    durable: receiptOrContext,
+  };
+}
+
+export function createBrainstormTools(
+  novelId: string,
+  receiptOrContext?: string | DurableBrainstormToolContext,
+) {
+  const { receiptId, durable } = normalizeDurableToolContext(receiptOrContext);
   return {
     updateBrainstormProfile: tool({
       description: 'Merge the current conversation into the novel brainstorm profile.',
       inputSchema: updateBrainstormProfileSchema,
       execute: async input => {
-        const novel = await getNovel(novelId);
-        if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
-          return { ok: false, reason: 'not_editable' };
-        }
         const update = {
           genre: trimOptional(input.genre),
           targetWords: input.targetWords,
@@ -463,11 +581,66 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
         const novelUpdate = Object.fromEntries(
           Object.entries(update).filter(([, value]) => value !== undefined),
         );
-        const updatedNovel = await updateNovel(novelId, novelUpdate);
-        if (receiptId && updatedNovel) {
-          recordBrainstormProfileMutation(receiptId, novel, updatedNovel);
-        }
-        return { ok: true };
+        const prepare = async () => {
+          const beforeNovel = await getNovel(novelId);
+          return {
+            beforeProfile: beforeNovel ? brainstormProfileSnapshot(beforeNovel) : null,
+            result: !beforeNovel || !isInStages(beforeNovel.stage, EDITABLE_BRAINSTORM_STAGES)
+              ? { ok: false as const, reason: 'not_editable' as const }
+              : { ok: true as const },
+          };
+        };
+        const execute = async (prepared: Awaited<ReturnType<typeof prepare>>) => {
+          if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
+          const current = await getNovel(novelId);
+          if (!current || !isInStages(current.stage, EDITABLE_BRAINSTORM_STAGES)) {
+            return { ok: false as const, reason: 'not_editable' as const };
+          }
+          const updatedNovel = await updateNovel(novelId, novelUpdate);
+          if (receiptId && updatedNovel) {
+            recordBrainstormProfileMutation(receiptId, current, updatedNovel);
+          }
+          return { ok: true as const };
+        };
+        if (!durable) return execute(await prepare());
+        return runDurableBrainstormTool({
+          novelId,
+          context: durable,
+          toolName: 'updateBrainstormProfile',
+          input: novelUpdate,
+          prepare,
+          execute,
+          recover: async prepared => {
+            const current = await getNovel(novelId);
+            if (!prepared.result.ok || !prepared.beforeProfile) {
+              return (
+                (!current && !prepared.beforeProfile)
+                || sameBrainstormProfile(current, prepared.beforeProfile)
+              )
+                ? { state: 'already_after', result: prepared.result }
+                : { state: 'conflict' };
+            }
+            const expectedAfter = profileAfterSnapshot(
+              prepared.beforeProfile,
+              novelUpdate,
+            );
+            if (sameBrainstormProfile(current, expectedAfter)) {
+              if (receiptId && current) {
+                recordBrainstormProfileSnapshotMutation(
+                  receiptId,
+                  novelId,
+                  prepared.beforeProfile,
+                  current,
+                );
+              }
+              return { state: 'already_after', result: prepared.result };
+            }
+            if (sameBrainstormProfile(current, prepared.beforeProfile)) {
+              return { state: 'safe_to_execute' };
+            }
+            return { state: 'conflict' };
+          },
+        });
       },
     }),
     upsertStoryDeckEntries: tool({
@@ -476,10 +649,6 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
         entries: z.array(storyDeckEntrySchema).min(1).max(6),
       }),
       execute: async input => {
-        const novel = await getNovel(novelId);
-        if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
-          return { ok: false, reason: 'not_editable' };
-        }
         const uniqueEntries = Array.from(
           new Map(input.entries.map(entry => [
             `${entry.type}:${entry.title.trim().toLowerCase()}`,
@@ -487,15 +656,62 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
           ])).values(),
         );
         const touchedTypes = Array.from(new Set(uniqueEntries.map(entry => entry.type)));
-        const existingPairs = await Promise.all(touchedTypes.map(async type => [
-          type,
-          await getKnowledgeEntries(novelId, { type }),
-        ] as const));
-        const existingByType = new Map(existingPairs);
-        const results = await Promise.all(uniqueEntries.map(entry =>
-          upsertStoryDeckEntry(novelId, entry, existingByType),
-        ));
-        if (receiptId) {
+        const semanticInput = {
+          entries: uniqueEntries.map(entry => ({
+            ...entry,
+            title: entry.title.trim(),
+            summary: entry.summary.trim(),
+          })),
+        };
+        const prepare = async () => {
+          const novel = await getNovel(novelId);
+          const scopedEntries = (await Promise.all(touchedTypes.map(
+            type => getKnowledgeEntries(novelId, { type }),
+          ))).flat();
+          const beforeEntries = uniqueEntries.map(entry =>
+            scopedEntries.find(row => entryKey(row) === entryKey(entry))
+          ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
+          if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
+            return {
+              editable: false as const,
+              beforeStage: novel?.stage ?? null,
+              beforeEntries,
+              beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+              result: { ok: false as const, reason: 'not_editable' as const },
+            };
+          }
+          const actions = uniqueEntries.map(entry => {
+            const before = beforeEntries.find(row => entryKey(row) === entryKey(entry));
+            if (!before) return 'created' as const;
+            return storyDeckInputMatchesRow(entry, before) ? 'unchanged' as const : 'updated' as const;
+          });
+          return {
+            editable: true as const,
+            beforeStage: novel.stage,
+            beforeEntries,
+            beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+            result: {
+              ok: true as const,
+              created: actions.filter(action => action === 'created').length,
+              updated: actions.filter(action => action === 'updated').length,
+              unchanged: actions.filter(action => action === 'unchanged').length,
+            },
+          };
+        };
+        const execute = async (prepared: Awaited<ReturnType<typeof prepare>>) => {
+          if (!prepared.editable) return prepared.result;
+          const novel = await getNovel(novelId);
+          if (!novel || !isInStages(novel.stage, EDITABLE_BRAINSTORM_STAGES)) {
+            return { ok: false as const, reason: 'not_editable' as const };
+          }
+          const existingPairs = await Promise.all(touchedTypes.map(async type => [
+            type,
+            await getKnowledgeEntries(novelId, { type }),
+          ] as const));
+          const existingByType = new Map(existingPairs);
+          const results = await Promise.all(uniqueEntries.map(entry =>
+            upsertStoryDeckEntry(novelId, entry, existingByType),
+          ));
           const afterPairs = await Promise.all(touchedTypes.map(async type => [
             type,
             await getKnowledgeEntries(novelId, { type }),
@@ -503,7 +719,7 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
           const afterByType = new Map(afterPairs);
           uniqueEntries.forEach((entry, index) => {
             const result = results[index];
-            if (result === 'unchanged') return;
+            if (!receiptId || result === 'unchanged') return;
             const normalizedTitle = entry.title.trim().toLowerCase();
             const before = (existingByType.get(entry.type) ?? []).find(
               candidate => candidate.title.trim().toLowerCase() === normalizedTitle,
@@ -513,19 +729,204 @@ export function createBrainstormTools(novelId: string, receiptId?: string) {
             );
             if (after) recordBrainstormEntryMutation(receiptId, before, after, result);
           });
-        }
-        return {
-          ok: true,
-          created: results.filter(result => result === 'created').length,
-          updated: results.filter(result => result === 'updated').length,
-          unchanged: results.filter(result => result === 'unchanged').length,
+          return {
+            ok: true as const,
+            created: results.filter(result => result === 'created').length,
+            updated: results.filter(result => result === 'updated').length,
+            unchanged: results.filter(result => result === 'unchanged').length,
+          };
         };
+        if (!durable) return execute(await prepare());
+        return runDurableBrainstormTool({
+          novelId,
+          context: durable,
+          toolName: 'upsertStoryDeckEntries',
+          input: semanticInput,
+          prepare,
+          externalizePrepared: externalizeKnowledgeBeforeEntries,
+          hydratePrepared: hydrateKnowledgeBeforeEntries,
+          execute,
+          recover: async prepared => {
+            const currentNovel = await getNovel(novelId);
+            const currentEntries = (await Promise.all(touchedTypes.map(
+              type => getKnowledgeEntries(novelId, { type }),
+            ))).flat();
+            const afterEntries = uniqueEntries.map(entry =>
+              currentEntries.find(row => entryKey(row) === entryKey(entry))
+            );
+            const wholeAfter = uniqueEntries.every((entry, index) =>
+              storyDeckInputMatchesRow(entry, afterEntries[index])
+            );
+            if (wholeAfter) {
+              if (receiptId) {
+                uniqueEntries.forEach((entry, index) => {
+                  const before = prepared.beforeEntries.find(
+                    row => entryKey(row) === entryKey(entry),
+                  ) ?? null;
+                  const after = afterEntries[index];
+                  const action = before
+                    ? (storyDeckInputMatchesRow(entry, before) ? 'unchanged' : 'updated')
+                    : 'created';
+                  if (after && action !== 'unchanged') {
+                    recordBrainstormEntryMutation(receiptId, before, after, action);
+                  }
+                });
+              }
+              await reconcileBrainstormEntryEffects(
+                novelId,
+                afterEntries.filter((entry): entry is KnowledgeEntryRow => Boolean(entry)),
+              );
+              return { state: 'already_after', result: prepared.result };
+            }
+            const exactBefore = currentNovel?.stage === prepared.beforeStage
+              && knowledgeEntriesFingerprint(currentEntries)
+                === prepared.beforeScopeFingerprint;
+            if (exactBefore && prepared.editable) {
+              return { state: 'safe_to_execute' };
+            }
+            if (exactBefore && !prepared.editable) {
+              return { state: 'already_after', result: prepared.result };
+            }
+            return { state: 'conflict' };
+          },
+        });
       },
     }),
     finalizeBrainstorm: tool({
       description: 'Atomically save the approved brainstorm profile and complete Story Deck, then mark the story ready for approval. This must be the final tool call of the turn.',
       inputSchema: finalizeBrainstormSchema,
-      execute: async input => commitFinalizedBrainstorm(novelId, input, receiptId),
+      execute: async input => {
+        const uniqueEntries = Array.from(new Map(input.entries.map(entry => [
+          `${entry.type}:${entry.title.trim().toLowerCase()}`,
+          entry,
+        ])).values());
+        const semanticInput = {
+          profile: Object.fromEntries(Object.entries({
+            genre: trimOptional(input.profile.genre),
+            targetWords: input.profile.targetWords,
+            storySummary: trimOptional(input.profile.storySummary),
+            characterSummary: trimOptional(input.profile.characterSummary),
+            arcSummary: trimOptional(input.profile.arcSummary),
+          }).filter(([, value]) => value !== undefined)),
+          entries: uniqueEntries.map(entry => ({
+            ...entry,
+            title: entry.title.trim(),
+            summary: entry.summary.trim(),
+          })),
+        };
+        const profileUpdate = semanticInput.profile;
+        const prepare = async () => {
+          const beforeNovel = await getNovel(novelId);
+          const scopedEntries = (await Promise.all(STORY_DECK_TYPES.map(
+            type => getKnowledgeEntries(novelId, { type }),
+          ))).flat();
+          const beforeEntries = uniqueEntries.map(entry =>
+            scopedEntries.find(row => entryKey(row) === entryKey(entry))
+          ).filter((entry): entry is KnowledgeEntryRow => Boolean(entry));
+          const coverage = uniqueEntries.reduce<Record<StoryDeckType, number>>(
+            (counts, entry) => {
+              counts[entry.type] += 1;
+              return counts;
+            },
+            { character: 0, world: 0, outline: 0 },
+          );
+          return {
+            beforeProfile: beforeNovel ? brainstormProfileSnapshot(beforeNovel) : null,
+            beforeEntries,
+            beforeScopeFingerprint: knowledgeEntriesFingerprint(scopedEntries),
+            result: !beforeNovel || !isInStages(beforeNovel.stage, EDITABLE_BRAINSTORM_STAGES)
+              ? { ok: false as const, reason: 'not_editable' as const }
+              : { ok: true as const, coverage },
+          };
+        };
+        const execute = async (prepared: Awaited<ReturnType<typeof prepare>>) => {
+          if (!prepared.result.ok || !prepared.beforeProfile) return prepared.result;
+          return commitFinalizedBrainstorm(novelId, input, receiptId);
+        };
+        if (!durable) return execute(await prepare());
+        return runDurableBrainstormTool({
+          novelId,
+          context: durable,
+          toolName: 'finalizeBrainstorm',
+          input: semanticInput,
+          prepare,
+          externalizePrepared: externalizeKnowledgeBeforeEntries,
+          hydratePrepared: hydrateKnowledgeBeforeEntries,
+          execute,
+          recover: async prepared => {
+            const currentNovel = await getNovel(novelId);
+            const currentEntries = (await Promise.all(STORY_DECK_TYPES.map(
+              type => getKnowledgeEntries(novelId, { type }),
+            ))).flat();
+            const afterEntries = uniqueEntries.map(entry =>
+              currentEntries.find(row => entryKey(row) === entryKey(entry))
+            );
+            if (!prepared.result.ok || !prepared.beforeProfile) {
+              const exactBefore = (
+                (!currentNovel && !prepared.beforeProfile)
+                || sameBrainstormProfile(currentNovel, prepared.beforeProfile)
+              ) && knowledgeEntriesFingerprint(currentEntries)
+                === prepared.beforeScopeFingerprint;
+              return exactBefore
+                ? { state: 'already_after', result: prepared.result }
+                : { state: 'conflict' };
+            }
+            const expectedAfterProfile = profileAfterSnapshot(
+              prepared.beforeProfile,
+              {
+                ...profileUpdate,
+                stage: 'ready_for_greenlight',
+                progress: 0,
+                interviewState: toJsonb(greenlightProposalState(
+                  prepared.beforeProfile,
+                  input.profile,
+                )),
+              },
+            );
+            const wholeAfter = sameBrainstormProfile(
+              currentNovel,
+              expectedAfterProfile,
+            ) && uniqueEntries.every((entry, index) =>
+              storyDeckInputMatchesRow(entry, afterEntries[index])
+            );
+            if (wholeAfter && currentNovel) {
+              if (receiptId) {
+                recordBrainstormProfileSnapshotMutation(
+                  receiptId,
+                  novelId,
+                  prepared.beforeProfile,
+                  currentNovel,
+                );
+                uniqueEntries.forEach((entry, index) => {
+                  const before = prepared.beforeEntries.find(
+                    row => entryKey(row) === entryKey(entry),
+                  ) ?? null;
+                  const after = afterEntries[index];
+                  const action = before
+                    ? (storyDeckInputMatchesRow(entry, before) ? 'unchanged' : 'updated')
+                    : 'created';
+                  if (after && action !== 'unchanged') {
+                    recordBrainstormEntryMutation(receiptId, before, after, action);
+                  }
+                });
+              }
+              await reconcileBrainstormEntryEffects(
+                novelId,
+                afterEntries.filter((entry): entry is KnowledgeEntryRow => Boolean(entry)),
+              );
+              return { state: 'already_after', result: prepared.result };
+            }
+            const exactBefore = sameBrainstormProfile(
+              currentNovel,
+              prepared.beforeProfile,
+            ) && knowledgeEntriesFingerprint(currentEntries)
+              === prepared.beforeScopeFingerprint;
+            return exactBefore
+              ? { state: 'safe_to_execute' }
+              : { state: 'conflict' };
+          },
+        });
+      },
     }),
   };
 }

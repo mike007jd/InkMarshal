@@ -5,8 +5,9 @@
 //   2. Referential integrity (relation endpoints exist in entries; every outline
 //      chapterNumber has a matching chapter file; conversation/message refs).
 //
-// Compatibility gate: the MAJOR of `formatVersion` must equal the running
-// build's; a MAJOR mismatch is a breaking layout change and is rejected outright.
+// Compatibility gate: current 2.0 plus the explicitly published 1.0 / 1.1
+// formats. Unknown legacy minors, future 2.x minors, and malformed versions are
+// rejected — this build cannot restore layouts it does not understand.
 // `dbSchemaVersion` is informational only (shown in the preview, never blocks).
 //
 // Pre-decompression ZIP resource guard (fflate `unzipSync` filter metadata):
@@ -47,6 +48,7 @@ export interface VerifyIssue {
     | 'missing_manifest'
     | 'bad_manifest'
     | 'format_incompatible'
+    | 'unsupported_attachments'
     | 'missing_file'
     | 'missing_checksum'
     | 'sha256_mismatch'
@@ -84,18 +86,38 @@ export interface VerifyReport {
   bundle: BackupBundle | null;
 }
 
-function majorOf(version: string): string {
-  return String(version).split('.')[0] ?? '';
+function parseFormatVersion(version: string): { major: number; minor: number } | null {
+  const match = /^(\d+)\.(\d+)$/.exec(String(version));
+  if (!match) return null;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor)) return null;
+  return { major, minor };
 }
 
-function minorOf(version: string): number {
-  const n = Number.parseInt(String(version).split('.')[1] ?? '0', 10);
-  return Number.isFinite(n) ? n : 0;
+/**
+ * Accept only formats whose semantics this build explicitly understands.
+ * 1.0 / 1.1 are published legacy contracts; 2.0 is current. Do not use a broad
+ * "older major is safe" rule: a lower major can still be an unknown layout.
+ */
+export function isFormatCompatible(formatVersion: string): boolean {
+  const candidate = parseFormatVersion(formatVersion);
+  if (!candidate) return false;
+  if (candidate.major === 1) return candidate.minor === 0 || candidate.minor === 1;
+  return candidate.major === 2 && candidate.minor === 0;
 }
 
 /** Format 1.1+ requires the fixed history files to be present and checksummed. */
 function requiresHistoryLayout(formatVersion: string): boolean {
-  return majorOf(formatVersion) === majorOf(FORMAT_VERSION) && minorOf(formatVersion) >= 1;
+  const candidate = parseFormatVersion(formatVersion);
+  return candidate !== null
+    && (candidate.major >= 2 || (candidate.major === 1 && candidate.minor >= 1));
+}
+
+/** Format 2.0+ requires an explicit lifecycle state in every chapter file. */
+function requiresChapterProcessingStatus(formatVersion: string): boolean {
+  const candidate = parseFormatVersion(formatVersion);
+  return candidate !== null && candidate.major >= 2;
 }
 
 function parseJson<T>(raw: string): T | undefined {
@@ -145,8 +167,15 @@ function isBackupNovelPayload(value: unknown): value is BackupNovelPayload {
     && isFiniteNumber(value.updatedAt);
 }
 
-function isBackupChapter(value: unknown): value is BackupChapter {
+type SerializedBackupChapter = Omit<BackupChapter, 'processingStatus'> & {
+  processingStatus?: 'content_saved' | 'complete';
+};
+
+function isSerializedBackupChapter(value: unknown): value is SerializedBackupChapter {
   if (!isRecord(value)) return false;
+  const statusOk = value.processingStatus === undefined
+    || value.processingStatus === 'content_saved'
+    || value.processingStatus === 'complete';
   return isFiniteNumber(value.chapterNumber)
     && typeof value.title === 'string'
     && typeof value.content === 'string'
@@ -158,6 +187,7 @@ function isBackupChapter(value: unknown): value is BackupChapter {
     && (value.qualityIssues === null || Array.isArray(value.qualityIssues))
     && (value.generationMeta === null || isRecord(value.generationMeta))
     && (value.snapshots === null || Array.isArray(value.snapshots))
+    && statusOk
     && isFiniteNumber(value.createdAt);
 }
 
@@ -388,7 +418,7 @@ export async function verifyBackupPackage(bytes: Uint8Array): Promise<VerifyRepo
     };
   }
 
-  const formatCompatible = majorOf(manifest.formatVersion) === majorOf(FORMAT_VERSION);
+  const formatCompatible = isFormatCompatible(manifest.formatVersion);
   if (!formatCompatible) {
     errors.push({
       code: 'format_incompatible',
@@ -538,24 +568,42 @@ export async function verifyBackupPackage(bytes: Uint8Array): Promise<VerifyRepo
 
   // Chapters: read every chapters/NNNN.json the zip carries.
   const chapters: BackupChapter[] = [];
+  const processingStatusRequired = requiresChapterProcessingStatus(manifest.formatVersion);
   for (const path of Object.keys(entries)) {
     if (!path.startsWith(PACKAGE_PATHS.chaptersDir) || !path.endsWith('.json')) continue;
     const ch = parseJson<unknown>(strFromU8(entries[path]));
-    if (!isBackupChapter(ch)) {
+    if (
+      !isSerializedBackupChapter(ch)
+      || (processingStatusRequired && ch.processingStatus === undefined)
+    ) {
       errors.push({ code: 'corrupt_section', detail: `Chapter file ${path} is corrupt.`, ref: path });
       continue;
     }
-    chapters.push(ch);
+    chapters.push({
+      ...ch,
+      // Published 1.x packages pre-date this lifecycle contract. Treat every
+      // legacy chapter as complete even if an unknown extra field is present;
+      // only a 2.x version signal may carry content_saved semantics.
+      processingStatus: processingStatusRequired ? ch.processingStatus! : 'complete',
+    });
   }
   chapters.sort((a, b) => a.chapterNumber - b.chapterNumber);
 
-  // Attachments (optional, forward-compat).
+  // Attachments: layout reserved, but this build cannot restore them — reject
+  // nonempty packages rather than verify OK and silently drop on restore.
   const attachments: BackupAttachment[] = [];
   for (const path of Object.keys(entries)) {
     if (!path.startsWith(PACKAGE_PATHS.attachmentsDir)) continue;
     const name = path.slice(PACKAGE_PATHS.attachmentsDir.length);
     if (!name) continue;
     attachments.push({ name, contentsBase64: Buffer.from(entries[path]).toString('base64') });
+  }
+  if (attachments.length > 0) {
+    errors.push({
+      code: 'unsupported_attachments',
+      detail: `This build cannot restore package attachments (${attachments.length} file(s)). Re-export without attachments or use a build that supports them.`,
+      ref: PACKAGE_PATHS.attachmentsDir,
+    });
   }
 
   // --- Secret re-scan (defense in depth; should be a no-op if extract worked) ---

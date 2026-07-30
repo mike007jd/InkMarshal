@@ -119,6 +119,37 @@ function mockCapturedStream(optionsLog: unknown[], text = 'assistant text') {
   });
 }
 
+function mockDeferredStream(args: {
+  optionsLog: unknown[];
+  gate: { promise: Promise<void> };
+  text?: string;
+  callCount: { value: number };
+}) {
+  const text = args.text ?? 'assistant text';
+  vi.doMock('ai', async importOriginal => {
+    const actual = await importOriginal<typeof import('ai')>();
+    return {
+      ...actual,
+      streamText: vi.fn((opts: {
+        onFinish: (event: { text: string; usage: undefined }) => Promise<void>;
+        onError?: (event: { error: unknown }) => Promise<void>;
+      }) => {
+        args.callCount.value += 1;
+        args.optionsLog.push(opts);
+        return {
+          toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+            mockUIMessageResponse(uiOptions, async () => {
+              await args.gate.promise;
+              const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+              await opts.onFinish({ text, usage: undefined });
+              return { type: 'text-delta', messageId: id, delta: text };
+            }),
+        };
+      }),
+    };
+  });
+}
+
 describe('novel messages route helpers', () => {
   it('accepts only supported locale strings from the request body', async () => {
     const { normalizeLegacyChatLanguageInput } = await import('./route');
@@ -199,10 +230,15 @@ describe('novel messages API', () => {
       expect(body).toContain('text-delta');
       expect(body).toContain('assistant text');
 
+      const { deterministicAssistantMessageId } = await import('./route');
       const persisted = await getMessages(novel.id);
       expect(persisted.map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
         { id: 'user-ui-1', role: 'user', content: 'hello from ui' },
-        { id: persisted[1]!.id, role: 'assistant', content: 'assistant text' },
+        {
+          id: deterministicAssistantMessageId('user-ui-1'),
+          role: 'assistant',
+          content: 'assistant text',
+        },
       ]);
       expect(usage.settle).toHaveBeenCalledWith({
         outcome: 'success',
@@ -822,9 +858,19 @@ describe('novel messages API', () => {
 
       const responses = await Promise.all([makeRequest('en'), makeRequest('zh-CN')]);
       const bodies = await Promise.all(responses.map(response => response.text()));
-
-      expect(responses.map(response => response.status)).toEqual([200, 200]);
-      expect(bodies[0]).toBe(bodies[1]);
+      const statuses = responses.map(response => response.status).sort();
+      // Durable claim serializes the side effect: one winner streams, the loser
+      // either waits as in_progress or (rarely) replays after completion.
+      expect(statuses[0]).toBe(200);
+      expect([200, 409]).toContain(statuses[1]);
+      if (statuses[1] === 409) {
+        expect(bodies.some(body => body.includes('CHAT_TURN_IN_PROGRESS'))).toBe(true);
+      } else {
+        expect(bodies[0]).toBe(bodies[1]);
+      }
+      const replay = await makeRequest('en');
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toContain('Approve & Begin Writing');
       expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
       expect((await getMessages(novel.id)).map(message => message.role)).toEqual([
         'user',
@@ -1104,7 +1150,7 @@ describe('novel messages API', () => {
       };
     });
 
-    const { createNovel, deleteNovelCascade, getMessages } = await import('@/lib/db');
+    const { createNovel, deleteNovelCascade, getMessages, getChatTurn } = await import('@/lib/db');
     const { POST } = await import('./route');
     const novel = await createNovel({ userId: 'local-user', title: 'Provider Failure Chat' });
 
@@ -1124,7 +1170,561 @@ describe('novel messages API', () => {
       expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
         { id: 'failed-user-1', role: 'user', content: 'will fail' },
       ]);
+      expect(getChatTurn(novel.id, 'failed-user-1')?.status).toBe('failed');
       expect(usage.settle).toHaveBeenCalledWith({ outcome: 'failed' });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('replays the same deterministic assistant on sequential ordinary-chat duplicates', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions, 'stable ordinary reply');
+
+    const { createNovel, deleteNovelCascade, getMessages, getChatTurn } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Sequential Ordinary Idempotency' });
+    const userMessageId = 'ordinary-seq-user';
+    const body = {
+      language: 'en',
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        // Client metadata must be ignored — DB is authoritative.
+        metadata: { persisted: false, conversationId: null },
+        parts: [{ type: 'text', text: 'hello ordinary' }],
+      }],
+    };
+
+    try {
+      const first = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await first.text()).toContain('stable ordinary reply');
+
+      const second = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await second.text()).toContain('stable ordinary reply');
+
+      expect(streamOptions).toHaveLength(1);
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
+        { id: userMessageId, role: 'user', content: 'hello ordinary' },
+        {
+          id: deterministicAssistantMessageId(userMessageId),
+          role: 'assistant',
+          content: 'stable ordinary reply',
+        },
+      ]);
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        responseText: 'stable ordinary reply',
+      });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('allows only one deferred provider execution for concurrent ordinary-chat duplicates', async () => {
+    mockUsage();
+    mockContext();
+    let release!: () => void;
+    const gate = {
+      promise: new Promise<void>(resolve => {
+        release = resolve;
+      }),
+    };
+    const streamOptions: unknown[] = [];
+    const callCount = { value: 0 };
+    mockDeferredStream({ optionsLog: streamOptions, gate, callCount, text: 'only once' });
+
+    const { createNovel, deleteNovelCascade, getMessages, getChatTurn } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Concurrent Ordinary Idempotency' });
+    const userMessageId = 'ordinary-concurrent-user';
+    const body = {
+      language: 'en',
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'race me' }],
+      }],
+    };
+
+    try {
+      const started = Promise.all([
+        POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }), { params: Promise.resolve({ id: novel.id }) }),
+        POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }), { params: Promise.resolve({ id: novel.id }) }),
+      ]);
+
+      // Let both handlers race through beginChatTurn before the provider resumes.
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(callCount.value).toBe(1);
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('running');
+
+      release();
+      const [first, second] = await started;
+      const bodies = await Promise.all([first.text(), second.text()]);
+      const statuses = [first.status, second.status].sort();
+      expect(statuses).toEqual([200, 409]);
+      expect(bodies.some(bodyText => bodyText.includes('only once'))).toBe(true);
+      expect(bodies.some(bodyText => bodyText.includes('CHAT_TURN_IN_PROGRESS'))).toBe(true);
+
+      const replay = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toContain('only once');
+      expect(callCount.value).toBe(1);
+      expect(streamOptions).toHaveLength(1);
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role }))).toEqual([
+        { id: userMessageId, role: 'user' },
+        { id: deterministicAssistantMessageId(userMessageId), role: 'assistant' },
+      ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('fails closed when the same user_message_id is reused with different content', async () => {
+    mockUsage();
+    mockContext();
+    mockSuccessfulStream('first reply');
+
+    const { createNovel, deleteNovelCascade, getMessages } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Ordinary Collision' });
+    const userMessageId = 'ordinary-collision-user';
+
+    try {
+      const first = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            parts: [{ type: 'text', text: 'original content' }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await first.text();
+
+      const collision = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            parts: [{ type: 'text', text: 'mutated content' }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(collision.status).toBe(409);
+      expect(await collision.json()).toMatchObject({ code: 'CHAT_TURN_REQUEST_COLLISION' });
+      expect((await getMessages(novel.id)).map(m => m.content)).toEqual([
+        'original content',
+        'first reply',
+      ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('fails closed when the same user_message_id changes semantic mode after completion', async () => {
+    mockUsage();
+    mockContext();
+    mockSuccessfulStream('ordinary reply');
+
+    const { createNovel, deleteNovelCascade, getMessages } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Ordinary Mode Collision' });
+    const userMessageId = 'ordinary-mode-collision-user';
+    const messages = [{
+      id: userMessageId,
+      role: 'user',
+      parts: [{ type: 'text', text: 'keep this request immutable' }],
+    }];
+
+    try {
+      const first = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await first.text();
+
+      const collision = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages, repairStoryDeck: true }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(collision.status).toBe(409);
+      expect(await collision.json()).toMatchObject({ code: 'CHAT_TURN_REQUEST_COLLISION' });
+      expect((await getMessages(novel.id)).map(message => message.content)).toEqual([
+        'keep this request immutable',
+        'ordinary reply',
+      ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('marks a failed ordinary turn retryable and succeeds on the next attempt without duplicating the user row', async () => {
+    const usage = mockUsage();
+    mockContext();
+    vi.doMock('ai', async importOriginal => {
+      const actual = await importOriginal<typeof import('ai')>();
+      let attempts = 0;
+      return {
+        ...actual,
+        streamText: vi.fn((opts: {
+          onFinish: (event: { text: string; usage: undefined }) => Promise<void>;
+          onError: (event: { error: unknown }) => Promise<void>;
+        }) => {
+          attempts += 1;
+          return {
+            toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+              mockUIMessageResponse(uiOptions, async () => {
+                if (attempts === 1) {
+                  const error = new Error('provider down');
+                  await opts.onError({ error });
+                  return { error: uiOptions.onError?.(error) };
+                }
+                const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+                await opts.onFinish({ text: 'recovered reply', usage: undefined });
+                return { type: 'text-delta', messageId: id, delta: 'recovered reply' };
+              }),
+          };
+        }),
+      };
+    });
+
+    const { createNovel, deleteNovelCascade, getMessages, getChatTurn } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Ordinary Fail Then Retry' });
+    const userMessageId = 'ordinary-fail-retry-user';
+    const body = {
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'please retry me' }],
+      }],
+    };
+
+    try {
+      const failed = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await failed.text();
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('failed');
+      expect((await getMessages(novel.id)).map(m => m.role)).toEqual(['user']);
+
+      const retried = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await retried.text()).toContain('recovered reply');
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        responseText: 'recovered reply',
+      });
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
+        { id: userMessageId, role: 'user', content: 'please retry me' },
+        {
+          id: deterministicAssistantMessageId(userMessageId),
+          role: 'assistant',
+          content: 'recovered reply',
+        },
+      ]);
+      expect(usage.settle).toHaveBeenCalledWith({ outcome: 'failed' });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('replays from the durable turn receipt after a completed ordinary chat', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions, 'receipt replay');
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { POST, deterministicAssistantMessageId } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Ordinary Completed Replay' });
+    const userMessageId = 'ordinary-replay-user';
+    const body = {
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'persist then replay' }],
+      }],
+    };
+
+    try {
+      const first = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await first.text();
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('succeeded');
+
+      // Simulate response-row loss after the durable receipt was stamped succeeded.
+      getDb()
+        .prepare('DELETE FROM messages WHERE novel_id = ? AND id = ?')
+        .run(novel.id, deterministicAssistantMessageId(userMessageId));
+
+      const replay = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...body,
+          messages: [{
+            ...body.messages[0],
+            metadata: { persisted: true, conversationId: null },
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toContain('receipt replay');
+      expect(streamOptions).toHaveLength(1);
+      expect((await getMessages(novel.id)).map(m => m.id)).toEqual([
+        userMessageId,
+        deterministicAssistantMessageId(userMessageId),
+      ]);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('allows only one special-branch side effect for concurrent repair duplicates', async () => {
+    mockUsage();
+    mockContext();
+    const finalizeCount = { value: 0 };
+    vi.doMock('@/lib/brainstorm-agent', async importOriginal => {
+      const actual = await importOriginal<typeof import('@/lib/brainstorm-agent')>();
+      return {
+        ...actual,
+        finalizeApprovedStoryDeck: vi.fn(async (...args: Parameters<typeof actual.finalizeApprovedStoryDeck>) => {
+          finalizeCount.value += 1;
+          return actual.finalizeApprovedStoryDeck(...args);
+        }),
+      };
+    });
+
+    const {
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      getMessages,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Concurrent Repair Claim' });
+    const userMessageId = 'repair-concurrent-user';
+    const body = {
+      language: 'en',
+      repairStoryDeck: true,
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'Complete the approved Story Deck.' }],
+      }],
+    };
+
+    try {
+      await updateNovel(novel.id, {
+        stage: 'ready_for_greenlight',
+        genre: 'Fantasy',
+        storySummary: 'Two sisters uncover a haunted archive.',
+        characterSummary: 'The sisters disagree about whether to trust the archive.',
+        arcSummary: 'They reconcile while sealing the archive.',
+      });
+
+      const [first, second] = await Promise.all([
+        POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }), { params: Promise.resolve({ id: novel.id }) }),
+        POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }), { params: Promise.resolve({ id: novel.id }) }),
+      ]);
+      const bodies = await Promise.all([first.text(), second.text()]);
+      const statuses = [first.status, second.status].sort();
+      expect(statuses).toEqual([200, 409]);
+      expect(bodies.some(body => body.includes('Story Deck completed'))).toBe(true);
+      expect(bodies.some(body => body.includes('CHAT_TURN_IN_PROGRESS'))).toBe(true);
+      expect(finalizeCount.value).toBe(1);
+      expect((await getKnowledgeEntries(novel.id)).map(entry => entry.type).sort()).toEqual([
+        'character',
+        'outline',
+        'world',
+      ]);
+      expect((await getMessages(novel.id)).map(message => message.role)).toEqual(['user', 'assistant']);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('reuses brainstorm_receipt_id after provider failure and after in-memory restart', async () => {
+    mockUsage();
+    mockContext();
+    vi.doMock('ai', async importOriginal => {
+      const actual = await importOriginal<typeof import('ai')>();
+      let attempts = 0;
+      return {
+        ...actual,
+        streamText: vi.fn((opts: {
+          onFinish: (event: { text: string; usage: undefined }) => Promise<void>;
+          onError: (event: { error: unknown }) => Promise<void>;
+        }) => {
+          attempts += 1;
+          return {
+            toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+              mockUIMessageResponse(uiOptions, async () => {
+                if (attempts === 1) {
+                  const error = new Error('provider down');
+                  await opts.onError({ error });
+                  return { error: uiOptions.onError?.(error) };
+                }
+                const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+                await opts.onFinish({ text: 'reused receipt reply', usage: undefined });
+                return { type: 'text-delta', messageId: id, delta: 'reused receipt reply' };
+              }),
+          };
+        }),
+      };
+    });
+
+    const { createNovel, deleteNovelCascade, getChatTurn } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Receipt Reuse' });
+    const userMessageId = 'receipt-reuse-user';
+    const body = {
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'keep the receipt' }],
+      }],
+    };
+
+    try {
+      const failed = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await failed.text();
+      const failedTurn = getChatTurn(novel.id, userMessageId);
+      expect(failedTurn?.status).toBe('failed');
+      expect(failedTurn?.brainstormReceiptId).toBeTruthy();
+      const receiptId = failedTurn!.brainstormReceiptId!;
+
+      const registry = (globalThis as typeof globalThis & {
+        __inkmarshalBrainstormReceipts?: Map<string, unknown>;
+      }).__inkmarshalBrainstormReceipts;
+      registry?.clear();
+
+      const retried = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await retried.text()).toContain('reused receipt reply');
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        brainstormReceiptId: receiptId,
+      });
+      expect(registry?.has(receiptId)).toBe(true);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('reclaims a stale running ordinary turn and retries safely', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions, 'stale reclaim reply');
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { getDb } = await import('@/lib/db/connection');
+    const { CHAT_TURN_STALE_LEASE_MS } = await import('@/lib/db/queries-chat-turns');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Stale Running Retry' });
+    const userMessageId = 'stale-running-retry-user';
+    const body = {
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'abandoned mid-flight' }],
+      }],
+    };
+
+    try {
+      const { beginChatTurn, hashChatTurnRequest } = await import('@/lib/db/queries-chat-turns');
+      const assistantMessageId = deterministicAssistantMessageId(userMessageId);
+      expect(beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({ content: 'abandoned mid-flight', mode: 'ordinary' }),
+        assistantMessageId,
+      }).kind).toBe('acquired');
+      getDb()
+        .prepare(
+          `UPDATE chat_turns
+              SET brainstorm_receipt_id = ?, updated_at = ?
+            WHERE novel_id = ? AND user_message_id = ?`,
+        )
+        .run(
+          'prebound-receipt',
+          new Date(Date.now() - CHAT_TURN_STALE_LEASE_MS - 5_000).toISOString(),
+          novel.id,
+          userMessageId,
+        );
+
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await response.text()).toContain('stale reclaim reply');
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        brainstormReceiptId: 'prebound-receipt',
+        responseText: 'stale reclaim reply',
+      });
+      expect(streamOptions).toHaveLength(1);
+      expect((await getMessages(novel.id)).map(m => m.id)).toEqual([
+        userMessageId,
+        assistantMessageId,
+      ]);
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }

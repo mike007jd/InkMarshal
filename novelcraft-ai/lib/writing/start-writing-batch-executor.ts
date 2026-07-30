@@ -7,6 +7,7 @@ import {
 } from '@/lib/ai';
 import {
   getVolumeSummaries,
+  isChapterProcessingComplete,
   updateChapterMeta,
   updateNovel,
   upsertChapter,
@@ -18,7 +19,11 @@ import { isZhLocale } from '@/lib/i18n';
 import { shouldStopStartWritingBatch } from '@/lib/start-writing-batch';
 import { START_WRITING_EVENTS, type StartWritingEndReason } from '@/lib/start-writing-logging';
 import { sanitizeError } from '@/lib/utils';
-import { writeChapter, type WriteChapterDeps } from '@/lib/writing-orchestrator';
+import {
+  completeSavedChapterPostProcessing,
+  writeChapter,
+  type WriteChapterDeps,
+} from '@/lib/writing-orchestrator';
 import type { WritingEventSink } from '@/lib/writing/ndjson-sink';
 import {
   maybeRunVolumeSummary,
@@ -34,6 +39,17 @@ export interface WritingBatchResult {
   completedChapters: number;
   writtenThisBatch: number;
   latestProgress: number;
+}
+
+function toDigestSource(chapter: Chapter): RollingDigestSource {
+  return {
+    chapterNumber: chapter.chapterNumber,
+    title: chapter.title,
+    content: chapter.content,
+    summary: chapter.summary || '',
+    summaryStale: chapter.generationMeta?.summaryStale === true,
+    keyFacts: chapter.keyFacts ?? null,
+  };
 }
 
 export async function executeWritingChapterBatch(args: {
@@ -85,18 +101,113 @@ export async function executeWritingChapterBatch(args: {
   } catch {
     digestParams = { recentWindow: 2, tailCharsPerChapter: 1500, maxBatchChars: 80_000 };
   }
+  // Only complete chapters feed the rolling digest / volume history.
   const digestSources: RollingDigestSource[] = blueprint.chapters
     .map(plan => existingByNumber.get(plan.chapterNumber))
-    .filter((chapter): chapter is Chapter => chapter !== undefined)
-    .map(chapter => ({
-      chapterNumber: chapter.chapterNumber,
-      title: chapter.title,
-      content: chapter.content,
-      summary: chapter.summary || '',
-      summaryStale: chapter.generationMeta?.summaryStale === true,
-      keyFacts: chapter.keyFacts ?? null,
-    }));
+    .filter((chapter): chapter is Chapter =>
+      chapter !== undefined && isChapterProcessingComplete(chapter),
+    )
+    .map(toDigestSource);
   let volumeSummaries = await getVolumeSummaries(novelId).catch(() => []);
+
+  const buildChapterDeps = (planTitle: string, planChapterNumber: number): WriteChapterDeps => ({
+    createChapterUsage: async () => {
+      throw new Error('createChapterUsage must be bound by the call site');
+    },
+    streamChapter: streamArgs => streamChapter({
+      model: streamArgs.model,
+      novelContext: novel,
+      blueprint: streamArgs.blueprint,
+      language,
+      signal: lifecycle.signal,
+      targetWordsPerChapter: streamArgs.targetWordsPerChapter,
+      systemPrompt,
+      recentChapterTails: streamArgs.recentChapterTails,
+      earlierChapterDigest: streamArgs.earlierChapterDigest,
+      onFinish: streamArgs.onFinish,
+      onError: streamArgs.onError,
+      preset: chapterPreset,
+    }),
+    streamChapterContinuation: continuationArgs => streamChapterContinuation({
+      model: continuationArgs.model,
+      novelContext: novel,
+      blueprint: continuationArgs.blueprint,
+      existingContent: continuationArgs.existingContent,
+      targetExtraWords: continuationArgs.targetExtraWords,
+      language,
+      signal: lifecycle.signal,
+      systemPrompt,
+      onFinish: continuationArgs.onFinish,
+      onError: continuationArgs.onError,
+      preset: chapterPreset,
+    }),
+    summarize: ({ content, plan: chapterPlan }) => runSummarize({
+      request,
+      userId,
+      signal: lifecycle.signal,
+      chapterContent: content,
+      chapterTitle: chapterPlan.title,
+      plan: chapterPlan,
+      language,
+      systemPrompt,
+      chapterNumber: chapterPlan.chapterNumber,
+      log,
+    }),
+    validate: ({ content, previousFactsSummary }) => runValidate({
+      request,
+      userId,
+      signal: lifecycle.signal,
+      chapterContent: content,
+      chapterTitle: planTitle,
+      knowledgeContext: knowledgeSummaries,
+      previousFactsSummary,
+      targetWords: targetWordsPerChapter,
+      language,
+      systemPrompt,
+      chapterNumber: planChapterNumber,
+      log,
+    }),
+    revise: ({ content, plan: chapterPlan, revisionBrief }) => runRalphRevision({
+      request,
+      userId,
+      signal: lifecycle.signal,
+      chapterContent: content,
+      chapterTitle: chapterPlan.title,
+      plan: chapterPlan,
+      novel,
+      revisionBrief,
+      language,
+      systemPrompt,
+      chapterNumber: chapterPlan.chapterNumber,
+      log,
+    }),
+    upsertChapter: (chapterNumber, title, content, options) =>
+      upsertChapter(novelId, chapterNumber, title, content, options),
+    updateChapterMeta: (chapterNumber, meta) =>
+      updateChapterMeta(novelId, chapterNumber, meta),
+    renewLock: () => lease.renew(),
+    emit: frame => sink.emit(frame),
+    isCancelled: () => lifecycle.isCancelled(),
+    isAborted: () => lifecycle.signal.aborted,
+    log,
+  });
+
+  const registerSavedOutcome = async (
+    planChapterNumber: number,
+    saved: Chapter,
+    opts: { countComplete: boolean },
+  ) => {
+    existingByNumber.set(planChapterNumber, saved);
+    if (!opts.countComplete || !isChapterProcessingComplete(saved)) return;
+    completedChapters += 1;
+    writtenThisBatch += 1;
+    latestProgress = progressForCompleted(completedChapters);
+    await updateNovel(novelId, {
+      stage: 'autonomous_writing',
+      progress: latestProgress,
+    });
+    jobs.bumpProgress(planChapterNumber, ++seq);
+  };
 
   for (let index = 0; index < blueprint.chapters.length; index += 1) {
     if (sink.isClosed() || lifecycle.signal.aborted) {
@@ -106,7 +217,11 @@ export async function executeWritingChapterBatch(args: {
     }
 
     const plan = blueprint.chapters[index];
-    if (existingByNumber.has(plan.chapterNumber)) continue;
+    const existing = existingByNumber.get(plan.chapterNumber);
+
+    // Skip only fully complete chapters.
+    if (existing && isChapterProcessingComplete(existing)) continue;
+
     if (shouldStopStartWritingBatch({
       writtenThisBatch,
       chapterNumber: plan.chapterNumber,
@@ -132,6 +247,110 @@ export async function executeWritingChapterBatch(args: {
       { volumeSummaries },
     );
     const chapterStartedAt = Date.now();
+
+    // Resume path: durable prose exists but metadata/status is incomplete —
+    // repair post-processing without regenerating content.
+    if (existing && !isChapterProcessingComplete(existing)) {
+      log(START_WRITING_EVENTS.chapterStart, {
+        ch: plan.chapterNumber,
+        title: plan.title,
+        repair: 1,
+      });
+      sink.emit({
+        type: 'phase',
+        phase: 'saving',
+        progress: progressForCompleted(completedChapters),
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `正在补全第 ${plan.chapterNumber} 章元数据…`
+          : `Repairing Chapter ${plan.chapterNumber} metadata...`,
+      });
+
+      const repairDeps = buildChapterDeps(plan.title, plan.chapterNumber);
+
+      const repairOutcome = await completeSavedChapterPostProcessing(repairDeps, {
+        plan,
+        savedChapter: existing,
+        targetWordsPerChapter,
+        language,
+        earlierDigest: digest.earlierDigest,
+        progress: progressForCompleted(completedChapters),
+      });
+
+      if (repairOutcome.status === 'aborted') {
+        if (repairOutcome.savedChapter) {
+          existingByNumber.set(plan.chapterNumber, repairOutcome.savedChapter);
+        }
+        abortedReason = 'aborted';
+        break;
+      }
+      if (repairOutcome.status === 'lock_failed' || repairOutcome.status === 'saved_failed') {
+        if (repairOutcome.savedChapter) {
+          await registerSavedOutcome(plan.chapterNumber, repairOutcome.savedChapter, {
+            countComplete: isChapterProcessingComplete(repairOutcome.savedChapter),
+          });
+          if (isChapterProcessingComplete(repairOutcome.savedChapter)) {
+            digestSources.push(toDigestSource(repairOutcome.savedChapter));
+          }
+        }
+        errorMessage = repairOutcome.errorMessage ?? (
+          repairOutcome.status === 'lock_failed'
+            ? (isZhLocale(language)
+                ? '写作锁已丢失（另一个会话已接管）。'
+                : 'Writing lock lost (another session took over).')
+            : (isZhLocale(language)
+                ? '章节已保存，但用量记录失败。'
+                : 'The chapter was saved, but its usage record failed.')
+        );
+        abortedReason = repairOutcome.status === 'lock_failed' ? 'lock_failed' : 'error';
+        break;
+      }
+
+      // written
+      completedChapters += 1;
+      writtenThisBatch += 1;
+      existingByNumber.set(plan.chapterNumber, repairOutcome.savedChapter!);
+      digestSources.push(toDigestSource(repairOutcome.savedChapter!));
+      latestProgress = progressForCompleted(completedChapters);
+      sink.emit({
+        type: 'chapter_done',
+        chapterNumber: plan.chapterNumber,
+        title: plan.title,
+        content: repairOutcome.content,
+        wordCount: repairOutcome.actualWords,
+        qualityIssues: repairOutcome.qualityIssues,
+        ralphRevisions: repairOutcome.ralphRevisions,
+        progress: latestProgress,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+      });
+      sink.emit({
+        type: 'phase',
+        phase: 'chapter_complete',
+        progress: latestProgress,
+        chapterNumber: plan.chapterNumber,
+        chapterTitle: plan.title,
+        completedChapters,
+        totalChapters: blueprint.chapters.length,
+        message: isZhLocale(language)
+          ? `第 ${plan.chapterNumber} 章已完成`
+          : `Chapter ${plan.chapterNumber} complete`,
+      });
+      await updateNovel(novelId, { progress: latestProgress });
+      jobs.bumpProgress(plan.chapterNumber, ++seq);
+      log(START_WRITING_EVENTS.chapterDone, {
+        ch: plan.chapterNumber,
+        words: repairOutcome.actualWords,
+        attempts: repairOutcome.attempts,
+        durationMs: Date.now() - chapterStartedAt,
+        repair: 1,
+      });
+      continue;
+    }
+
     log(START_WRITING_EVENTS.chapterStart, { ch: plan.chapterNumber, title: plan.title });
     sink.emit({
       type: 'phase',
@@ -153,101 +372,24 @@ export async function executeWritingChapterBatch(args: {
         : `Writing Chapter ${plan.chapterNumber}: ${plan.title}...`,
     });
 
-    const chapterDeps: WriteChapterDeps = {
-      createChapterUsage: async () => {
-        let chapterUsage: AIUsageSession;
-        try {
-          chapterUsage = await createAIUsageSession(request, {
-            userId,
-            operation: 'chapter',
-          });
-        } catch (error) {
-          const response = aiUsageErrorResponse(error);
-          const message = response
-            ? (await response.json().catch(() => ({})))?.error || 'AI usage error'
-            : sanitizeError(error, 'AI usage error');
-          throw new Error(message, { cause: error });
-        }
-        chapterUsage.addPromptText(systemPrompt);
-        chapterUsage.addPromptText(JSON.stringify(plan));
-        return chapterUsage;
-      },
-      streamChapter: streamArgs => streamChapter({
-        model: streamArgs.model,
-        novelContext: novel,
-        blueprint: streamArgs.blueprint,
-        language,
-        signal: lifecycle.signal,
-        targetWordsPerChapter: streamArgs.targetWordsPerChapter,
-        systemPrompt,
-        recentChapterTails: streamArgs.recentChapterTails,
-        earlierChapterDigest: streamArgs.earlierChapterDigest,
-        onFinish: streamArgs.onFinish,
-        onError: streamArgs.onError,
-        preset: chapterPreset,
-      }),
-      streamChapterContinuation: continuationArgs => streamChapterContinuation({
-        model: continuationArgs.model,
-        novelContext: novel,
-        blueprint: continuationArgs.blueprint,
-        existingContent: continuationArgs.existingContent,
-        targetExtraWords: continuationArgs.targetExtraWords,
-        language,
-        signal: lifecycle.signal,
-        systemPrompt,
-        onFinish: continuationArgs.onFinish,
-        onError: continuationArgs.onError,
-        preset: chapterPreset,
-      }),
-      summarize: ({ content, plan: chapterPlan }) => runSummarize({
-        request,
-        userId,
-        signal: lifecycle.signal,
-        chapterContent: content,
-        chapterTitle: chapterPlan.title,
-        plan: chapterPlan,
-        language,
-        systemPrompt,
-        chapterNumber: chapterPlan.chapterNumber,
-        log,
-      }),
-      validate: ({ content, previousFactsSummary }) => runValidate({
-        request,
-        userId,
-        signal: lifecycle.signal,
-        chapterContent: content,
-        chapterTitle: plan.title,
-        knowledgeContext: knowledgeSummaries,
-        previousFactsSummary,
-        targetWords: targetWordsPerChapter,
-        language,
-        systemPrompt,
-        chapterNumber: plan.chapterNumber,
-        log,
-      }),
-      revise: ({ content, plan: chapterPlan, revisionBrief }) => runRalphRevision({
-        request,
-        userId,
-        signal: lifecycle.signal,
-        chapterContent: content,
-        chapterTitle: chapterPlan.title,
-        plan: chapterPlan,
-        novel,
-        revisionBrief,
-        language,
-        systemPrompt,
-        chapterNumber: chapterPlan.chapterNumber,
-        log,
-      }),
-      upsertChapter: (chapterNumber, title, content) =>
-        upsertChapter(novelId, chapterNumber, title, content),
-      updateChapterMeta: (chapterNumber, meta) =>
-        updateChapterMeta(novelId, chapterNumber, meta),
-      renewLock: () => lease.renew(),
-      emit: frame => sink.emit(frame),
-      isCancelled: () => lifecycle.isCancelled(),
-      isAborted: () => lifecycle.signal.aborted,
-      log,
+    const chapterDeps = buildChapterDeps(plan.title, plan.chapterNumber);
+    chapterDeps.createChapterUsage = async () => {
+      let chapterUsage: AIUsageSession;
+      try {
+        chapterUsage = await createAIUsageSession(request, {
+          userId,
+          operation: 'chapter',
+        });
+      } catch (error) {
+        const response = aiUsageErrorResponse(error);
+        const message = response
+          ? (await response.json().catch(() => ({})))?.error || 'AI usage error'
+          : sanitizeError(error, 'AI usage error');
+        throw new Error(message, { cause: error });
+      }
+      chapterUsage.addPromptText(systemPrompt);
+      chapterUsage.addPromptText(JSON.stringify(plan));
+      return chapterUsage;
     };
 
     const outcome = await writeChapter(chapterDeps, {
@@ -260,20 +402,28 @@ export async function executeWritingChapterBatch(args: {
     });
 
     if (outcome.status === 'aborted') {
+      // Register durable prose so the next resume repairs metadata instead of
+      // regenerating. Incomplete chapters never advance completedChapters.
+      if (outcome.savedChapter) {
+        existingByNumber.set(plan.chapterNumber, outcome.savedChapter);
+      }
       abortedReason = 'aborted';
       break;
     }
     if (outcome.status === 'lock_failed' || outcome.status === 'saved_failed') {
       if (outcome.savedChapter) {
-        completedChapters += 1;
-        writtenThisBatch += 1;
-        existingByNumber.set(plan.chapterNumber, outcome.savedChapter);
-        latestProgress = progressForCompleted(completedChapters);
-        await updateNovel(novelId, {
-          stage: 'autonomous_writing',
-          progress: latestProgress,
+        await registerSavedOutcome(plan.chapterNumber, outcome.savedChapter, {
+          countComplete: isChapterProcessingComplete(outcome.savedChapter),
         });
-        jobs.bumpProgress(plan.chapterNumber, ++seq);
+        if (isChapterProcessingComplete(outcome.savedChapter)) {
+          digestSources.push(toDigestSource(outcome.savedChapter));
+        } else {
+          // Persist progress bookmark without claiming chapter completion.
+          await updateNovel(novelId, {
+            stage: 'autonomous_writing',
+            progress: latestProgress,
+          });
+        }
       }
       errorMessage = outcome.errorMessage ?? (
         outcome.status === 'lock_failed'

@@ -150,7 +150,12 @@ export interface WriteChapterDeps {
   summarize: (input: { content: string; plan: ChapterBlueprint }) => Promise<SummarizeOutcome>;
   validate: (input: { content: string; previousFactsSummary: string }) => Promise<ValidateOutcome>;
   revise: (input: { content: string; plan: ChapterBlueprint; revisionBrief: string }) => Promise<ReviseOutcome>;
-  upsertChapter: (chapterNumber: number, title: string, content: string) => Promise<Chapter>;
+  upsertChapter: (
+    chapterNumber: number,
+    title: string,
+    content: string,
+    options?: { processingStatus?: 'content_saved' | 'complete' },
+  ) => Promise<Chapter>;
   updateChapterMeta: (
     chapterNumber: number,
     meta: {
@@ -158,6 +163,7 @@ export interface WriteChapterDeps {
       keyFacts: ChapterKeyFacts | null;
       qualityIssues: ChapterQualityIssue[] | null;
       generationMeta: ChapterGenerationMeta;
+      processingStatus?: 'content_saved' | 'complete';
     },
   ) => Promise<void>;
   /** Renew the writing lock; false ⇒ another session took over. */
@@ -411,9 +417,12 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
 
   // CRITICAL: record usage strictly AFTER the chapter content is persisted, so a
   // failed write can't bill tokens for a chapter the user never received.
+  // Persist as content_saved until post-processing metadata commits atomically.
   let savedChapter: Chapter;
   try {
-    savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent);
+    savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent, {
+      processingStatus: 'content_saved',
+    });
   } catch (error) {
     await failChapterUsageOnce();
     throw error;
@@ -449,6 +458,9 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
   const deferredPostChapterUsages: DeferredUsage[] = [];
   const failDeferredPostChapterUsages = async () => {
     await Promise.allSettled(deferredPostChapterUsages.map(u => u.failUsage()));
+  };
+  const cancelDeferredPostChapterUsages = async () => {
+    await Promise.allSettled(deferredPostChapterUsages.map(u => u.cancelUsage()));
   };
 
   let [summarizeOutcome, validateOutcome] = await Promise.allSettled([
@@ -555,7 +567,9 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
       if (summarizeOutcome.status === 'fulfilled') deferredPostChapterUsages.push(summarizeOutcome.value);
       if (validateOutcome.status === 'fulfilled') deferredPostChapterUsages.push(validateOutcome.value);
       try {
-        savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent);
+        savedChapter = await deps.upsertChapter(plan.chapterNumber, plan.title, chapterContent, {
+          processingStatus: 'content_saved',
+        });
       } catch (error) {
         await failDeferredPostChapterUsages();
         throw error;
@@ -581,13 +595,42 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
 
   chapterQualityIssues = ensureLengthIssue(chapterQualityIssues, actualWords, targetWordsPerChapter);
 
+  if (deps.isCancelled()) {
+    await cancelDeferredPostChapterUsages();
+    await cancelSettledUsages(summarizeOutcome, validateOutcome);
+    return buildOutcome('aborted', {
+      content: chapterContent,
+      actualWords,
+      qualityIssues: chapterQualityIssues,
+      generationMeta,
+      savedChapter,
+    });
+  }
+
+  // Summarize/validate (and a possible Ralph pass) may outlive the lease.
+  // Re-check immediately before the only transition to `complete`.
+  if (!(await deps.renewLock())) {
+    await failDeferredPostChapterUsages();
+    await failSettledUsages(summarizeOutcome, validateOutcome);
+    return buildOutcome('lock_failed', {
+      content: chapterContent,
+      actualWords,
+      qualityIssues: chapterQualityIssues,
+      generationMeta,
+      savedChapter,
+      errorMessage: 'Writing lock lost before completing chapter metadata.',
+    });
+  }
+
   try {
     await deps.updateChapterMeta(plan.chapterNumber, {
       summary: chapterSummary,
       keyFacts: chapterKeyFacts,
       qualityIssues: chapterQualityIssues,
       generationMeta,
+      processingStatus: 'complete',
     });
+    savedChapter = { ...savedChapter, processingStatus: 'complete', summary: chapterSummary, keyFacts: chapterKeyFacts, qualityIssues: chapterQualityIssues, generationMeta };
   } catch (error) {
     await failDeferredPostChapterUsages();
     await failSettledUsages(summarizeOutcome, validateOutcome);
@@ -609,6 +652,8 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
       failedUsageIndexes.map(index => usagesToSettle[index].failUsage()),
     );
     const firstFailure = usageSettlements[failedUsageIndexes[0]];
+    // Metadata + status=complete already committed — report the usage error
+    // without regressing completion.
     return {
       status: 'saved_failed',
       errorMessage: sanitizeError(
@@ -640,4 +685,153 @@ export async function writeChapter(deps: WriteChapterDeps, input: WriteChapterIn
     generationMeta,
     savedChapter,
   };
+}
+
+export interface CompleteSavedChapterInput {
+  plan: ChapterBlueprint;
+  savedChapter: Chapter;
+  targetWordsPerChapter: number;
+  language: Locale;
+  earlierDigest: string;
+  progress: number;
+}
+
+/**
+ * Finish post-processing for prose that is already durable as `content_saved`.
+ * Never regenerates or overwrites chapter content.
+ */
+export async function completeSavedChapterPostProcessing(
+  deps: Pick<
+    WriteChapterDeps,
+    'summarize' | 'validate' | 'updateChapterMeta' | 'renewLock' | 'emit' | 'isCancelled' | 'log'
+  >,
+  input: CompleteSavedChapterInput,
+): Promise<ChapterOutcome> {
+  const { plan, savedChapter, targetWordsPerChapter, language } = input;
+  const chapterContent = savedChapter.content;
+  const actualWords = countWords(chapterContent);
+  const generationMeta: ChapterGenerationMeta = savedChapter.generationMeta ?? {
+    targetWords: targetWordsPerChapter,
+    actualWords,
+    attempts: 1,
+    modelId: 'resume-repair',
+    generatedAt: new Date().toISOString(),
+  };
+  generationMeta.actualWords = actualWords;
+
+  const buildOutcome = (status: ChapterOutcomeStatus, over: Partial<ChapterOutcome> = {}): ChapterOutcome => ({
+    status,
+    errorMessage: null,
+    content: chapterContent,
+    actualWords,
+    attempts: generationMeta.attempts ?? 1,
+    qualityIssues: savedChapter.qualityIssues,
+    ralphRevisions: 0,
+    summary: savedChapter.summary || chapterContent.slice(-600).trim(),
+    keyFacts: savedChapter.keyFacts,
+    generationMeta,
+    savedChapter,
+    ...over,
+  });
+
+  if (!(await deps.renewLock())) {
+    return buildOutcome('lock_failed', {
+      errorMessage: 'Writing lock lost before repairing chapter metadata.',
+    });
+  }
+
+  const [summarizeOutcome, validateOutcome] = await Promise.allSettled([
+    deps.summarize({ content: chapterContent, plan }),
+    deps.validate({ content: chapterContent, previousFactsSummary: input.earlierDigest }),
+  ]);
+
+  if (deps.isCancelled()) {
+    await cancelSettledUsages(summarizeOutcome, validateOutcome);
+    return buildOutcome('aborted');
+  }
+
+  let chapterQualityIssues: ChapterQualityIssue[] | null =
+    validateOutcome.status === 'fulfilled' ? validateOutcome.value.issues : null;
+  chapterQualityIssues = ensureLengthIssue(chapterQualityIssues, actualWords, targetWordsPerChapter);
+  const chapterSummary = summarizeOutcome.status === 'fulfilled'
+    ? summarizeOutcome.value.summary
+    : chapterContent.slice(-600).trim();
+  const chapterKeyFacts = summarizeOutcome.status === 'fulfilled'
+    ? summarizeOutcome.value.keyFacts
+    : null;
+
+  // The repair work itself may take longer than the lease. Never let an old
+  // writer finalize metadata after another session has taken ownership.
+  if (!(await deps.renewLock())) {
+    await failSettledUsages(summarizeOutcome, validateOutcome);
+    return buildOutcome('lock_failed', {
+      errorMessage: 'Writing lock lost before completing repaired chapter metadata.',
+    });
+  }
+
+  try {
+    await deps.updateChapterMeta(plan.chapterNumber, {
+      summary: chapterSummary,
+      keyFacts: chapterKeyFacts,
+      qualityIssues: chapterQualityIssues,
+      generationMeta,
+      processingStatus: 'complete',
+    });
+  } catch (error) {
+    await failSettledUsages(summarizeOutcome, validateOutcome);
+    throw error;
+  }
+
+  const usagesToSettle = [
+    ...(summarizeOutcome.status === 'fulfilled' ? [summarizeOutcome.value] : []),
+    ...(validateOutcome.status === 'fulfilled' ? [validateOutcome.value] : []),
+  ];
+  const usageSettlements = await Promise.allSettled(
+    usagesToSettle.map(usage => usage.recordUsage()),
+  );
+  const failedUsageIndexes = usageSettlements.flatMap((settlement, index) =>
+    settlement.status === 'rejected' ? [index] : [],
+  );
+  const completedChapter: Chapter = {
+    ...savedChapter,
+    summary: chapterSummary,
+    keyFacts: chapterKeyFacts,
+    qualityIssues: chapterQualityIssues,
+    generationMeta,
+    processingStatus: 'complete',
+  };
+
+  if (failedUsageIndexes.length > 0) {
+    await Promise.allSettled(
+      failedUsageIndexes.map(index => usagesToSettle[index].failUsage()),
+    );
+    const firstFailure = usageSettlements[failedUsageIndexes[0]];
+    return buildOutcome('saved_failed', {
+      errorMessage: sanitizeError(
+        firstFailure.status === 'rejected' ? firstFailure.reason : null,
+        'Chapter metadata was repaired, but usage settlement failed.',
+      ),
+      qualityIssues: chapterQualityIssues,
+      summary: chapterSummary,
+      keyFacts: chapterKeyFacts,
+      generationMeta,
+      savedChapter: completedChapter,
+    });
+  }
+
+  deps.emit({
+    type: 'progress',
+    progress: input.progress,
+    message: isZhLocale(language)
+      ? `已补全第 ${plan.chapterNumber} 章元数据`
+      : `Repaired Chapter ${plan.chapterNumber} metadata`,
+  });
+
+  return buildOutcome('written', {
+    qualityIssues: chapterQualityIssues,
+    summary: chapterSummary,
+    keyFacts: chapterKeyFacts,
+    generationMeta,
+    savedChapter: completedChapter,
+  });
 }

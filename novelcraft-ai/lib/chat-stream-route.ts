@@ -10,6 +10,10 @@ export interface ChatTurnPersistence {
   persistUser(id: string): Promise<Message>;
   persistAssistant(id: string, text: string): Promise<Message>;
   persistStoppedAssistant?(id: string, text: string): Promise<Message | null>;
+  /** Durable turn receipt: provider error while still running. */
+  markFailed?(): Promise<void>;
+  /** Durable turn receipt: aborted without a persisted assistant reply. */
+  markCancelled?(): Promise<void>;
 }
 
 export interface StreamChatTurnArgs {
@@ -72,23 +76,50 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
         aiUsage.addPartialOutput(text);
         if (lifecycle.isCancelled()) {
           await usage.cancelOnce(modelUsage);
+          if (!text.trim()) {
+            await persistence.markCancelled?.().catch((error) => {
+              console.error('Failed to mark cancelled chat turn:', error);
+            });
+          }
           return;
         }
         if (text.trim()) {
           assistantMessage = await persistence.persistAssistant(responseMessageId, text);
+        } else {
+          await persistence.markFailed?.().catch((error) => {
+            console.error('Failed to mark empty-provider chat turn failed:', error);
+          });
         }
         await usage.recordOnce(modelUsage, finishReason);
       },
       onError: async () => {
-        if (lifecycle.isCancelled()) await usage.cancelOnce();
-        else await usage.failOnce();
+        if (lifecycle.isCancelled()) {
+          await usage.cancelOnce();
+          await persistence.markCancelled?.().catch((error) => {
+            console.error('Failed to mark cancelled chat turn:', error);
+          });
+        } else {
+          await usage.failOnce();
+          await persistence.markFailed?.().catch((error) => {
+            console.error('Failed to mark failed chat turn:', error);
+          });
+        }
       },
     });
   } catch (error) {
     const wasCancelled = lifecycle.isCancelled();
     lifecycle.cancel();
-    if (wasCancelled) await usage.cancelOnce();
-    else await usage.failOnce();
+    if (wasCancelled) {
+      await usage.cancelOnce();
+      await persistence.markCancelled?.().catch((markError) => {
+        console.error('Failed to mark cancelled chat turn:', markError);
+      });
+    } else {
+      await usage.failOnce();
+      await persistence.markFailed?.().catch((markError) => {
+        console.error('Failed to mark failed chat turn:', markError);
+      });
+    }
     throw error;
   }
 
@@ -112,9 +143,18 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
     onFinish: async ({ responseMessage, isAborted }) => {
       if (!isAborted) return;
       await usage.cancelOnce();
-      await persistStoppedAssistantOnce(getUIMessageText(responseMessage)).catch((error) => {
+      const stoppedText = getUIMessageText(responseMessage);
+      try {
+        await persistStoppedAssistantOnce(stoppedText);
+        if (!stoppedText.trim()) {
+          await persistence.markCancelled?.();
+        }
+      } catch (error) {
         console.error('Failed to persist stopped assistant message:', error);
-      });
+        await persistence.markCancelled?.().catch((markError) => {
+          console.error('Failed to mark cancelled chat turn:', markError);
+        });
+      }
     },
     // Required by AI SDK abort handling: tee + independently consume the SSE
     // stream so onFinish({ isAborted: true }) still runs after the client Stop

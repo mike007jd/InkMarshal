@@ -1,19 +1,14 @@
-// Manuscript-import domain types (W2-1).
+// Manuscript-import domain types.
 //
-// The import pipeline is staged and deterministic:
-//   1. A native file pick yields raw bytes (base64) — see desktop-runtime
-//      `readLocalFile(['txt','md','docx'])`.
-//   2. A parser (`parse-text` / `parse-docx`) turns those bytes into a
-//      `RawDocument`: a flat ordered list of structural blocks (heading levels
-//      + paragraphs) plus the detected source kind.
-//   3. `detect-chapters` runs a PURE, AI-free heuristic over the blocks to
-//      produce `ChapterCandidate[]` — the volume/chapter tree the user previews
-//      and hand-corrects before anything is written.
-//   4. The corrected candidates become an `ImportPlan` the server action
-//      transacts into a new (or existing) novel.
-//
-// No type here imports DB, native, or AI modules — keep this storage-adapter
-// neutral so the pure detector + dedupe stay trivially unit-testable.
+// Opaque session pipeline:
+//   1. Native `stageManuscriptImport` copies the picked file under
+//      `import-sessions/{token}/` and returns only `{ token, basename }`.
+//   2. Node opens the session: parses the staged file, retains full prose
+//      server-side, and returns bounded preview snippets + stable segment ids.
+//   3. The client corrects boundaries via rename / merge-adjacent /
+//      split-at-paragraph while tracking compact `parts` references.
+//   4. Confirm sends only compact metadata/parts/dedupe decisions; the server
+//      reconstructs exact prose and writes atomically.
 
 export type ImportSource = 'txt' | 'md' | 'docx';
 
@@ -45,9 +40,8 @@ export interface RawDocument {
 }
 
 /**
- * A single detected chapter, ready for preview + correction. `volumeTitle` is
- * the nearest preceding volume heading (null for chapters before any volume).
- * `content` is the joined body prose (paragraphs separated by a blank line).
+ * A single detected chapter with full prose (server-side only after open).
+ * Never returned to the client in the opaque session pipeline.
  */
 export interface ChapterCandidate {
   /** Stable per-detection id so the preview editor can key/track rows across
@@ -62,6 +56,41 @@ export interface ChapterCandidate {
   /** True when the chapter boundary came from an inferred (non-style) heading —
    *  drives the "auto-detected, please verify" affordance in the preview. */
   inferred: boolean;
+}
+
+/** Contiguous coverage of one stored segment's paragraphs (half-open range). */
+export interface ImportChapterPart {
+  segmentId: string;
+  /** Inclusive start paragraph index (0-based). */
+  fromParagraph: number;
+  /** Exclusive end paragraph index. */
+  toParagraph: number;
+}
+
+/**
+ * Client-facing chapter preview. Full prose stays server-side; the UI edits
+ * titles / boundaries while retaining `parts` for exact reconstruction.
+ */
+export interface ImportPreviewChapter {
+  /** Stable UI row id (may be regenerated on renumber; parts are authoritative). */
+  id: string;
+  chapterNumber: number;
+  title: string;
+  volumeTitle: string | null;
+  wordCount: number;
+  inferred: boolean;
+  /** Bounded body preview (not full prose). */
+  snippet: string;
+  /** Bounded per-paragraph snippets for split-at-paragraph. */
+  paragraphs: string[];
+  /** Exact reconstruction references into the server-side segment store. */
+  parts: ImportChapterPart[];
+}
+
+/** Compact chapter descriptor sent on confirm / dedupe (no prose). */
+export interface ImportChapterRef {
+  title: string;
+  parts: ImportChapterPart[];
 }
 
 /** Per-chapter merge decision the user makes after dedupe flags a collision. */
@@ -97,18 +126,7 @@ export interface ExistingChapterRef {
   content: string;
 }
 
-/**
- * The fully-corrected import payload the wizard sends to the server action. The
- * server never re-detects — the candidate list IS the source of truth, so a
- * user's manual boundary fixes are never silently overridden.
- */
-export interface ImportPlan {
-  source: ImportSource;
-  filename: string;
-  novelTitle: string;
-  chapters: ImportPlanChapter[];
-}
-
+/** Internal reconstruction shape after the server expands compact refs to prose. */
 export interface ImportPlanChapter {
   chapterNumber: number;
   title: string;

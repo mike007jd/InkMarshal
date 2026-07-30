@@ -22,6 +22,7 @@ mod engine;
 mod health;
 mod http_util;
 mod inkmarshal_home;
+mod manuscript_import;
 mod metadata_db;
 mod model_manager;
 mod secret;
@@ -1436,6 +1437,7 @@ pub fn run() {
             save_export_file,
             reveal_export_file,
             read_local_file,
+            manuscript_import::stage_manuscript_import,
             secret::keychain_set,
             secret::keychain_get,
             secret::keychain_delete,

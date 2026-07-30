@@ -73,6 +73,36 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at      TEXT NOT NULL
 );
 
+-- Durable ordinary-chat turn receipt: one provider execution per
+-- (novel_id, user_message_id); retries replay or fail closed on collision.
+CREATE TABLE IF NOT EXISTS chat_turns (
+  novel_id              TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  user_message_id       TEXT NOT NULL,
+  request_hash          TEXT NOT NULL,
+  assistant_message_id  TEXT NOT NULL,
+  status                TEXT NOT NULL
+                        CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
+  brainstorm_receipt_id TEXT,
+  response_text         TEXT,
+  error_code            TEXT,
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  PRIMARY KEY (novel_id, user_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_turn_tool_snapshots (
+  novel_id        TEXT NOT NULL,
+  user_message_id TEXT NOT NULL,
+  tool_key        TEXT NOT NULL,
+  snapshot_key    TEXT NOT NULL,
+  payload         TEXT NOT NULL,
+  payload_sha256  TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (novel_id, user_message_id, tool_key, snapshot_key),
+  FOREIGN KEY (novel_id, user_message_id)
+    REFERENCES chat_turns(novel_id, user_message_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS chapters (
   id                TEXT PRIMARY KEY,
   novel_id          TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
@@ -90,6 +120,10 @@ CREATE TABLE IF NOT EXISTS chapters (
   generation_meta   TEXT,
   generation_meta_v INTEGER DEFAULT NULL,
   snapshots         TEXT DEFAULT NULL,
+  -- Durable chapter lifecycle: AI prose lands as content_saved until
+  -- post-processing metadata is committed; manual/import defaults to complete.
+  processing_status TEXT NOT NULL DEFAULT 'complete'
+                    CHECK (processing_status IN ('content_saved', 'complete')),
   created_at        TEXT NOT NULL,
   UNIQUE(novel_id, chapter_number)
 );
@@ -270,6 +304,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_relations_target ON knowledge_relations
 CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_relations_unique
   ON knowledge_relations(source_id, target_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_messages_novel_id ON messages(novel_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_turns_novel_status ON chat_turns(novel_id, status);
 CREATE INDEX IF NOT EXISTS idx_novels_series ON novels(series_id);
 CREATE INDEX IF NOT EXISTS idx_novels_updated_at ON novels(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_novels_user_id ON novels(user_id);

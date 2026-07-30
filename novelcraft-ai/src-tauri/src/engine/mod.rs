@@ -109,8 +109,8 @@ pub use registry::{stop_all, EngineRegistry};
 #[cfg(test)]
 mod tests {
     use super::budget::{
-        admit_engine, budget_available_bytes, estimate_footprint_inner,
-        normalize_engine_model_path_for_match, validate_engine_model_path,
+        admit_engine, admit_estimated_footprint, budget_available_bytes, estimate_footprint_inner,
+        footprint_for_admission, normalize_engine_model_path_for_match, validate_engine_model_path,
         GGUF_FOOTPRINT_MULTIPLIER, MLX_FOOTPRINT_MULTIPLIER, RESERVED_FOR_OS_BYTES,
     };
     use super::log::{
@@ -175,15 +175,58 @@ mod tests {
     }
 
     #[test]
-    fn admit_rejects_impossible_footprint_and_admits_zero() {
+    fn admit_rejects_impossible_footprint_and_admits_measured_zero() {
         let registry = EngineRegistry::default();
         // Larger than any machine's RAM → rejected with the structured error.
         let err = admit_engine(&registry, u64::MAX, "fmt:/m/huge.gguf")
             .err()
             .expect("over-budget start rejected");
         assert!(err.starts_with("ENGINE_BUDGET_EXCEEDED:"), "got: {err}");
-        // A footprint of 0 (unmeasurable model) is always admitted.
+        // A genuinely measured footprint of 0 is always admitted.
         assert!(admit_engine(&registry, 0, "fmt:/m/zero.gguf").is_ok());
+    }
+
+    #[test]
+    fn footprint_for_admission_keeps_measured_zero() {
+        let tmp = unique_tmp("measured-zero-gguf");
+        let file = tmp.join("empty.gguf");
+        fs::write(&file, b"").expect("write empty gguf");
+        let footprint =
+            footprint_for_admission(&file, EngineFormat::Gguf).expect("measured zero ok");
+        assert_eq!(footprint, 0);
+        let registry = EngineRegistry::default();
+        let (_bytes, _guard) =
+            admit_estimated_footprint(&registry, &file, EngineFormat::Gguf, "fmt:/m/empty.gguf")
+                .expect("measured zero admitted");
+        assert_eq!(registry.1.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn estimate_failure_is_footprint_unknown_without_admission() {
+        let registry = EngineRegistry::default();
+        let missing = PathBuf::from("/no/such/inkmarshal-model/does-not-exist.gguf");
+        let err = admit_estimated_footprint(
+            &registry,
+            &missing,
+            EngineFormat::Gguf,
+            "fmt:/m/missing.gguf",
+        )
+        .err()
+        .expect("estimate failure must fail closed");
+        assert!(err.starts_with("ENGINE_FOOTPRINT_UNKNOWN:"), "got: {err}");
+        let json = &err["ENGINE_FOOTPRINT_UNKNOWN:".len()..];
+        let payload: serde_json::Value =
+            serde_json::from_str(json).expect("ENGINE_FOOTPRINT_UNKNOWN payload must be JSON");
+        let reason = payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .expect("reason field");
+        assert!(!reason.is_empty(), "safe reason must be retained");
+        assert!(
+            registry.1.lock().unwrap().is_empty(),
+            "must not reserve when footprint is unknown"
+        );
     }
 
     #[test]

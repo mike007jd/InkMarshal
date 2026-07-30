@@ -7,6 +7,10 @@ import path from 'node:path';
 import process from 'node:process';
 import Database from 'better-sqlite3';
 import { sql as currentSchemaSql } from '../lib/db/schema/0001_initial.ts';
+import {
+  CURRENT_SCHEMA_DESCRIPTION,
+  CURRENT_SCHEMA_VERSION,
+} from '../lib/db/schema/version.ts';
 
 const root = process.cwd();
 const dataDir = mkdtempSync(path.join(tmpdir(), 'inkmarshal-full-novel-qa-'));
@@ -31,9 +35,9 @@ function initializeCurrentDatabase() {
       'CREATE TABLE _schema_version (version INTEGER NOT NULL, description TEXT NOT NULL, applied_at TEXT NOT NULL)',
     );
     db.prepare(
-      'INSERT INTO _schema_version (version, description, applied_at) VALUES (19, ?, ?)',
-    ).run('current_epoch_v19', now);
-    db.pragma('user_version = 19');
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+    ).run(CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION, now);
+    db.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
   });
   try {
     tx();
