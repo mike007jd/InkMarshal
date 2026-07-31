@@ -754,6 +754,13 @@ export const zhTW = {
   updateProgress: '正在安裝更新… {progress}%',
   updateLater: '稍後提醒',
   updateInstallFailed: '暫時無法安裝更新。你可以繼續寫作，稍後再試。',
+  updateInstallCorruptPackage:
+    '下載的更新包無法安裝。你的文稿仍安全——請改用已驗證的安裝包。',
+  updateInstallNetworkFailed: '無法完成更新下載。請檢查網路後重試。',
+  updateInstallPermissionFailed:
+    '無法替換已安裝的應用程式。請退出其他 InkMarshal 執行個體後重試，或使用已驗證的安裝包。',
+  updateVerifiedDmgRecoveryHint: '建議改用已驗證的 Apple Silicon 安裝包：',
+  updateDownloadVerifiedDmg: '下載已驗證 DMG',
   updateSaveFailed: '最新編輯尚未儲存，InkMarshal 已取消重新啟動。',
   automaticUpdateCheckTitle: '自動檢查更新',
   automaticUpdateCheckDescription: 'InkMarshal 啟動後會透過 GitHub 檢查新版本。關閉後仍可隨時手動檢查。',

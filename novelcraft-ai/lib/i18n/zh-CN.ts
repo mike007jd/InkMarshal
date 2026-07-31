@@ -754,6 +754,13 @@ export const zhCN = {
   updateProgress: '正在安装更新… {progress}%',
   updateLater: '稍后提醒',
   updateInstallFailed: '暂时无法安装更新。你可以继续写作，稍后再试。',
+  updateInstallCorruptPackage:
+    '下载的更新包无法安装。你的文稿仍安全——请改用已验证的安装包。',
+  updateInstallNetworkFailed: '无法完成更新下载。请检查网络后重试。',
+  updateInstallPermissionFailed:
+    '无法替换已安装的应用。请退出其他 InkMarshal 实例后重试，或使用已验证的安装包。',
+  updateVerifiedDmgRecoveryHint: '建议改用已验证的 Apple Silicon 安装包：',
+  updateDownloadVerifiedDmg: '下载已验证 DMG',
   updateSaveFailed: '最新编辑尚未保存，InkMarshal 已取消重启。',
   automaticUpdateCheckTitle: '自动检查更新',
   automaticUpdateCheckDescription: 'InkMarshal 启动后会通过 GitHub 检查新版本。关闭后仍可随时手动检查。',

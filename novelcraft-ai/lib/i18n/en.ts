@@ -754,6 +754,14 @@ export const en = {
   updateProgress: 'Installing update… {progress}%',
   updateLater: 'Remind me later',
   updateInstallFailed: 'The update could not be installed. Keep writing and try again later.',
+  updateInstallCorruptPackage:
+    'The downloaded update package could not be installed. Your writing is safe — download the verified installer instead.',
+  updateInstallNetworkFailed:
+    'InkMarshal could not finish downloading the update. Check your connection, then try again.',
+  updateInstallPermissionFailed:
+    'InkMarshal could not replace the installed app. Quit other copies, then try again or use the verified installer.',
+  updateVerifiedDmgRecoveryHint: 'Prefer the verified Apple Silicon installer:',
+  updateDownloadVerifiedDmg: 'Download verified DMG',
   updateSaveFailed: 'Your latest edit could not be saved, so InkMarshal did not restart.',
   automaticUpdateCheckTitle: 'Automatically check for updates',
   automaticUpdateCheckDescription: 'Checks GitHub shortly after InkMarshal starts. You can still check manually when this is off.',

@@ -91,6 +91,13 @@ describe('desktop runtime command contract', () => {
     expect(
       normalizeAllowedExternalUrl('https://github.com/mike007jd/InkMarshal/issues/new?template=bug'),
     ).toBe('https://github.com/mike007jd/InkMarshal/issues/new');
+    expect(
+      normalizeAllowedExternalUrl(
+        'https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg',
+      ),
+    ).toBe(
+      'https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg',
+    );
 
     expect(() => normalizeAllowedExternalUrl('http://github.com/mike007jd/InkMarshal')).toThrow(
       'HTTPS',
@@ -116,6 +123,11 @@ describe('desktop runtime command contract', () => {
     expect(scoped.test('https://github.com/mike007jd/InkMarshal/')).toBe(true);
     expect(scoped.test('https://github.com/mike007jd/InkMarshal/issues/new')).toBe(true);
     expect(scoped.test('https://github.com/mike007jd/InkMarshal/issues/new/')).toBe(true);
+    expect(
+      scoped.test(
+        'https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg',
+      ),
+    ).toBe(true);
     expect(scoped.test('https://github.com/mike007jd/InkMarshal/issues/new?template=bug')).toBe(false);
     expect(scoped.test('http://github.com/mike007jd/InkMarshal')).toBe(false);
     expect(scoped.test('https://github.com/other/repo')).toBe(false);

@@ -512,6 +512,7 @@ export async function stopOthersForPath(modelPath: string): Promise<number> {
 const ALLOWED_EXTERNAL_URLS = new Set([
   'https://github.com/mike007jd/InkMarshal',
   'https://github.com/mike007jd/InkMarshal/issues/new',
+  'https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg',
 ]);
 
 export function normalizeAllowedExternalUrl(url: string): string {

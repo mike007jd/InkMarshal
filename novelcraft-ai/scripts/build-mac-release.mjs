@@ -24,6 +24,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createMacDmg } from './mac-dmg.mjs';
+import { assertUpdaterArchiveClean } from './verify-updater-archive.mjs';
 
 const STABLE_DMG_NAME = 'InkMarshal-mac-aarch64.dmg';
 const STABLE_SHA_NAME = `${STABLE_DMG_NAME}.sha256`;
@@ -628,13 +629,18 @@ function publishStableReleaseAssets({
   }
 }
 
-function createSignedUpdaterAssets(appPath, archivePath, updaterKeyPath) {
+async function createSignedUpdaterAssets(appPath, archivePath, updaterKeyPath) {
   mkdirSync(dirname(archivePath), { recursive: true });
   rmSync(archivePath, { force: true });
   rmSync(`${archivePath}.sig`, { force: true });
   // Tauri's macOS updater consumes a gzip-compressed tar containing the final
   // signed .app. Create it only after deep-signing, notarizing and stapling.
-  runCapture('/usr/bin/tar', ['-czf', archivePath, '-C', dirname(appPath), basename(appPath)]);
+  // COPYFILE_DISABLE prevents AppleDouble (`._*`) members that break Tauri's
+  // skip(1) unpack into tauri_updated_app*; default bsdtar listings hide them.
+  runCapture('/usr/bin/tar', ['-czf', archivePath, '-C', dirname(appPath), basename(appPath)], {
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
+  });
+  await assertUpdaterArchiveClean(archivePath);
   const signerArgs = ['tauri', 'signer', 'sign', '--private-key-path', updaterKeyPath];
   const updaterPassword = readEnv('TAURI_SIGNING_PRIVATE_KEY_PASSWORD');
   // Always pass the password argument, including an empty password. Otherwise
@@ -748,7 +754,7 @@ stapleArtifact(appPath);
 // The updater archive must capture the final signed/stapled app. Signing an
 // earlier archive would make the published update differ from the verified app.
 const producedUpdaterPath = join(releaseDir, `${UPDATER_ARCHIVE_NAME}.produced`);
-const producedUpdaterSignaturePath = createSignedUpdaterAssets(appPath, producedUpdaterPath, updaterKeyPath);
+const producedUpdaterSignaturePath = await createSignedUpdaterAssets(appPath, producedUpdaterPath, updaterKeyPath);
 const producedManifestPath = join(releaseDir, `${UPDATE_MANIFEST_NAME}.produced`);
 writeUpdateManifest(producedManifestPath, producedUpdaterSignaturePath);
 
