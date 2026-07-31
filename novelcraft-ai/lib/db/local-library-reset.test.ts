@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -18,6 +19,12 @@ import {
   clearLocalLibraryContent,
   resetLocalLibrary,
 } from '@/lib/db/local-library-reset';
+import {
+  __libraryResetIntentTest,
+  createLibraryResetIntent,
+  markLibraryResetIntentCommitted,
+  reconcileInterruptedLocalLibraryResets,
+} from '@/lib/db/local-library-reset-intent';
 import { CURRENT_SCHEMA_VERSION } from '@/lib/db/schema';
 
 const previousDataDir = process.env.INKMARSHAL_DATA_DIR;
@@ -34,6 +41,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __localLibraryResetTest.afterArtifactQuarantined = null;
   __localLibraryResetTest.afterArtifactsQuarantined = null;
   closeDbForTest();
   if (previousDataDir === undefined) delete process.env.INKMARSHAL_DATA_DIR;
@@ -216,5 +224,91 @@ describe('local library reset', () => {
       .toEqual({ id: 'novel-keep' });
     expect(restored.prepare('SELECT value FROM app_settings WHERE key = ?').get('inkmarshal_settings'))
       .toEqual({ value: '{"theme":"restore-me"}' });
+  });
+
+  it('keeps the original library when artifact quarantine itself fails partway through', () => {
+    const live = getDb();
+    const now = new Date().toISOString();
+    live.prepare('INSERT INTO novels (id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .run('novel-partial-rename', 'local-user', now, now);
+    closeDbForTest();
+    const originalDb = readFileSync(dbPath());
+    __localLibraryResetTest.afterArtifactQuarantined = () => {
+      throw new Error('forced artifact quarantine failure');
+    };
+
+    expect(() => resetLocalLibrary()).toThrow('forced artifact quarantine failure');
+
+    expect(readFileSync(dbPath())).toEqual(originalDb);
+    expect(readdirSync(dataDir).some(name => name.startsWith('.library-reset-'))).toBe(false);
+    expect(getDb().prepare('SELECT id FROM novels WHERE id = ?').get('novel-partial-rename'))
+      .toEqual({ id: 'novel-partial-rename' });
+  });
+
+  it('restores a prepared reset intent after a crash before replacement commit', () => {
+    writeFileSync(dbPath(), 'old-library-bytes');
+    const declaredQuarantine = path.join(dataDir, '.library-reset-test-inkmarshal.db');
+    const intentPath = createLibraryResetIntent(dataDir, [{
+      source: dbPath(),
+      quarantine: declaredQuarantine,
+      sourceName: 'inkmarshal.db',
+      quarantineName: '.library-reset-test-inkmarshal.db',
+    }]);
+    renameSync(dbPath(), declaredQuarantine);
+    writeFileSync(`${dbPath()}-wal`, 'new-wal');
+    writeFileSync(`${dbPath()}-shm`, 'new-shm');
+    writeFileSync(`${dbPath()}-journal`, 'new-journal');
+    __libraryResetIntentTest.forgetActiveIntent(intentPath);
+
+    reconcileInterruptedLocalLibraryResets(dataDir);
+
+    expect(readFileSync(dbPath(), 'utf8')).toBe('old-library-bytes');
+    expect(existsSync(`${dbPath()}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath()}-shm`)).toBe(false);
+    expect(existsSync(`${dbPath()}-journal`)).toBe(false);
+    expect(existsSync(declaredQuarantine)).toBe(false);
+    expect(existsSync(intentPath)).toBe(false);
+  });
+
+  it('finishes a committed reset intent after a crash before quarantine discard', () => {
+    writeFileSync(dbPath(), 'old-library-bytes');
+    const declaredQuarantine = path.join(dataDir, '.library-reset-test-inkmarshal.db');
+    const intentPath = createLibraryResetIntent(dataDir, [{
+      source: dbPath(),
+      quarantine: declaredQuarantine,
+      sourceName: 'inkmarshal.db',
+      quarantineName: '.library-reset-test-inkmarshal.db',
+    }]);
+    renameSync(dbPath(), declaredQuarantine);
+    writeFileSync(dbPath(), 'new-library-bytes');
+    markLibraryResetIntentCommitted(intentPath);
+    __libraryResetIntentTest.forgetActiveIntent(intentPath);
+
+    reconcileInterruptedLocalLibraryResets(dataDir);
+
+    expect(readFileSync(dbPath(), 'utf8')).toBe('new-library-bytes');
+    expect(existsSync(declaredQuarantine)).toBe(false);
+    expect(existsSync(intentPath)).toBe(false);
+  });
+
+  it('refuses to open a fresh database over an unreadable reset intent', () => {
+    writeFileSync(path.join(dataDir, '.library-reset-intent-broken.json'), '{not-json');
+
+    expect(() => getDb()).toThrow(/invalid interrupted library reset intent/i);
+    expect(existsSync(dbPath())).toBe(false);
+  });
+
+  it('refuses to create a database when a prepared reset lost both artifact copies', () => {
+    const intentPath = createLibraryResetIntent(dataDir, [{
+      source: dbPath(),
+      quarantine: path.join(dataDir, '.library-reset-missing-inkmarshal.db'),
+      sourceName: 'inkmarshal.db',
+      quarantineName: '.library-reset-missing-inkmarshal.db',
+    }]);
+    __libraryResetIntentTest.forgetActiveIntent(intentPath);
+
+    expect(() => getDb()).toThrow(/could not restore an interrupted local library reset/i);
+    expect(existsSync(dbPath())).toBe(false);
+    expect(existsSync(intentPath)).toBe(true);
   });
 });

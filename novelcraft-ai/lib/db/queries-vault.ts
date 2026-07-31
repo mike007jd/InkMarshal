@@ -7,6 +7,9 @@
 // module. That way W2-C can swap recall to read `knowledge_index` without
 // having to refactor anything else.
 
+import path from 'node:path';
+import { realpathSync } from 'node:fs';
+
 import { getDb } from '@/lib/db/connection';
 import { touchNovelUpdatedAt } from '@/lib/db/transactions';
 import type { NovelVaultRow, VaultIndexRow } from '@/lib/vault/types';
@@ -21,6 +24,31 @@ export async function getNovelVault(novelId: string): Promise<NovelVaultRow | nu
     vaultPath: row.vault_path,
     vaultVersion: row.vault_version,
   };
+}
+
+export async function isVaultPathReferencedElsewhere(
+  novelId: string,
+  vaultPath: string,
+): Promise<boolean> {
+  const normalize = (value: string) => {
+    const resolved = path.resolve(value);
+    try {
+      return realpathSync(resolved);
+    } catch {
+      try {
+        return path.join(realpathSync(path.dirname(resolved)), path.basename(resolved));
+      } catch {
+        return resolved;
+      }
+    }
+  };
+  const target = normalize(vaultPath);
+  const rows = getDb().prepare(
+    `SELECT vault_path FROM novels WHERE id <> ? AND vault_path IS NOT NULL
+     UNION ALL
+     SELECT vault_path FROM series WHERE vault_path IS NOT NULL`,
+  ).all(novelId) as Array<{ vault_path: string }>;
+  return rows.some(row => normalize(row.vault_path) === target);
 }
 
 export async function setNovelVaultPath(

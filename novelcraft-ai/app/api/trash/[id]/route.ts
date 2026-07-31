@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 import { deleteTrashedNovelPermanently } from '@/lib/db';
-import { getNovelVault } from '@/lib/db/queries-vault';
+import { getNovelVault, isVaultPathReferencedElsewhere } from '@/lib/db/queries-vault';
 import { requireTrashedNovelOwner } from '@/lib/local-auth';
 import {
   discardAppOwnedVaultQuarantine,
@@ -19,7 +19,12 @@ export async function DELETE(
   const ownerCheck = await requireTrashedNovelOwner(id);
   if (ownerCheck instanceof NextResponse) return ownerCheck;
   const vault = await getNovelVault(id);
-  const vaultQuarantine = quarantineAppOwnedNovelVault(vault?.vaultPath);
+  const sharedVault = vault?.vaultPath
+    ? await isVaultPathReferencedElsewhere(id, vault.vaultPath)
+    : false;
+  const vaultQuarantine = sharedVault
+    ? null
+    : quarantineAppOwnedNovelVault(vault?.vaultPath, id);
   let deleted = false;
   try {
     deleted = await deleteTrashedNovelPermanently(id, ownerCheck.user.id);

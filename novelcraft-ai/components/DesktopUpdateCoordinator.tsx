@@ -81,16 +81,24 @@ export function DesktopUpdateCoordinator() {
           return;
         }
         if (result === null) {
+          const previous = updateRef.current;
+          updateRef.current = null;
+          updateGenerationRef.current += 1;
+          installSessionRef.current = { downloaded: false, installed: false };
+          setUpdate(null);
+          setError(null);
+          setShowVerifiedDmgRecovery(false);
+          if (previous) await previous.close().catch(() => undefined);
           if (source === 'manual') publishDesktopUpdateCheckResult('up-to-date');
           return;
         }
         const previous = updateRef.current;
-        if (previous && previous !== result) await previous.close().catch(() => undefined);
         updateGenerationRef.current += 1;
         installSessionRef.current = { downloaded: false, installed: false };
         setCritical(isCriticalDesktopUpdate(result));
         updateRef.current = result;
         setUpdate(result);
+        if (previous && previous !== result) await previous.close().catch(() => undefined);
         if (source === 'manual') publishDesktopUpdateCheckResult('update-available');
       } catch {
         // Startup checks remain silent so a temporary network failure never
@@ -132,7 +140,12 @@ export function DesktopUpdateCoordinator() {
   }, [update]);
 
   const install = useCallback(async () => {
-    if (!update || installingRef.current) return;
+    if (
+      !update
+      || installingRef.current
+      || checkingRef.current
+      || updateRef.current !== update
+    ) return;
     installingRef.current = true;
     setInstalling(true);
     setError(null);
