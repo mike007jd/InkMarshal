@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   VERIFIED_MAC_DMG_DOWNLOAD_URL,
+  canReplaceDesktopUpdateResource,
   categorizeDesktopUpdateFailure,
   desktopUpdateFailureMessage,
   installDesktopUpdate,
+  shouldDeferDesktopUpdateCheck,
 } from '@/lib/desktop-update-install';
 
 const t = {
@@ -14,6 +16,32 @@ const t = {
   updateInstallPermissionFailed: 'permission-failure',
   updateSaveFailed: 'save-failed',
 };
+
+describe('desktop update check/install exclusion', () => {
+  it('defers checks while another check or install is active', () => {
+    expect(shouldDeferDesktopUpdateCheck({ checking: false, installing: false })).toBe(false);
+    expect(shouldDeferDesktopUpdateCheck({ checking: true, installing: false })).toBe(true);
+    expect(shouldDeferDesktopUpdateCheck({ checking: false, installing: true })).toBe(true);
+  });
+
+  it('binds Update replacement to install generation so active installs keep their session', () => {
+    expect(canReplaceDesktopUpdateResource({
+      installing: false,
+      activeGeneration: 2,
+      checkGeneration: 2,
+    })).toBe(true);
+    expect(canReplaceDesktopUpdateResource({
+      installing: true,
+      activeGeneration: 2,
+      checkGeneration: 2,
+    })).toBe(false);
+    expect(canReplaceDesktopUpdateResource({
+      installing: false,
+      activeGeneration: 3,
+      checkGeneration: 2,
+    })).toBe(false);
+  });
+});
 
 describe('installDesktopUpdate', () => {
   it('downloads, durably flushes, installs, and only then relaunches', async () => {
@@ -31,6 +59,87 @@ describe('installDesktopUpdate', () => {
     });
 
     expect(calls).toEqual(['download', 'flush', 'install', 'relaunch']);
+  });
+
+  it('resumes after a flush failure without downloading the package again', async () => {
+    const session = { downloaded: false, installed: false };
+    const update = {
+      download: vi.fn(async () => undefined),
+      install: vi.fn(async () => undefined),
+    };
+    const flush = vi.fn()
+      .mockResolvedValueOnce({ ok: false })
+      .mockResolvedValueOnce({ ok: true });
+    const relaunch = vi.fn(async () => undefined);
+
+    await expect(installDesktopUpdate({
+      update,
+      session,
+      flush,
+      relaunch,
+      saveFailedMessage: 'save failed',
+    })).rejects.toThrow('save failed');
+    await installDesktopUpdate({ update, session, flush, relaunch, saveFailedMessage: 'save failed' });
+
+    expect(update.download).toHaveBeenCalledOnce();
+    expect(flush).toHaveBeenCalledTimes(2);
+    expect(update.install).toHaveBeenCalledOnce();
+    expect(relaunch).toHaveBeenCalledOnce();
+  });
+
+  it('retries install or relaunch from the failed stage', async () => {
+    const installSession = { downloaded: false, installed: false };
+    const installUpdate = {
+      download: vi.fn(async () => undefined),
+      install: vi.fn()
+        .mockRejectedValueOnce(new Error('install failed'))
+        .mockResolvedValueOnce(undefined),
+    };
+    const flush = vi.fn(async () => ({ ok: true }));
+    const relaunch = vi.fn(async () => undefined);
+
+    await expect(installDesktopUpdate({
+      update: installUpdate,
+      session: installSession,
+      flush,
+      relaunch,
+      saveFailedMessage: 'save failed',
+    })).rejects.toThrow('install failed');
+    await installDesktopUpdate({
+      update: installUpdate,
+      session: installSession,
+      flush,
+      relaunch,
+      saveFailedMessage: 'save failed',
+    });
+    expect(installUpdate.download).toHaveBeenCalledOnce();
+    expect(installUpdate.install).toHaveBeenCalledTimes(2);
+
+    const relaunchSession = { downloaded: false, installed: false };
+    const relaunchUpdate = {
+      download: vi.fn(async () => undefined),
+      install: vi.fn(async () => undefined),
+    };
+    const flakyRelaunch = vi.fn()
+      .mockRejectedValueOnce(new Error('relaunch failed'))
+      .mockResolvedValueOnce(undefined);
+    await expect(installDesktopUpdate({
+      update: relaunchUpdate,
+      session: relaunchSession,
+      flush,
+      relaunch: flakyRelaunch,
+      saveFailedMessage: 'save failed',
+    })).rejects.toThrow('relaunch failed');
+    await installDesktopUpdate({
+      update: relaunchUpdate,
+      session: relaunchSession,
+      flush,
+      relaunch: flakyRelaunch,
+      saveFailedMessage: 'save failed',
+    });
+    expect(relaunchUpdate.download).toHaveBeenCalledOnce();
+    expect(relaunchUpdate.install).toHaveBeenCalledOnce();
+    expect(flakyRelaunch).toHaveBeenCalledTimes(2);
   });
 
   it('does not install or relaunch when the durable flush fails', async () => {

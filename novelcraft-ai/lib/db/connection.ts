@@ -16,16 +16,17 @@ import path from 'node:path';
 import { nowIso } from '@/lib/utils';
 import { LOCAL_USER_ID, LOCAL_USER_EMAIL } from '@/lib/local-user';
 import { resolveLocalDbPath } from '@/lib/db-local-path';
+import { reconcileInterruptedLocalLibraryResets } from '@/lib/db/local-library-reset-intent';
 import {
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
   LocalDatabaseUnavailableError,
-  PreMigrationBackupRequiredError,
   ensureCurrentSchema,
   initializeCurrentSchema,
   inspectSchemaOpenPlan,
 } from '@/lib/db/migrations';
 import { seedPromptTemplates } from '@/lib/prompt-seed';
+import { reconcileAppOwnedVaultCleanupIntents } from '@/lib/vault/app-owned-cleanup';
 
 let _db: Database.Database | null = null;
 
@@ -136,6 +137,7 @@ export function getDb(): Database.Database {
   let inspectedSourceState: string | null = null;
   try {
     mkdirSync(path.dirname(dbPath), { recursive: true });
+    reconcileInterruptedLocalLibraryResets(path.dirname(dbPath));
     const hasExistingDatabase = existsSync(dbPath) && statSync(dbPath).size > 0;
     if (hasExistingDatabase) {
       // Inspect a byte-for-byte main/WAL snapshot. SQLite may create or update
@@ -166,8 +168,7 @@ export function getDb(): Database.Database {
     // read/write touched an unsupported on-disk shape.
     if (
       e instanceof DatabaseFromNewerAppVersionError ||
-      e instanceof IncompatibleDatabaseSchemaError ||
-      e instanceof PreMigrationBackupRequiredError
+      e instanceof IncompatibleDatabaseSchemaError
     ) throw e;
     throw new LocalDatabaseUnavailableError(
       `InkMarshal: could not open local database at ${dbPath}: ${(e as Error).message}`,
@@ -175,10 +176,15 @@ export function getDb(): Database.Database {
     );
   }
   _db = db;
+  const openedDb = db;
+  queueMicrotask(() => {
+    if (_db !== openedDb) return;
+    reconcileAppOwnedVaultCleanupIntents(openedDb);
+  });
   return db;
 }
 
-export function closeDbForTest(): void {
+export function closeDb(): void {
   if (_db) {
     try {
       _db.close();
@@ -187,4 +193,8 @@ export function closeDbForTest(): void {
     }
     _db = null;
   }
+}
+
+export function closeDbForTest(): void {
+  closeDb();
 }

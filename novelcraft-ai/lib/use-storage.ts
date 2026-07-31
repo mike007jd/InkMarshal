@@ -8,13 +8,11 @@ import { isExampleNovelId } from '@/lib/examples/prefix';
 
 /** Stable local-database failure codes returned by authenticated desktop novel APIs. */
 export type LocalDatabaseIssueCode =
-  | 'DATABASE_BACKUP_REQUIRED'
   | 'DATABASE_INCOMPATIBLE'
   | 'DATABASE_NEWER_VERSION'
   | 'DATABASE_UNAVAILABLE';
 
 const LOCAL_DATABASE_ISSUE_CODES = new Set<LocalDatabaseIssueCode>([
-  'DATABASE_BACKUP_REQUIRED',
   'DATABASE_INCOMPATIBLE',
   'DATABASE_NEWER_VERSION',
   'DATABASE_UNAVAILABLE',
@@ -37,8 +35,6 @@ export type CreateNovelResult = {
 /** Localized actionable copy for a typed local-database failure code. */
 export function localDatabaseIssueCopy(
   t: {
-    databaseBackupRequiredTitle: string;
-    databaseBackupRequiredBody: string;
     databaseIncompatibleTitle: string;
     databaseIncompatibleBody: string;
     databaseNewerVersionTitle: string;
@@ -48,9 +44,6 @@ export function localDatabaseIssueCopy(
   },
   code: LocalDatabaseIssueCode,
 ): { title: string; body: string } {
-  if (code === 'DATABASE_BACKUP_REQUIRED') {
-    return { title: t.databaseBackupRequiredTitle, body: t.databaseBackupRequiredBody };
-  }
   if (code === 'DATABASE_NEWER_VERSION') {
     return { title: t.databaseNewerVersionTitle, body: t.databaseNewerVersionBody };
   }
@@ -62,6 +55,7 @@ export function localDatabaseIssueCopy(
 
 /** Same-document fan-out after a successful novel PATCH so list subscribers converge. */
 export const NOVEL_UPDATED_EVENT = 'inkmarshal:novel-updated';
+export const NOVEL_LIST_INVALIDATED_EVENT = 'inkmarshal:novel-list-invalidated';
 
 export interface NovelUpdatedEventDetail {
   novel: Novel;
@@ -74,6 +68,13 @@ export function notifyNovelUpdated(novel: Novel): void {
       detail: { novel },
     }),
   );
+}
+
+/** Refreshes every mounted library subscriber after membership changes such
+ *  as restoring a trashed novel across routed desktop layouts. */
+export function notifyNovelListInvalidated(): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new Event(NOVEL_LIST_INVALIDATED_EVENT));
 }
 
 function applyNovelUpdatedToList(
@@ -173,6 +174,12 @@ export function useNovels() {
     window.addEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated);
     return () => window.removeEventListener(NOVEL_UPDATED_EVENT, onNovelUpdated);
   }, []);
+
+  useEffect(() => {
+    const onListInvalidated = () => { void refresh(); };
+    window.addEventListener(NOVEL_LIST_INVALIDATED_EVENT, onListInvalidated);
+    return () => window.removeEventListener(NOVEL_LIST_INVALIDATED_EVENT, onListInvalidated);
+  }, [refresh]);
   const create = useCallback(
     async (data: CreateNovelRequest = {}): Promise<CreateNovelResult> => {
       let databaseIssue: LocalDatabaseIssueCode | null = null;
@@ -225,6 +232,8 @@ export function useNovels() {
 export function useNovel(novelId: string | undefined) {
   const [novel, setNovel] = useState<Novel | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const [databaseIssue, setDatabaseIssue] = useState<LocalDatabaseIssueCode | null>(null);
   const activeNovelIdRef = useRef(novelId);
   const refreshSeqRef = useRef(0);
   const updateSeqByNovelRef = useRef(new Map<string, number>());
@@ -240,22 +249,42 @@ export function useNovel(novelId: string | undefined) {
       activeNovelIdRef.current === requestNovelId && refreshSeqRef.current === seq;
     if (!requestNovelId) {
       setNovel(null);
+      setError(null);
+      setDatabaseIssue(null);
       setLoading(false);
       return;
     }
     if (isExampleNovelId(requestNovelId)) {
       setNovel(getExampleById(requestNovelId)?.novel ?? null);
+      setError(null);
+      setDatabaseIssue(null);
       setLoading(false);
       return;
     }
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch(`/api/novels/${requestNovelId}`);
-      if (!res.ok) throw new Error(`GET /api/novels/${requestNovelId} ${res.status}`);
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        const issue = parseLocalDatabaseIssue(payload);
+        if (isCurrent()) setDatabaseIssue(issue);
+        throw new Error(
+          issue
+            ? `GET /api/novels/${requestNovelId} ${res.status} ${issue}`
+            : `GET /api/novels/${requestNovelId} ${res.status}`,
+        );
+      }
       const data: Novel = await res.json();
-      if (isCurrent()) setNovel(data);
+      if (isCurrent()) {
+        setNovel(data);
+        setDatabaseIssue(null);
+      }
     } catch (err) {
-      if (isCurrent()) console.error('[useNovel] refresh failed:', err);
+      if (isCurrent()) {
+        console.error('[useNovel] refresh failed:', err);
+        setError(err instanceof Error ? err : new Error(String(err)));
+      }
     } finally {
       if (isCurrent()) setLoading(false);
     }
@@ -308,5 +337,5 @@ export function useNovel(novelId: string | undefined) {
     [novelId],
   );
 
-  return { novel, loading, refresh, update };
+  return { novel, loading, error, databaseIssue, refresh, update };
 }

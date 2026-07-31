@@ -16,7 +16,6 @@ import {
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
   LocalDatabaseUnavailableError,
-  PreMigrationBackupRequiredError,
   ensureCurrentSchema,
   initializeCurrentSchema,
   knownLegacyReviewItemsFingerprint,
@@ -615,25 +614,22 @@ describe('known dual-marker review_items legacy → 21', () => {
     writer.close();
   });
 
-  it('requires a verified backup before dropping review_items and leaves bytes unchanged on backup failure', () => {
+  it('does not block the exact known migration when its optional backup fails', () => {
     const setup = new Database(dbPath());
     seedKnownLegacyReviewItems(setup);
     setup.close();
-    const before = digest(dbPath());
 
     const db = new Database(dbPath());
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     expect(() => ensureCurrentSchema(db, () => {
       throw new Error('disk full');
-    })).toThrow(PreMigrationBackupRequiredError);
-    db.close();
-    expect(digest(dbPath())).toBe(before);
-
-    const verify = new Database(dbPath(), { readonly: true });
-    expect(verify.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 2 });
+    })).not.toThrow();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('pre-migration backup failed'));
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
     expect(
-      verify.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").get(),
-    ).toEqual({ name: 'review_items' });
-    verify.close();
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").get(),
+    ).toBeUndefined();
+    db.close();
   });
 
   it('rolls back a failed destructive promotion and preserves the legacy shape', () => {
@@ -764,14 +760,14 @@ CREATE TABLE _schema_version (
 });
 
 describe('fail-closed unknown / future schemas', () => {
-  it('leaves an incompatible nonempty database byte-identical and avoids destructive reset guidance', () => {
+  it('leaves an incompatible nonempty database byte-identical until the user chooses to clear it', () => {
     const old = new Database(dbPath());
     old.exec('CREATE TABLE legacy_unsupported_shape (id TEXT PRIMARY KEY); INSERT INTO legacy_unsupported_shape VALUES (\'keep\');');
     old.close();
     const before = digest(dbPath());
 
     expect(() => getDb()).toThrow(IncompatibleDatabaseSchemaError);
-    expect(() => getDb()).toThrow(/Preserve a backup|contact support|update InkMarshal/i);
+    expect(() => getDb()).toThrow(/clear the local library/i);
     expect(() => getDb()).not.toThrow(/unpublished|local-state:reset/i);
     expect(digest(dbPath())).toBe(before);
 
@@ -862,17 +858,13 @@ describe('fail-closed unknown / future schemas', () => {
 
 describe('mapLocalDatabaseApiError', () => {
   it('returns stable non-secret codes for typed database failures', async () => {
-    const { mapLocalDatabaseApiError, PreMigrationBackupRequiredError } = await import('@/lib/db/migrations');
+    const { mapLocalDatabaseApiError } = await import('@/lib/db/migrations');
     expect(mapLocalDatabaseApiError(new DatabaseFromNewerAppVersionError(99, 21))).toMatchObject({
       code: 'DATABASE_NEWER_VERSION',
       status: 503,
     });
     expect(mapLocalDatabaseApiError(new IncompatibleDatabaseSchemaError('fixture'))).toMatchObject({
       code: 'DATABASE_INCOMPATIBLE',
-      status: 503,
-    });
-    expect(mapLocalDatabaseApiError(new PreMigrationBackupRequiredError('disk full'))).toMatchObject({
-      code: 'DATABASE_BACKUP_REQUIRED',
       status: 503,
     });
     expect(mapLocalDatabaseApiError(new LocalDatabaseUnavailableError('internal path detail'))).toMatchObject({

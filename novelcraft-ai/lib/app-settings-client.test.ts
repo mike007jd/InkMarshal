@@ -849,11 +849,13 @@ describe('DesktopShell hydrate sequencing contract', () => {
     const { join } = await import('node:path');
     const source = readFileSync(join(process.cwd(), 'components/DesktopShellLayout.tsx'), 'utf8');
     expect(source).toContain('const result = await hydrateAppSettings()');
-    expect(source).toContain('if (!mounted || !result.ok)');
+    expect(source).toContain('if (!mounted) return;');
+    expect(source).toContain('if (!result.ok)');
+    expect(source).toContain('setSettingsLoadFailed(true)');
     expect(source).toContain('await restoreEnginesOnLaunch()');
     expect(source).toContain("window.addEventListener('focus', retry)");
     expect(source).toContain("window.addEventListener('online', retry)");
-    expect(source.indexOf('if (!mounted || !result.ok)')).toBeLessThan(
+    expect(source.indexOf('if (!result.ok)')).toBeLessThan(
       source.indexOf('await restoreEnginesOnLaunch()'),
     );
   });

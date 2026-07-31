@@ -20,7 +20,6 @@ export function ChatArea({
   onUpdate,
   initialCreativity = null,
   onStatusChange,
-  composerCollapsed = false,
   completionContent,
   autoSubmitRequest = 0,
   autoSubmitText,
@@ -29,7 +28,6 @@ export function ChatArea({
   onUpdate: () => void;
   initialCreativity?: CreativityLevel | null;
   onStatusChange?: (status: ChatStatus) => void;
-  composerCollapsed?: boolean;
   completionContent?: ReactNode;
   autoSubmitRequest?: number;
   autoSubmitText?: string;
@@ -160,12 +158,10 @@ export function ChatArea({
           <NovelThread
             placeholder={t.typeMessage}
             emptyState={<EmptyChatInterviewGuide />}
-            composerFooter={t.aiWarning}
             composerControls={<ChatModelPicker onSavingChange={setModelSelectionPending} />}
             composerSendDisabled={modelSelectionPending}
             errorMessage={errorMessage}
             onRetry={() => void retry()}
-            hideComposer={composerCollapsed}
             completionContent={completionContent}
           />
         </AssistantRuntimeProvider>

@@ -62,7 +62,8 @@ import {
   pickModelDir,
   pickLocalGgufModel,
   pickLocalMlxModelFolder,
-  removeInstalledLocalModel,
+  deleteManagedLocalModel,
+  unregisterImportedLocalModel,
   revealModelDir,
   resetModelDir,
   revealLocalModel,
@@ -72,6 +73,7 @@ import {
   type EngineInfo,
 } from '@/lib/desktop-runtime';
 import {
+  getStoredSetting,
   hydrateAppSettings,
   removeStoredSetting,
   setStoredSetting,
@@ -100,8 +102,10 @@ import {
 import {
   listRoleEngineBindings,
   normalizeModelPathForCompare,
+  startEngineForRoles,
   stopEngineAndUnbind,
 } from '@/lib/model-supply/orchestrator';
+import { CAPABILITY_ROLES } from '@/lib/model-supply/types';
 import { EngineLaunchRoleDialog } from '@/components/EngineLaunchRoleDialog';
 import { StudioFirstRunWizard } from '@/components/StudioFirstRunWizard';
 import { useClientMacPlatform } from '@/components/hooks/useClientMacPlatform';
@@ -160,6 +164,7 @@ const FIT_BADGE_VARIANT: Record<FitState, React.ComponentProps<typeof Badge>['va
 
 const DOWNLOAD_PROGRESS_KEY = 'inkmarshal:model-download-progress:v1';
 const MODEL_ROOT_SETTING_KEY = 'inkmarshal_model_root_v1';
+const ENGINE_LAUNCH_PLANS_KEY = 'inkmarshal_engine_launch_plans_v1';
 const RECOMMENDED_FORMAT: EngineFormat = 'gguf';
 
 function compactHomePath(value: string | null | undefined): string {
@@ -168,6 +173,42 @@ function compactHomePath(value: string | null | undefined): string {
   const userMatch = value.match(/^\/Users\/([^/]+)(\/.*)?$/);
   if (!userMatch) return value;
   return `~${userMatch[2] ?? ''}`;
+}
+
+function uniqueCapabilityRoles(roles: readonly CapabilityRole[]): CapabilityRole[] {
+  const seen = new Set<CapabilityRole>();
+  const out: CapabilityRole[] = [];
+  for (const role of roles) {
+    if (seen.has(role)) continue;
+    seen.add(role);
+    out.push(role);
+  }
+  return out;
+}
+
+function launchPlanRolesForModelPath(modelPath: string): CapabilityRole[] {
+  try {
+    const raw = getStoredSetting(ENGINE_LAUNCH_PLANS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    const key = normalizeModelPathForCompare(modelPath);
+    const roles: CapabilityRole[] = [];
+    for (const plan of parsed) {
+      if (!plan || typeof plan !== 'object') continue;
+      const path = (plan as { modelPath?: unknown }).modelPath;
+      const planRoles = (plan as { roles?: unknown }).roles;
+      if (typeof path !== 'string' || !Array.isArray(planRoles)) continue;
+      if (normalizeModelPathForCompare(path) !== key) continue;
+      for (const role of planRoles) {
+        if (typeof role === 'string' && (CAPABILITY_ROLES as readonly string[]).includes(role)) {
+          roles.push(role as CapabilityRole);
+        }
+      }
+    }
+    return uniqueCapabilityRoles(roles);
+  } catch {
+    return [];
+  }
 }
 
 export function LocalModelsPanel({
@@ -189,14 +230,16 @@ export function LocalModelsPanel({
   const [healthyConnectionModels, setHealthyConnectionModels] = useState<
     ReadonlyMap<string, ReadonlySet<string>>
   >(() => new Map());
+  const [settingsLoadFailed, setSettingsLoadFailed] = useState(false);
+  const [settingsRetryToken, setSettingsRetryToken] = useState(0);
   const [format, setFormat] = useState<EngineFormat>('gguf');
 
   const [progress, setProgress] = useState<Record<string, ModelProgress>>({});
   const [progressHydrated, setProgressHydrated] = useState(false);
   const [useStates, setUseStates] = useState<Record<string, EngineUseState>>({});
   const [removingPaths, setRemovingPaths] = useState<Record<string, boolean>>({});
-  // Model pending a remove/unregister confirmation — replaces window.confirm so
-  // the gate matches the book Dialog idiom and is localizable.
+  // Only app-managed bytes require confirmation. Removing an external model
+  // registration is reversible by importing it again and runs directly.
   const [pendingRemoval, setPendingRemoval] = useState<InstalledLocalModel | null>(null);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
@@ -372,7 +415,12 @@ export function LocalModelsPanel({
       if (hydrationAttempt) return;
       const attempt = (async () => {
         const result = await hydrateAppSettings();
-        if (cancelled || !mountedRef.current || !result.ok) return;
+        if (cancelled || !mountedRef.current) return;
+        if (!result.ok) {
+          setSettingsLoadFailed(true);
+          return;
+        }
+        setSettingsLoadFailed(false);
         settingsHydratedRef.current = true;
         refreshBindingReadiness(true);
       })().finally(() => {
@@ -408,7 +456,7 @@ export function LocalModelsPanel({
       window.removeEventListener('online', retry);
       window.clearInterval(healthInterval);
     };
-  }, [refresh, refreshBindingReadiness]);
+  }, [refresh, refreshBindingReadiness, settingsRetryToken]);
 
   const platform = isMac ? 'macos' : 'windows';
   const recommended = useMemo(() => {
@@ -868,15 +916,61 @@ export function LocalModelsPanel({
     ],
   );
 
+  const undoUnregisterExternalModel = useCallback(
+    async (snapshot: {
+      modelPath: string;
+      label: string;
+      format: EngineFormat;
+      roles: CapabilityRole[];
+    }) => {
+      try {
+        const restored = await importLocalModel(snapshot.modelPath, snapshot.label);
+        setInstalled(current => (
+          current.some(item => item.modelPath === restored.modelPath)
+            ? current
+            : [...current, restored]
+        ));
+        notifyLocalModelStateChanged();
+        await refresh().catch(() => {});
+        if (snapshot.roles.length > 0) {
+          await startEngineForRoles({
+            modelPath: restored.modelPath,
+            format: snapshot.format,
+            modelLabel: snapshot.label,
+            roles: snapshot.roles,
+            onConflict: 'cancel',
+          });
+          await refresh().catch(() => {});
+        }
+      } catch {
+        toast(t.modelManagerUnregisterUndoFailed, 'error');
+      }
+    },
+    [refresh, t.modelManagerUnregisterUndoFailed, toast],
+  );
+
   const removeModel = useCallback(
     async (model: InstalledLocalModel) => {
       if (removingModelPathsRef.current.has(model.modelPath)) return;
       removingModelPathsRef.current.add(model.modelPath);
       setRemovingPaths(s => ({ ...s, [model.modelPath]: true }));
       try {
-        const running = runningByPath.get(normalizeModelPathForCompare(model.modelPath)) ?? [];
+        const modelKey = normalizeModelPathForCompare(model.modelPath);
+        const running = runningByPath.get(modelKey) ?? [];
+        const runningEngineIds = new Set(running.map(engine => engine.engineId));
+        const boundRoles = CAPABILITY_ROLES.filter(role => {
+          const binding = roleBindings.get(role);
+          return Boolean(binding && runningEngineIds.has(binding.engineId));
+        });
+        const plannedRoles = launchPlanRolesForModelPath(model.modelPath);
+        const restoreRoles = uniqueCapabilityRoles([...boundRoles, ...plannedRoles]);
+
         await Promise.all(running.map(engine => stopModel(engine.engineId)));
-        await removeInstalledLocalModel(model.modelPath);
+        if (model.managedByApp) {
+          await deleteManagedLocalModel(model.modelPath);
+        } else {
+          await unregisterImportedLocalModel(model.modelPath);
+        }
         setInstalled(current => current.filter(item => item.modelPath !== model.modelPath));
         setProgress(prev => {
           const next = { ...prev };
@@ -885,11 +979,35 @@ export function LocalModelsPanel({
           }
           return next;
         });
+        if (
+          pendingLaunch
+          && normalizeModelPathForCompare(pendingLaunch.modelPath) === modelKey
+        ) {
+          setPendingLaunch(null);
+        }
         notifyLocalModelStateChanged();
-        // The destructive command already succeeded. Keep the confirmed
-        // removal visible even if a follow-up status refresh is transiently
-        // unavailable; the next regular refresh will reconcile the rest.
+        // The command already succeeded. Keep the confirmed removal visible
+        // even if a follow-up status refresh is transiently unavailable.
         await refresh().catch(() => {});
+        if (!model.managedByApp) {
+          toast(
+            t.modelManagerUnregistered.replace('{model}', model.label),
+            'success',
+            {
+              action: {
+                label: t.trashUndoAction,
+                onClick: () => {
+                  void undoUnregisterExternalModel({
+                    modelPath: model.modelPath,
+                    label: model.label,
+                    format: model.format as EngineFormat,
+                    roles: restoreRoles,
+                  });
+                },
+              },
+            },
+          );
+        }
       } catch {
         toast(
           model.managedByApp
@@ -905,12 +1023,17 @@ export function LocalModelsPanel({
       }
     },
     [
+      pendingLaunch,
       refresh,
+      roleBindings,
       runningByPath,
       stopModel,
       t.modelManagerRemoveFailed,
       t.modelManagerUnregisterFailed,
+      t.modelManagerUnregistered,
+      t.trashUndoAction,
       toast,
+      undoUnregisterExternalModel,
     ],
   );
 
@@ -1034,7 +1157,6 @@ export function LocalModelsPanel({
     const canInstall =
       desktop &&
       Boolean(status?.model_dir) &&
-      fit.state !== 'bad' &&
       !loadingFiles &&
       state !== 'downloading' &&
       state !== 'verifying' &&
@@ -1134,7 +1256,10 @@ export function LocalModelsPanel({
                 size="sm"
                 className="text-book-danger hover:text-book-danger"
                 disabled={removing}
-                onClick={() => setPendingRemoval(installedModel)}
+                onClick={() => {
+                  if (installedModel.managedByApp) setPendingRemoval(installedModel);
+                  else void removeModel(installedModel);
+                }}
               >
                 {removing ? (
                   <Spinner size="sm" />
@@ -1188,21 +1313,40 @@ export function LocalModelsPanel({
     );
   }
 
+  const settingsLoadFailure = settingsLoadFailed ? (
+    <div role="alert" className="flex flex-wrap items-center gap-2 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-sm text-book-danger">
+      <span className="min-w-0 flex-1">{t.modelSettingsLoadFailed}</span>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setSettingsRetryToken(value => value + 1)}
+      >
+        <RefreshCw className="size-3.5" />
+        {t.toastRetry}
+      </Button>
+    </div>
+  ) : null;
+
   if (installed.length === 0 && !showAdvancedManager) {
     return (
-      <StudioFirstRunWizard
-        installedCount={0}
-        onBrowseAllModels={() => setShowAdvancedManager(true)}
-        onImportGguf={() => void importExistingModel('gguf')}
-        onImportMlx={isMac ? () => void importExistingModel('mlx') : undefined}
-        importing={importing}
-        importError={importError}
-      />
+      <section className="space-y-4">
+        {settingsLoadFailure}
+        <StudioFirstRunWizard
+          installedCount={0}
+          onBrowseAllModels={() => setShowAdvancedManager(true)}
+          onImportGguf={() => void importExistingModel('gguf')}
+          onImportMlx={isMac ? () => void importExistingModel('mlx') : undefined}
+          importing={importing}
+          importError={importError}
+        />
+      </section>
     );
   }
 
   return (
     <section className="space-y-5">
+      {settingsLoadFailure}
       <div className="flex items-center gap-2">
         <Cpu className="h-4 w-4 text-book-ink-muted" />
         <h3 className="flex-1 text-xs font-semibold uppercase tracking-wider text-book-ink-muted">
@@ -1529,7 +1673,10 @@ export function LocalModelsPanel({
                       variant="outline"
                       size="sm"
                       disabled={removing}
-                      onClick={() => setPendingRemoval(model)}
+                      onClick={() => {
+                        if (model.managedByApp) setPendingRemoval(model);
+                        else void removeModel(model);
+                      }}
                     >
                       {removing ? (
                         <Spinner size="sm" />
@@ -1860,10 +2007,10 @@ export function LocalModelsPanel({
           <DialogContent className="max-w-md">
             <DialogHeader>
               <DialogTitle className="font-serif text-xl">
-                {pendingRemoval.managedByApp ? t.modelManagerRemove : t.modelManagerUnregister}
+                {t.modelManagerRemove}
               </DialogTitle>
               <DialogDescription className="leading-relaxed text-book-ink-secondary">
-                {(pendingRemoval.managedByApp ? t.modelManagerRemoveConfirm : t.modelManagerUnregisterConfirm).replace('{model}', pendingRemoval.label)}
+                {t.modelManagerRemoveConfirm.replace('{model}', pendingRemoval.label)}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -1877,7 +2024,7 @@ export function LocalModelsPanel({
               </Button>
               <Button
                 type="button"
-                variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}
+                variant="destructive"
                 onClick={() => {
                   const model = pendingRemoval;
                   setPendingRemoval(null);
@@ -1885,7 +2032,7 @@ export function LocalModelsPanel({
                 }}
                 className="h-auto px-4 py-2 text-sm font-medium"
               >
-                {pendingRemoval.managedByApp ? t.modelManagerRemove : t.modelManagerUnregister}
+                {t.modelManagerRemove}
               </Button>
             </DialogFooter>
           </DialogContent>

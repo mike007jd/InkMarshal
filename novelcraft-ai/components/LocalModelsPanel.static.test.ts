@@ -31,14 +31,35 @@ describe('LocalModelsPanel removal path', () => {
 
   it('exposes removal on installed recommendation cards and reports failures', () => {
     const source = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
+    const runtime = readFileSync(join(process.cwd(), 'lib/desktop-runtime.ts'), 'utf8');
 
     expect(source).toContain('{installedModel && (');
-    expect(source).toContain('onClick={() => setPendingRemoval(installedModel)}');
+    expect(source).toContain('installedModel.managedByApp');
+    expect(source).toContain('void removeModel(installedModel)');
+    expect(source).toContain('deleteManagedLocalModel(model.modelPath)');
+    expect(source).toContain('unregisterImportedLocalModel(model.modelPath)');
     expect(source).toContain('? t.modelManagerRemoveFailed');
     expect(source).toContain(': t.modelManagerUnregisterFailed');
+    expect(source).toContain('t.modelManagerUnregistered.replace');
+    expect(source).toContain('label: t.trashUndoAction');
+    expect(source).toContain('void undoUnregisterExternalModel(');
+    expect(source).toContain('startEngineForRoles({');
     expect(source).toContain('setInstalled(current => current.filter(item => item.modelPath !== model.modelPath))');
     expect(source).toContain('await refresh().catch(() => {})');
-    expect(source).toContain("variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}");
+    expect(source).toContain('variant="destructive"');
+    expect(source).not.toContain("variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}");
+    expect(source).not.toContain('removeInstalledLocalModel');
+    expect(runtime).toContain("unregisterImportedLocalModel: 'unregister_imported_local_model'");
+    expect(runtime).toContain("deleteManagedLocalModel: 'delete_managed_local_model'");
+    expect(runtime).not.toContain("removeInstalledLocalModel: 'remove_installed_local_model'");
+  });
+
+  it('treats hardware fit as advice instead of blocking model installation', () => {
+    const source = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
+
+    expect(source).not.toContain("fit.state !== 'bad'");
+    expect(source).toContain('FIT_BADGE_VARIANT[fit.state]');
+    expect(source).toContain("state === 'idle' && fit.state === 'bad'");
   });
 
   it('uses current provider health and exact advertised models for role coverage', () => {
@@ -53,7 +74,10 @@ describe('LocalModelsPanel removal path', () => {
     expect(source).toContain('refreshBindingReadiness(true)');
     expect(source).toContain('CAPABILITY_HEALTH_REFRESH_MS');
     expect(source).toContain('const result = await hydrateAppSettings()');
-    expect(source).toContain('if (cancelled || !mountedRef.current || !result.ok) return');
+    expect(source).toContain('setSettingsLoadFailed(true)');
+    expect(source).toContain('setSettingsLoadFailed(false)');
+    expect(source).toContain('setSettingsRetryToken(value => value + 1)');
+    expect(source).toContain('{t.modelSettingsLoadFailed}');
     expect(source).toContain('if (!settingsHydratedRef.current) return');
     expect(source).toContain('const engines = await engineStatus().catch');
   });

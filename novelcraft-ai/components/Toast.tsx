@@ -1,7 +1,6 @@
 'use client';
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
-import { createPortal } from 'react-dom';
 import { X, AlertTriangle, CheckCircle, Info } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -61,13 +60,6 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   // Tracks each live toast's deadline so hover can pause/resume the countdown.
   const expiryRef = useRef<Map<string, { expiresAt: number; remaining: number | null }>>(new Map());
-  // Discover the optional `#toast-anchor` element rendered by the desktop
-  // shell. When present, toasts portal into it so they stay clear of the
-  // persistent StageBar / ManuscriptSidebar. The anchor belongs to routed
-  // layout content, so retaining it in state can leave portals attached to a
-  // detached node after navigation. Resolve it afresh whenever toast state
-  // renders and fall back to the fixed container when it is absent or stale.
-
   // Cleanup all timers on unmount
   useEffect(() => {
     const timers = timersRef.current;
@@ -152,18 +144,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     }
   }, [dismiss]);
 
-  const candidateAnchorEl = toasts.length > 0 && typeof document !== 'undefined'
-    ? document.getElementById('toast-anchor')
-    : null;
-  const anchorEl = candidateAnchorEl?.isConnected ? candidateAnchorEl : null;
-
   const toastList = (
     <div
-      className={
-        anchorEl
-          ? 'absolute bottom-3 right-3 z-[100] flex flex-col gap-2 max-w-sm w-full pointer-events-none'
-          : 'fixed bottom-6 right-6 z-[100] flex flex-col gap-2 max-w-sm w-full pointer-events-none'
-      }
+      className="fixed bottom-6 right-6 z-[100] flex max-w-sm w-full flex-col gap-2 pointer-events-none"
     >
       {toasts.map(t => {
         const Icon = IconComponent[t.type];
@@ -211,11 +194,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={{ toast }}>
       {children}
-      {toasts.length > 0 && (
-        anchorEl
-          ? createPortal(toastList, anchorEl)
-          : toastList
-      )}
+      {toasts.length > 0 && toastList}
     </ToastContext.Provider>
   );
 }

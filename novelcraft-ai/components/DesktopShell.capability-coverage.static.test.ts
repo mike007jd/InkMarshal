@@ -32,10 +32,18 @@ describe('DesktopShell non-local capability coverage health probes', () => {
 
   it('never probes non-authoritative connection mirrors before SQLite hydration', () => {
     expect(shell).toContain('const result = await hydrateAppSettings()');
-    expect(shell).toContain('if (!mounted || !result.ok) return');
+    expect(shell).toContain('if (!result.ok)');
+    expect(shell).toContain('setSettingsLoadFailed(true)');
+    expect(shell).toContain('setSettingsLoadFailed(false)');
     expect(shell).toContain('if (!readinessEnabled) return');
     expect(shell.indexOf('await hydrateAppSettings()')).toBeLessThan(
       shell.indexOf('readinessEnabled = true'),
     );
+  });
+
+  it('does not disguise settings hydration failure as zero ready models', () => {
+    expect(shell).toContain('modelSettingsLoadFailedShort');
+    expect(shell).toContain('visibleModelCoverageLabel');
+    expect(shell).toContain('visibleModelCoverageTooltip');
   });
 });

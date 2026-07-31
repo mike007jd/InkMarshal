@@ -20,7 +20,6 @@ export function AgentWorkspacePane({
   novel,
   deckCounts,
   deckLoading,
-  conversationThreadsUnlocked,
   activeConvId,
   setActiveConvId,
   onCreateConversation,
@@ -37,7 +36,6 @@ export function AgentWorkspacePane({
   novel: Novel | null | undefined;
   deckCounts: DeckCounts;
   deckLoading: boolean;
-  conversationThreadsUnlocked: boolean;
   activeConvId: string | null;
   setActiveConvId: (id: string | null) => void;
   onCreateConversation: (topic: string, title: string) => void | Promise<void>;
@@ -51,7 +49,7 @@ export function AgentWorkspacePane({
   initialCreativity?: CreativityLevel | null;
 }) {
   const { t } = useLanguage();
-  const showConversationList = conversationThreadsUnlocked;
+  const showConversationList = true;
   const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
   const [adjustingProposalLocally, setAdjustingProposalLocally] = useState(false);
   const [acknowledgedAdjustRequest, setAcknowledgedAdjustRequest] = useState(
@@ -146,7 +144,6 @@ export function AgentWorkspacePane({
             onUpdate={onUpdate}
             onStatusChange={handleChatStatusChange}
             initialCreativity={initialCreativity ?? null}
-            composerCollapsed={proposalReview && !adjustingProposal}
             autoSubmitRequest={proposalAdjustRequest}
             autoSubmitText={t.storyDeckCompletePrompt}
             completionContent={proposalReview && !adjustingProposal && novel ? (

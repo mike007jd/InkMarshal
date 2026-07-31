@@ -48,6 +48,13 @@ describe('signed desktop updater contract', () => {
     expect(coordinator).toContain('result === null');
     expect(coordinator).not.toContain('.available');
     expect(coordinator).toContain('installDesktopUpdate({');
+    expect(coordinator).toContain('session: installSessionRef.current');
+    expect(coordinator).toContain('previous.close()');
+    expect(coordinator).toContain('shouldDeferDesktopUpdateCheck');
+    expect(coordinator).toContain('canReplaceDesktopUpdateResource');
+    expect(coordinator).toContain('updateGenerationRef');
+    expect(coordinator).toContain('installingRef.current');
+    expect(coordinator).toContain('error ? t.updateRetry : t.updateInstall');
     expect(coordinator).toContain('categorizeDesktopUpdateFailure');
     expect(coordinator).toContain('VERIFIED_MAC_DMG_DOWNLOAD_URL');
     expect(coordinator).toContain('openExternal(VERIFIED_MAC_DMG_DOWNLOAD_URL)');

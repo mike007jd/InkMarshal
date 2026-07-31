@@ -22,4 +22,14 @@ describe('series authoring UX', () => {
     expect(workspace).toContain('{suggestion(c.kind)}');
     expect(workspace).not.toContain('autoResolveConflict');
   });
+
+  it('lets the last anchor leave by keeping its shared entries private', () => {
+    const workspace = source('components/studio/series-workspace.tsx');
+    const actions = source('app/actions/series.ts');
+
+    expect(workspace).toContain('{ keepAnchoredEntriesPrivate: true }');
+    expect(workspace).toContain('{t.keepPrivateOnRemove}');
+    expect(actions).toContain('opts?.keepAnchoredEntriesPrivate');
+    expect(actions).toContain('await setEntrySeriesId(entry.id, null)');
+  });
 });

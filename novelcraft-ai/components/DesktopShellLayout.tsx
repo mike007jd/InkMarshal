@@ -16,8 +16,8 @@ import {
   requestManuscriptFlush,
 } from '@/lib/desktop-shell-bus';
 
-import { DeleteNovelDialog } from '@/components/DeleteNovelDialog';
 import { TrashPanel } from '@/components/TrashPanel';
+import { LocalLibraryRecovery } from '@/components/LocalLibraryRecovery';
 import { AIActionGateCoordinator } from '@/components/AIActionGateCoordinator';
 import { DesktopUpdateCoordinator } from '@/components/DesktopUpdateCoordinator';
 import { VaultRuntimeCoordinator } from '@/components/VaultRuntimeCoordinator';
@@ -35,7 +35,11 @@ import {
 import { InkMarshalLogo, ManuscriptIcon } from '@/components/Icons';
 import { OrnamentalDivider } from '@/components/BookOrnaments';
 import { useLanguage } from '@/components/LanguageProvider';
-import { localDatabaseIssueCopy, useNovels } from '@/lib/use-storage';
+import {
+  localDatabaseIssueCopy,
+  notifyNovelListInvalidated,
+  useNovels,
+} from '@/lib/use-storage';
 import { useRegisterSearchScope, type NovelListScope } from '@/components/search/GlobalSearchProvider';
 import {
   engineStatus,
@@ -104,7 +108,6 @@ export function DesktopShell({ children }: DesktopShellProps) {
     remove,
   } = useNovels();
   const databaseIssueCopy = databaseIssue ? localDatabaseIssueCopy(t, databaseIssue) : null;
-  const [deleteTarget, setDeleteTarget] = useState<Novel | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showTrash, setShowTrash] = useState(false);
   const [runningEngines, setRunningEngines] = useState<EngineInfo[]>([]);
@@ -115,6 +118,7 @@ export function DesktopShell({ children }: DesktopShellProps) {
   const [healthyConnectionModels, setHealthyConnectionModels] = useState<
     ReadonlyMap<string, ReadonlySet<string>>
   >(() => new Map());
+  const [settingsLoadFailed, setSettingsLoadFailed] = useState(false);
   const readinessSeqRef = useRef(0);
   const deletingNovelIdsRef = useRef<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -142,19 +146,19 @@ export function DesktopShell({ children }: DesktopShellProps) {
     }
     moreToolsOpenRef.current = false;
     setMoreToolsOpen(false);
-  }, []);
+  }, [setMoreToolsOpen]);
   const closeMobileNavigation = useCallback(() => {
     closeMoreTools(false);
     restoreMobileNavFocusRef.current = true;
     setMobileNavOpen(false);
-  }, [closeMoreTools]);
+  }, [closeMoreTools, setMobileNavOpen]);
   const toggleMobileNavigation = useCallback(() => {
     if (mobileNavOpen) {
       closeMoreTools(false);
       restoreMobileNavFocusRef.current = true;
     }
     setMobileNavOpen(open => !open);
-  }, [closeMoreTools, mobileNavOpen]);
+  }, [closeMoreTools, mobileNavOpen, setMobileNavOpen]);
 
   useEffect(() => {
     const refreshDeveloperTools = () => setDeveloperTools(Boolean(getSettings().developerTools));
@@ -235,7 +239,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
       if (readinessEnabled || initializationPromise) return;
       const request = (async () => {
         const result = await hydrateAppSettings();
-        if (!mounted || !result.ok) return;
+        if (!mounted) return;
+        if (!result.ok) {
+          setSettingsLoadFailed(true);
+          return;
+        }
+        setSettingsLoadFailed(false);
         // Hydration makes connection endpoints authoritative. Restore local
         // child processes before the first readiness paint; a restore failure
         // still leaves provider probing safe and dead local engines truthful.
@@ -304,6 +313,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
           '{roles}',
           modelCoverage.notReadyRoles.map(role => roleChipLabel(role, t)).join(', '),
         );
+  const visibleModelCoverageLabel = settingsLoadFailed
+    ? t.modelSettingsLoadFailedShort
+    : modelCoverageLabel;
+  const visibleModelCoverageTooltip = settingsLoadFailed
+    ? t.modelSettingsLoadFailed
+    : modelCoverageTooltip;
 
   const searchScope = useMemo<NovelListScope>(() => ({
     kind: 'novel-list',
@@ -327,12 +342,21 @@ export function DesktopShell({ children }: DesktopShellProps) {
   }), [novels, rememberedNovelViews, router, t.untitledNovel]);
   useRegisterSearchScope(searchScope);
 
-  const handleDelete = async () => {
-    if (!deleteTarget) return;
-    const id = deleteTarget.id;
+  const restoreFromTrash = async (novel: Novel) => {
+    try {
+      const response = await fetch(`/api/trash/${novel.id}/restore`, { method: 'POST' });
+      if (!response.ok) throw new Error('restore_failed');
+      notifyNovelListInvalidated();
+      toast(t.trashRestoreSuccess.replace('{title}', novel.title), 'success');
+    } catch {
+      toast(t.trashRestoreFailed, 'error');
+    }
+  };
+
+  const handleMoveToTrash = async (novel: Novel) => {
+    const id = novel.id;
     if (deletingNovelIdsRef.current.has(id)) return;
     deletingNovelIdsRef.current.add(id);
-    setDeleteTarget(null);
     try {
       const deleted = await remove(id);
       if (!deleted) {
@@ -342,7 +366,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
       if (activeNovelId === id) {
         router.push('/desktop-studio');
       }
-      toast(t.moveToTrashSuccess.replace('{title}', deleteTarget.title), 'success');
+      toast(t.moveToTrashSuccess.replace('{title}', novel.title), 'success', {
+        action: {
+          label: t.trashUndoAction,
+          onClick: () => { void restoreFromTrash(novel); },
+        },
+      });
     } finally {
       deletingNovelIdsRef.current.delete(id);
     }
@@ -597,7 +626,7 @@ export function DesktopShell({ children }: DesktopShellProps) {
                     variant="ghost"
                     size="icon"
                     type="button"
-                    onClick={() => setDeleteTarget(novel)}
+                    onClick={() => void handleMoveToTrash(novel)}
                     className="h-auto w-auto rounded p-2 text-book-ink-muted opacity-0 transition-feedback hover:bg-book-bg-secondary hover:text-book-danger group-hover:opacity-100 focus-visible:opacity-100"
                     aria-label={`${t.moveToTrashAction} ${novel.title}`}
                   >
@@ -614,10 +643,12 @@ export function DesktopShell({ children }: DesktopShellProps) {
             {!novelsLoading && databaseIssueCopy && novels.length === 0 && (
               <div role="alert" className="flex flex-col items-start gap-2 px-3 py-6 text-left">
                 <p className="text-sm font-medium text-book-danger">{databaseIssueCopy.title}</p>
-                <p className="text-sm text-book-ink-secondary">{databaseIssueCopy.body}</p>
-                <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
-                  {t.toastRetry}
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
+                    {t.toastRetry}
+                  </Button>
+                  <LocalLibraryRecovery />
+                </div>
               </div>
             )}
             {!novelsLoading && !databaseIssueCopy && novelsError && novels.length === 0 && (
@@ -650,14 +681,16 @@ export function DesktopShell({ children }: DesktopShellProps) {
                 <span
                   className={cn(
                     'shrink-0 rounded border px-1.5 py-0.5 text-xs font-semibold leading-none',
-                    modelCoverage.complete
+                    settingsLoadFailed
+                      ? 'border-book-danger/40 bg-book-danger-light text-book-danger'
+                      : modelCoverage.complete
                       ? 'border-book-success/40 bg-book-success/10 text-book-success'
                       : 'border-book-gold/50 bg-book-gold/10 text-book-gold-dark',
                   )}
-                  aria-label={modelCoverageTooltip}
-                  title={modelCoverageTooltip}
+                  aria-label={visibleModelCoverageTooltip}
+                  title={visibleModelCoverageTooltip}
                 >
-                  {modelCoverageLabel}
+                  {visibleModelCoverageLabel}
                 </span>
               </Link>
             </Button>
@@ -804,15 +837,8 @@ export function DesktopShell({ children }: DesktopShellProps) {
         <div className="flex min-h-0 flex-1 flex-col">
           {children}
         </div>
-        <div id="toast-anchor" className="pointer-events-none absolute inset-0 z-[90]" aria-hidden />
       </main>
 
-       <DeleteNovelDialog
-        open={deleteTarget !== null}
-        title={deleteTarget?.title || ''}
-        onCancel={() => setDeleteTarget(null)}
-        onConfirm={handleDelete}
-       />
        <AIActionGateCoordinator />
        <DesktopUpdateCoordinator />
        <VaultRuntimeCoordinator />
@@ -826,7 +852,6 @@ export function DesktopShell({ children }: DesktopShellProps) {
       <TrashPanel
         open={showTrash}
         onOpenChange={setShowTrash}
-        onLibraryChange={() => void refresh()}
         returnFocusRef={moreToolsTriggerRef}
         fallbackFocusRef={mobileNavOpenButtonRef}
       />

@@ -174,10 +174,6 @@ vi.mock('@/lib/novel-workspace-preferences', () => ({
   useRememberedNovelViews: () => ({}),
 }));
 
-vi.mock('@/components/DeleteNovelDialog', () => ({
-  DeleteNovelDialog: () => null,
-}));
-
 vi.mock('@/components/TrashPanel', () => ({
   TrashPanel: ({ open }: { open: boolean }) => (
     open ? <div data-testid="trash-panel">Trash panel</div> : null

@@ -13,18 +13,17 @@ import { useNovelWorkspaceNavigation } from '@/components/novel-workspace/useNov
 import { useStoryDeckCoverage } from '@/components/novel-workspace/useStoryDeckCoverage';
 import { NovelTopBar } from '@/components/NovelTopBar';
 import { StageBar } from '@/components/StageBar';
+import { LocalLibraryRecovery } from '@/components/LocalLibraryRecovery';
 import { useToast } from '@/components/Toast';
+import { Button } from '@/components/ui/button';
 import type { KnowledgeFilterTab } from '@/lib/knowledge-workspace';
-import {
-  isPostInterviewStage,
-  type NovelView,
-} from '@/lib/novel-workspace-view';
+import { type NovelView } from '@/lib/novel-workspace-view';
 import {
   STAGES_THAT_SHOW_UNIFICATION_PANEL,
   isInStages,
 } from '@/lib/novel-stages';
 import { useManuscriptSession } from '@/lib/use-manuscript-session';
-import { useNovel } from '@/lib/use-storage';
+import { localDatabaseIssueCopy, useNovel } from '@/lib/use-storage';
 
 interface NovelWorkspaceProps {
   novelId: string;
@@ -42,7 +41,14 @@ export function NovelWorkspace({
 }: NovelWorkspaceProps) {
   const { t } = useLanguage();
   const { toast } = useToast();
-  const { novel, refresh: refreshNovel, update: updateNovel } = useNovel(novelId);
+  const {
+    novel,
+    loading: novelLoading,
+    error: novelError,
+    databaseIssue,
+    refresh: refreshNovel,
+    update: updateNovel,
+  } = useNovel(novelId);
   const {
     view,
     selectView,
@@ -179,6 +185,26 @@ export function NovelWorkspace({
   const showUnification = !!liveNovel
     && isInStages(liveNovel.stage, STAGES_THAT_SHOW_UNIFICATION_PANEL);
 
+  if (!liveNovel && !novelLoading && (databaseIssue || novelError)) {
+    const issueCopy = databaseIssue ? localDatabaseIssueCopy(t, databaseIssue) : null;
+    return (
+      <div className="book-texture-parchment flex h-full min-h-0 items-center justify-center p-6">
+        <div role="alert" className="w-full max-w-lg rounded-md border border-book-danger/40 bg-book-bg-card p-5">
+          <h1 className="font-serif text-xl text-book-danger">
+            {issueCopy?.title ?? t.errorLoadProjects}
+          </h1>
+          {issueCopy ? <p className="mt-2 text-sm text-book-ink-secondary">{issueCopy.body}</p> : null}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={() => void refreshNovel()}>
+              {t.toastRetry}
+            </Button>
+            {databaseIssue ? <LocalLibraryRecovery /> : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col book-texture-parchment">
       <NovelTopBar
@@ -230,7 +256,6 @@ export function NovelWorkspace({
               novel={liveNovel}
               deckCounts={deckCounts}
               deckLoading={deckLoading}
-              conversationThreadsUnlocked={isPostInterviewStage(liveNovel?.stage)}
               activeConvId={activeConvId}
               setActiveConvId={setActiveConvId}
               onCreateConversation={handleCreateConversation}

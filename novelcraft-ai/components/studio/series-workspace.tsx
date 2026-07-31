@@ -241,16 +241,18 @@ function MembersTab({
     await runMutation(async () => {});
   }, [seriesId, runMutation]);
 
+  const otherMembers = detail.members.filter(m => m.id !== removeTarget?.id);
+
   const onConfirmTransfer = useCallback(async () => {
-    if (!removeTarget || !transferTo) return;
+    if (!removeTarget || (otherMembers.length > 0 && !transferTo)) return;
     await runMutation(async () => {
-      await removeNovelFromSeries(seriesId, removeTarget.id, { transferToNovelId: transferTo });
+      await removeNovelFromSeries(seriesId, removeTarget.id, otherMembers.length > 0
+        ? { transferToNovelId: transferTo }
+        : { keepAnchoredEntriesPrivate: true });
     });
     setRemoveTarget(null);
     setBlocked(null);
-  }, [removeTarget, transferTo, seriesId, runMutation]);
-
-  const otherMembers = detail.members.filter(m => m.id !== removeTarget?.id);
+  }, [otherMembers.length, removeTarget, transferTo, seriesId, runMutation]);
 
   return (
     <div className="space-y-4 pt-4">
@@ -356,7 +358,7 @@ function MembersTab({
               </Select>
             </div>
           ) : (
-            <p className="text-sm text-book-ink-muted">{t.noMembers}</p>
+            <p className="text-sm text-book-ink-muted">{t.keepPrivateOnRemove}</p>
           )}
           <DialogFooter>
             <Button
@@ -369,7 +371,7 @@ function MembersTab({
             <Button
               variant="danger-soft"
               size="sm"
-              disabled={!transferTo || busy}
+              disabled={(otherMembers.length > 0 && !transferTo) || busy}
               onClick={() => void onConfirmTransfer()}
             >
               {t.confirmRemove}

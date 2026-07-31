@@ -67,7 +67,8 @@ export const DESKTOP_COMMANDS = {
   listInstalledLocalModels: 'list_installed_local_models',
   importLocalModel: 'import_local_model',
   revealLocalModel: 'reveal_local_model',
-  removeInstalledLocalModel: 'remove_installed_local_model',
+  unregisterImportedLocalModel: 'unregister_imported_local_model',
+  deleteManagedLocalModel: 'delete_managed_local_model',
   engineStart: 'engine_start',
   engineStop: 'engine_stop',
   engineStatus: 'engine_status',
@@ -332,9 +333,15 @@ export async function listInstalledLocalModels(): Promise<InstalledLocalModel[]>
 }
 
 /** Register an existing local GGUF file or MLX bundle folder without copying it. */
-export async function importLocalModel(modelPath: string): Promise<InstalledLocalModel> {
+export async function importLocalModel(
+  modelPath: string,
+  label?: string,
+): Promise<InstalledLocalModel> {
   requireTauri('importLocalModel');
-  return invokeTauri<InstalledLocalModel>(DESKTOP_COMMANDS.importLocalModel, { modelPath });
+  return invokeTauri<InstalledLocalModel>(DESKTOP_COMMANDS.importLocalModel, {
+    modelPath,
+    label: label ?? null,
+  });
 }
 
 /** Pick an existing GGUF file path through the native desktop dialog. */
@@ -407,10 +414,16 @@ export async function revealExportFile(path: string): Promise<void> {
   await invokeTauri<void>(DESKTOP_COMMANDS.revealExportFile, { path });
 }
 
-/** Remove an installed local model after the UI has confirmed the destructive action. */
-export async function removeInstalledLocalModel(modelPath: string): Promise<void> {
-  requireTauri('removeInstalledLocalModel');
-  await invokeTauri<void>(DESKTOP_COMMANDS.removeInstalledLocalModel, { modelPath });
+/** Unregister an imported external model. Never deletes model bytes. */
+export async function unregisterImportedLocalModel(modelPath: string): Promise<void> {
+  requireTauri('unregisterImportedLocalModel');
+  await invokeTauri<void>(DESKTOP_COMMANDS.unregisterImportedLocalModel, { modelPath });
+}
+
+/** Permanently delete an app-managed model after the UI has confirmed destruction. */
+export async function deleteManagedLocalModel(modelPath: string): Promise<void> {
+  requireTauri('deleteManagedLocalModel');
+  await invokeTauri<void>(DESKTOP_COMMANDS.deleteManagedLocalModel, { modelPath });
 }
 
 export type EngineFormat = 'gguf' | 'mlx';

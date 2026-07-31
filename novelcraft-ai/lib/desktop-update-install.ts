@@ -13,10 +13,36 @@ interface DurableFlushOutcome {
 
 interface InstallDesktopUpdateOptions {
   update: DownloadableUpdate;
+  session?: DesktopUpdateInstallSession;
   flush: () => Promise<DurableFlushOutcome>;
   relaunch: () => Promise<void>;
   onDownloadEvent?: (event: DownloadEvent) => void;
   saveFailedMessage: string;
+}
+
+export interface DesktopUpdateInstallSession {
+  downloaded: boolean;
+  installed: boolean;
+}
+
+/** True when a check must not start because another check or install owns the Update. */
+export function shouldDeferDesktopUpdateCheck(options: {
+  checking: boolean;
+  installing: boolean;
+}): boolean {
+  return options.checking || options.installing;
+}
+
+/**
+ * A check result may replace the live Update resource only when install is idle
+ * and the generation captured at check start still matches the coordinator.
+ */
+export function canReplaceDesktopUpdateResource(options: {
+  installing: boolean;
+  activeGeneration: number;
+  checkGeneration: number;
+}): boolean {
+  return !options.installing && options.activeGeneration === options.checkGeneration;
 }
 
 /** Canonical verified Apple Silicon DMG — allowlisted for shell-open recovery. */
@@ -38,15 +64,22 @@ export type DesktopUpdateFailureCategory =
  */
 export async function installDesktopUpdate({
   update,
+  session = { downloaded: false, installed: false },
   flush,
   relaunch,
   onDownloadEvent,
   saveFailedMessage,
 }: InstallDesktopUpdateOptions): Promise<void> {
-  await update.download(onDownloadEvent);
-  const save = await flush();
-  if (!save.ok) throw new Error(saveFailedMessage);
-  await update.install();
+  if (!session.downloaded) {
+    await update.download(onDownloadEvent);
+    session.downloaded = true;
+  }
+  if (!session.installed) {
+    const save = await flush();
+    if (!save.ok) throw new Error(saveFailedMessage);
+    await update.install();
+    session.installed = true;
+  }
   await relaunch();
 }
 

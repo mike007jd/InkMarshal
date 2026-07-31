@@ -5,14 +5,6 @@ import { Undo2 } from 'lucide-react';
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from '@/components/ui/dialog';
 
 interface RevertChapterButtonProps {
   novelId: string;
@@ -45,7 +37,6 @@ export function RevertChapterButton({
 }: RevertChapterButtonProps) {
   const { t } = useLanguage();
   const { toast } = useToast();
-  const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   // Stash the content that was current right before revert, so we can offer a
   // single 5s "undo" PATCH back. Kept in a ref so the closure on the toast
@@ -53,7 +44,6 @@ export function RevertChapterButton({
   const undoStashRef = useRef<{ content: string; expiresAt: number } | null>(null);
 
   const performRevert = useCallback(async () => {
-    setConfirmOpen(false);
     setBusy(true);
     try {
       if (onBeforeAction && !(await onBeforeAction())) return;
@@ -133,50 +123,17 @@ export function RevertChapterButton({
   if (!hasOriginal) return null;
 
   return (
-    <>
-      <Button
-        variant="ghost"
-        type="button"
-        size="sm"
-        onClick={() => setConfirmOpen(true)}
-        disabled={busy}
-        className="h-7 px-2 text-xs gap-1 text-book-ink-secondary hover:text-book-ink-primary"
-        title={t.revertChapterButton}
-      >
-        <Undo2 className="w-3.5 h-3.5" />
-        <span>{t.revertChapterButton}</span>
-      </Button>
-
-      <Dialog open={confirmOpen} onOpenChange={(o) => { if (!o) setConfirmOpen(false); }}>
-        {confirmOpen && (
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle className="font-serif text-xl">{t.revertChapterConfirmTitle}</DialogTitle>
-              <DialogDescription className="text-book-ink-secondary leading-relaxed">
-                {t.revertChapterConfirmBody}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="ghost"
-                type="button"
-                onClick={() => setConfirmOpen(false)}
-                className="h-auto border border-book-border bg-book-bg-card px-4 py-2 text-sm font-medium text-book-ink-primary hover:bg-book-bg-card"
-              >
-                {t.cancel}
-              </Button>
-              <Button
-                variant="accent"
-                type="button"
-                onClick={performRevert}
-                className="h-auto px-4 py-2 text-sm font-medium"
-              >
-                {t.revertChapterButton}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        )}
-      </Dialog>
-    </>
+    <Button
+      variant="ghost"
+      type="button"
+      size="sm"
+      onClick={() => { void performRevert(); }}
+      disabled={busy}
+      className="h-7 px-2 text-xs gap-1 text-book-ink-secondary hover:text-book-ink-primary"
+      title={t.revertChapterButton}
+    >
+      <Undo2 className="w-3.5 h-3.5" />
+      <span>{t.revertChapterButton}</span>
+    </Button>
   );
 }

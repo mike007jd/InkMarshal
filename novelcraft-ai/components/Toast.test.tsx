@@ -94,14 +94,15 @@ describe('ToastProvider motion lifecycle', () => {
     expect(screen.getAllByText(/^Toast \d$/)).toHaveLength(5);
   });
 
-  it('falls back to the fixed container when the routed anchor is detached', () => {
+  it('stays in the global fixed layer when routed content is replaced', () => {
     const anchor = document.createElement('div');
     anchor.id = 'toast-anchor';
     document.body.appendChild(anchor);
 
     render(<ToastProvider><ToastHarness /></ToastProvider>);
     fireEvent.click(screen.getByRole('button', { name: 'Show toast' }));
-    expect(anchor.contains(screen.getByText('Saved'))).toBe(true);
+    expect(anchor.contains(screen.getByText('Saved'))).toBe(false);
+    expect(screen.getByText('Saved').closest('.fixed')).not.toBeNull();
 
     anchor.remove();
     fireEvent.click(screen.getByRole('button', { name: 'Show six' }));
@@ -109,24 +110,5 @@ describe('ToastProvider motion lifecycle', () => {
     const fixedList = screen.getByText('Toast 6').closest('.fixed');
     expect(fixedList).not.toBeNull();
     expect(document.body.contains(fixedList)).toBe(true);
-  });
-
-  it('portals into the replacement anchor after a routed layout remount', () => {
-    const staleAnchor = document.createElement('div');
-    staleAnchor.id = 'toast-anchor';
-    document.body.appendChild(staleAnchor);
-
-    render(<ToastProvider><ToastHarness /></ToastProvider>);
-    fireEvent.click(screen.getByRole('button', { name: 'Show toast' }));
-    expect(staleAnchor.contains(screen.getByText('Saved'))).toBe(true);
-
-    staleAnchor.remove();
-    const currentAnchor = document.createElement('div');
-    currentAnchor.id = 'toast-anchor';
-    document.body.appendChild(currentAnchor);
-    fireEvent.click(screen.getByRole('button', { name: 'Show six' }));
-
-    expect(currentAnchor.contains(screen.getByText('Toast 6'))).toBe(true);
-    expect(staleAnchor.childElementCount).toBe(0);
   });
 });

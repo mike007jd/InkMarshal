@@ -100,20 +100,28 @@ export function useDiffConfirmation({
     try {
       const saveOutcome = await requestManuscriptFlush();
       if (!saveOutcome.ok) throw new Error(t.editorSaveError);
-      const snapshotResponse = await fetch(
-        `/api/novels/${novelId}/chapters/${chapter.chapterNumber}/snapshots`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label: t.aiRecoverySnapshotLabel }),
-        },
-      );
-      if (!snapshotResponse.ok) throw new Error(t.aiRecoverySnapshotFailed);
+      let snapshotCreated = false;
+      try {
+        const snapshotResponse = await fetch(
+          `/api/novels/${novelId}/chapters/${chapter.chapterNumber}/snapshots`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label: t.aiRecoverySnapshotLabel }),
+          },
+        );
+        snapshotCreated = snapshotResponse.ok;
+      } catch {
+        snapshotCreated = false;
+      }
 
       const editor = editorRef.current;
       const baseContent = editor ? readEditorPlainText(editor) : chapter.content;
       const { text: newContent, skipped } = applyChanges(baseContent, accepted);
       applyTextThroughEditor(newContent);
+      if (!snapshotCreated) {
+        toast(t.aiRecoverySnapshotFailed, 'info');
+      }
       if (skipped > 0) {
         // Some accepted edits overlapped each other (or could no longer be
         // located) and were not written — tell the writer instead of letting

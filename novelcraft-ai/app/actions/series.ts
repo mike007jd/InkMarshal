@@ -189,7 +189,7 @@ export async function addNovelToSeries(seriesId: string, novelId: string): Promi
 export async function removeNovelFromSeries(
   seriesId: string,
   novelId: string,
-  opts?: { transferToNovelId?: string },
+  opts?: { transferToNovelId?: string; keepAnchoredEntriesPrivate?: boolean },
 ): Promise<{ ok: true } | { ok: false; reason: 'anchors_shared_entries'; sharedCount: number }> {
   const user = await requireUser();
   await requireSeriesOwner(seriesId, user.id);
@@ -198,17 +198,25 @@ export async function removeNovelFromSeries(
   if (await novelAnchorsSharedEntries(novelId)) {
     const transferTo = opts?.transferToNovelId;
     if (!transferTo) {
-      const shared = await listSharedEntriesForSeries(seriesId);
-      const sharedCount = shared.filter(e => e.novel_id === novelId).length;
-      return { ok: false, reason: 'anchors_shared_entries', sharedCount };
+      if (opts?.keepAnchoredEntriesPrivate) {
+        const shared = await listSharedEntriesForSeries(seriesId);
+        for (const entry of shared) {
+          if (entry.novel_id === novelId) await setEntrySeriesId(entry.id, null);
+        }
+      } else {
+        const shared = await listSharedEntriesForSeries(seriesId);
+        const sharedCount = shared.filter(e => e.novel_id === novelId).length;
+        return { ok: false, reason: 'anchors_shared_entries', sharedCount };
+      }
+    } else {
+      // Transfer target must be a different member of the same series.
+      const targetSeries = await getNovelSeriesId(transferTo);
+      if (transferTo === novelId || targetSeries !== seriesId) {
+        throw new Error('Invalid transfer target');
+      }
+      await verifyNovelOwnership(transferTo, user.id);
+      await reanchorSharedEntries(novelId, transferTo);
     }
-    // Transfer target must be a different member of the same series.
-    const targetSeries = await getNovelSeriesId(transferTo);
-    if (transferTo === novelId || targetSeries !== seriesId) {
-      throw new Error('Invalid transfer target');
-    }
-    await verifyNovelOwnership(transferTo, user.id);
-    await reanchorSharedEntries(novelId, transferTo);
   }
 
   await clearSharedProjectionForNovel(novelId);
