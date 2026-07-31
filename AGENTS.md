@@ -30,6 +30,20 @@
   cleanup, signing/notarization, and exact-final-DMG single-instance smoke.
 - Packaging does not authorize upload, tag, release, or deployment changes. Release steps live in `novelcraft-ai/docs/LAUNCH_READINESS.md`.
 
+## Updater signing key retention
+
+- The Tauri updater keypair is machine-local release infrastructure. The canonical
+  private key path on the release Mac is `~/.inkmarshal/release/updater.key`; its
+  public counterpart is `~/.inkmarshal/release/updater.key.pub`.
+- Keep the release directory at mode `700` and the private key at mode `600`.
+  Never commit, print, paste, or add either key to logs, screenshots, or cleanup
+  bundles. The private key must survive `clean:desktop-build`, `release:mac`, and
+  ordinary local-state cleanup.
+- Do not delete or rotate this key casually. A rotation requires replacing the
+  updater public key in `novelcraft-ai/src-tauri/tauri.conf.json` and manually
+  installing the bridge release because clients carrying the previous public key
+  cannot verify updates signed by the new key.
+
 ## Documentation
 
 - Start with `docs/README.md`; use code, manifests, tests, and live service state as the source of truth.
