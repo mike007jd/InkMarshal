@@ -206,11 +206,13 @@ const UserMessage: FC = () => {
   );
 };
 
-const Composer: FC<{
+type ComposerProps = {
   controls?: ReactNode;
   placeholder: string;
   sendDisabled?: boolean;
-}> = ({
+};
+
+const Composer: FC<ComposerProps> = ({
   controls,
   placeholder,
   sendDisabled = false,

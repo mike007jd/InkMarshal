@@ -161,9 +161,7 @@ export function ChatArea({
             placeholder={t.typeMessage}
             emptyState={<EmptyChatInterviewGuide />}
             composerFooter={t.aiWarning}
-            composerControls={(
-              <ChatModelPicker onSavingChange={setModelSelectionPending} />
-            )}
+            composerControls={<ChatModelPicker onSavingChange={setModelSelectionPending} />}
             composerSendDisabled={modelSelectionPending}
             errorMessage={errorMessage}
             onRetry={() => void retry()}

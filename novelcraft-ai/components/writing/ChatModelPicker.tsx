@@ -14,7 +14,10 @@ import { ChevronDown, Settings2 } from 'lucide-react';
 import { useLanguage } from '@/components/LanguageProvider';
 import { openModelsPanel } from '@/components/ModelsPanel';
 import { useCapabilityBinding } from '@/components/WritingModelStatusBar';
-import { useConnectionHealth } from '@/components/writing-model-health';
+import {
+  useConnectionHealth,
+  type WritingModelHealth,
+} from '@/components/writing-model-health';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -58,10 +61,33 @@ function optionValue(connectionId: string, modelId: string): string {
   return `${connectionId}${OPTION_SEPARATOR}${modelId}`;
 }
 
+function rememberConfiguredModel(
+  target: Record<string, string[]>,
+  connectionId: string,
+  modelId: string,
+): void {
+  const existing = target[connectionId];
+  if (!existing) {
+    target[connectionId] = [modelId];
+    return;
+  }
+  if (!existing.includes(modelId)) {
+    existing.push(modelId);
+  }
+}
+
+function filterConfiguredModels(
+  configuredModelIds: readonly string[],
+  available: readonly string[],
+): string[] {
+  return configuredModelIds.filter(modelId => available.includes(modelId));
+}
+
 function useConnectionsSnapshot(): {
   configuredModelsByConnection: Record<string, string[]>;
   connections: RuntimeConnection[];
   mounted: boolean;
+  resolutionKey: string;
 } {
   const snapshot = useSyncExternalStore(
     subscribeConnectionsStore,
@@ -78,6 +104,7 @@ function useConnectionsSnapshot(): {
         configuredModelsByConnection: {},
         connections: [],
         mounted: false,
+        resolutionKey: '',
       };
     }
     try {
@@ -89,27 +116,32 @@ function useConnectionsSnapshot(): {
       for (const role of CAPABILITY_ROLES) {
         const binding = parsed.profile[role];
         if (!binding) continue;
-        configuredModelsByConnection[binding.connectionId] = Array.from(new Set([
-          ...(configuredModelsByConnection[binding.connectionId] ?? []),
+        rememberConfiguredModel(
+          configuredModelsByConnection,
+          binding.connectionId,
           binding.modelId,
-        ]));
+        );
         if (binding.fallback) {
-          configuredModelsByConnection[binding.fallback.connectionId] = Array.from(new Set([
-            ...(configuredModelsByConnection[binding.fallback.connectionId] ?? []),
+          rememberConfiguredModel(
+            configuredModelsByConnection,
+            binding.fallback.connectionId,
             binding.fallback.modelId,
-          ]));
+          );
         }
       }
       return {
         configuredModelsByConnection,
         connections: parsed.connections,
         mounted: true,
+        // Snapshot is already the durable identity for connections + profile.
+        resolutionKey: snapshot,
       };
     } catch {
       return {
         configuredModelsByConnection: {},
         connections: [],
         mounted: true,
+        resolutionKey: snapshot,
       };
     }
   }, [snapshot]);
@@ -132,14 +164,14 @@ async function listSelectableModels(
     const tags: string[] = await ollamaListTags(connection.baseUrl)
       .catch((): string[] => []);
     if (tags.length > 0) {
-      return configuredModelIds.filter(modelId => tags.includes(modelId));
+      return filterConfiguredModels(configuredModelIds, tags);
     }
   }
 
   const health = await checkConnectionHealth(connection);
   if (!health.reachable || !health.transportOk) return [];
   if (health.models.length > 0) {
-    return configuredModelIds.filter(modelId => health.models.includes(modelId));
+    return filterConfiguredModels(configuredModelIds, health.models);
   }
   return [...configuredModelIds];
 }
@@ -154,6 +186,32 @@ function fallbackForSelection(
   return binding.fallback;
 }
 
+function pickerStatusPresentation(
+  unavailable: boolean,
+  health: WritingModelHealth,
+  bound: boolean,
+  labels: {
+    checking: string;
+    down: string;
+    ok: string;
+    unavailable: string;
+  },
+): { dotClass: string; healthLabel: string } {
+  if (unavailable) {
+    return { dotClass: 'bg-book-danger', healthLabel: labels.unavailable };
+  }
+  if (health === 'ok') {
+    return { dotClass: 'bg-book-success', healthLabel: labels.ok };
+  }
+  if (health === 'down') {
+    return { dotClass: 'bg-book-danger', healthLabel: labels.down };
+  }
+  return {
+    dotClass: bound ? 'bg-book-ink-muted' : 'bg-book-gold',
+    healthLabel: labels.checking,
+  };
+}
+
 export function ChatModelPicker({
   onSavingChange,
 }: {
@@ -166,20 +224,15 @@ export function ChatModelPicker({
     configuredModelsByConnection,
     connections,
     mounted: connectionsMounted,
+    resolutionKey,
   } = useConnectionsSnapshot();
   const { binding, conn } = resolved;
   const { health } = useConnectionHealth(conn);
 
-  const connectionsKey = useMemo(() => JSON.stringify(connections), [connections]);
-  const configuredModelsKey = useMemo(
-    () => JSON.stringify(configuredModelsByConnection),
-    [configuredModelsByConnection],
-  );
-  const resolutionKey = `${connectionsKey}:${configuredModelsKey}`;
   const [resolvedOptions, setResolvedOptions] = useState<{
-    connectionsKey: string;
     modelsByConnection: Record<string, string[]>;
-  }>({ connectionsKey: '', modelsByConnection: {} });
+    resolutionKey: string;
+  }>({ modelsByConnection: {}, resolutionKey: '' });
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const loadSequenceRef = useRef(0);
@@ -200,8 +253,8 @@ export function ChatModelPicker({
     ).then(entries => {
       if (cancelled || loadSequenceRef.current !== sequence) return;
       setResolvedOptions({
-        connectionsKey: resolutionKey,
         modelsByConnection: Object.fromEntries(entries),
+        resolutionKey,
       });
     });
 
@@ -210,14 +263,12 @@ export function ChatModelPicker({
     };
   }, [
     configuredModelsByConnection,
-    configuredModelsKey,
     connections,
-    connectionsKey,
     connectionsMounted,
     resolutionKey,
   ]);
 
-  const loadingOptions = resolvedOptions.connectionsKey !== resolutionKey;
+  const loadingOptions = resolvedOptions.resolutionKey !== resolutionKey;
 
   const options = useMemo<ChatModelOption[]>(() => {
     const next: ChatModelOption[] = [];
@@ -244,7 +295,7 @@ export function ChatModelPicker({
     return next;
   }, [binding, connections, loadingOptions, resolvedOptions.modelsByConnection]);
 
-  const selectableOptions = options.filter(option => option.selectable);
+  const hasSelectableOptions = options.some(option => option.selectable);
   const bound = Boolean(binding && conn);
   const currentValue = binding
     ? optionValue(binding.connectionId, binding.modelId)
@@ -302,7 +353,7 @@ export function ChatModelPicker({
     );
   }
 
-  if (!bound && !loadingOptions && selectableOptions.length === 0) {
+  if (!bound && !loadingOptions && !hasSelectableOptions) {
     return (
       <Button
         type="button"
@@ -319,16 +370,17 @@ export function ChatModelPicker({
     );
   }
 
-  const dotClass =
-    currentModelUnavailable
-      ? 'bg-book-danger'
-      : health === 'ok'
-      ? 'bg-book-success'
-      : health === 'down'
-        ? 'bg-book-danger'
-        : bound
-          ? 'bg-book-ink-muted'
-          : 'bg-book-gold';
+  const { dotClass, healthLabel } = pickerStatusPresentation(
+    currentModelUnavailable,
+    health,
+    bound,
+    {
+      checking: t.statusBarHealthChecking,
+      down: t.statusBarHealthDown,
+      ok: t.statusBarHealthOk,
+      unavailable: t.chatModelPickerUnavailable,
+    },
+  );
   const triggerLabel = bound
     ? binding!.modelId
     : loadingOptions
@@ -339,14 +391,6 @@ export function ChatModelPicker({
       ? t.statusLocalPrefix
       : conn!.label
     : null;
-  const healthLabel =
-    currentModelUnavailable
-      ? t.chatModelPickerUnavailable
-      : health === 'ok'
-      ? t.statusBarHealthOk
-      : health === 'down'
-        ? t.statusBarHealthDown
-        : t.statusBarHealthChecking;
   const accessibleTriggerLabel = [
     t.chatModelPickerLabel,
     triggerLabel,
