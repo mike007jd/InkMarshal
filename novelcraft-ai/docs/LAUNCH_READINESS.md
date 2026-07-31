@@ -42,6 +42,13 @@ Notarization authenticates only via `notarytool --keychain-profile`. Create the 
 cleaning or building. Do not pass Apple ID or app-specific passwords on the release command line,
 and do not load them from `apple.env`.
 
+The updater signing key is separate from Apple notarization credentials. On the release Mac,
+`release:mac` uses `~/.inkmarshal/release/updater.key` by default; keep that directory at mode `700`
+and the private key at mode `600`. The keypair is not repository data and must survive build cleanup,
+state cleanup, and workstation maintenance. Never commit or log the private key. If it is rotated,
+replace the public key in `src-tauri/tauri.conf.json` and manually install that bridge release before
+expecting existing clients to receive automatic updates.
+
 ## Preflight
 
 Run from `novelcraft-ai/`:

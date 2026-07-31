@@ -67,7 +67,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5QTIzNzZDRjhDQTI2MDkKUldRSkpzcjRiRGVpS1Jab0pra2tGNFlPSTU1cXk3R2FiZmRsT1M2RjVDNVF5Y0w5b3kxaW9nUVgK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIyM0U5RURDRjBEQjNCMzgKUldRNE85dnczSjQrSXZsczhrai92aks0a1RkMkd3YWcrSkpYdU9kbVdsNzFWNDA5Sm00WFJYT1UK",
       "endpoints": [
         "https://github.com/mike007jd/InkMarshal/releases/latest/download/latest.json"
       ]
