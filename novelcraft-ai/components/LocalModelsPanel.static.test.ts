@@ -29,6 +29,18 @@ describe('LocalModelsPanel removal path', () => {
     expect(source).toContain('removingModelPathsRef.current.delete(model.modelPath)');
   });
 
+  it('exposes removal on installed recommendation cards and reports failures', () => {
+    const source = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
+
+    expect(source).toContain('{installedModel && (');
+    expect(source).toContain('onClick={() => setPendingRemoval(installedModel)}');
+    expect(source).toContain('? t.modelManagerRemoveFailed');
+    expect(source).toContain(': t.modelManagerUnregisterFailed');
+    expect(source).toContain('setInstalled(current => current.filter(item => item.modelPath !== model.modelPath))');
+    expect(source).toContain('await refresh().catch(() => {})');
+    expect(source).toContain("variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}");
+  });
+
   it('uses current provider health and exact advertised models for role coverage', () => {
     const source = readFileSync(join(process.cwd(), 'components/LocalModelsPanel.tsx'), 'utf8');
 
