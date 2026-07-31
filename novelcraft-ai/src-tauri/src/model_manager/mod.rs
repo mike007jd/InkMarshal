@@ -461,6 +461,52 @@ mod installed_model_scan_tests {
     }
 
     #[test]
+    fn imported_registration_keeps_files_under_model_root_unregister_only() {
+        let root = test_root("import-under-root");
+        let model = root.join("external.Q4_K_M.gguf");
+        fs::write(&model, b"GGUFexternal").expect("gguf");
+        let canonical = model.canonicalize().expect("canonical");
+        let mut imported = std::collections::HashMap::new();
+        imported.insert(
+            metadata_key(&canonical),
+            ImportedModelMetadata {
+                label: "External Under Root".to_string(),
+                format: "gguf".to_string(),
+                imported_at_unix: 9,
+            },
+        );
+        write_imported_metadata(&root, &imported).expect("write imported");
+
+        let found = scan_installed_models_root(&root).expect("scan");
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].managed_by_app);
+        assert_eq!(found[0].label, "External Under Root");
+
+        let target =
+            removable_managed_model_path(&root, &model.to_string_lossy()).expect("path under root");
+        let still_imported = read_imported_metadata(&root);
+        assert!(still_imported.contains_key(&metadata_key(&target)));
+        // delete_managed_local_model refuses this ownership shape; unregister only
+        // clears metadata and must leave bytes untouched.
+        write_imported_metadata(&root, &std::collections::HashMap::new()).expect("unregister");
+        assert!(model.exists());
+        assert_eq!(fs::read(&model).expect("bytes"), b"GGUFexternal");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imported_model_from_path_never_claims_app_ownership() {
+        let root = test_root("import-no-own");
+        let model = root.join("inside.Q4_K_M.gguf");
+        fs::write(&model, b"GGUFinside").expect("gguf");
+        let imported = imported_model_from_path(&root, &model, Some("Inside".to_string()))
+            .expect("import shape");
+        assert!(!imported.managed_by_app);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn registered_model_path_reveals_only_real_models() {
         let root = test_root("reveal-validate");
         let gguf = root.join("writer.Q4_K_M.gguf");

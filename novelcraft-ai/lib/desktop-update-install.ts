@@ -25,6 +25,26 @@ export interface DesktopUpdateInstallSession {
   installed: boolean;
 }
 
+/** True when a check must not start because another check or install owns the Update. */
+export function shouldDeferDesktopUpdateCheck(options: {
+  checking: boolean;
+  installing: boolean;
+}): boolean {
+  return options.checking || options.installing;
+}
+
+/**
+ * A check result may replace the live Update resource only when install is idle
+ * and the generation captured at check start still matches the coordinator.
+ */
+export function canReplaceDesktopUpdateResource(options: {
+  installing: boolean;
+  activeGeneration: number;
+  checkGeneration: number;
+}): boolean {
+  return !options.installing && options.activeGeneration === options.checkGeneration;
+}
+
 /** Canonical verified Apple Silicon DMG — allowlisted for shell-open recovery. */
 export const VERIFIED_MAC_DMG_DOWNLOAD_URL =
   'https://github.com/mike007jd/InkMarshal/releases/latest/download/InkMarshal-mac-aarch64.dmg';

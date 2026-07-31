@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -12,7 +13,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDbForTest, getDb } from '@/lib/db/connection';
-import { clearLocalLibraryContent, resetLocalLibrary } from '@/lib/db/local-library-reset';
+import {
+  __localLibraryResetTest,
+  clearLocalLibraryContent,
+  resetLocalLibrary,
+} from '@/lib/db/local-library-reset';
 import { CURRENT_SCHEMA_VERSION } from '@/lib/db/schema';
 
 const previousDataDir = process.env.INKMARSHAL_DATA_DIR;
@@ -29,6 +34,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __localLibraryResetTest.afterArtifactsQuarantined = null;
   closeDbForTest();
   if (previousDataDir === undefined) delete process.env.INKMARSHAL_DATA_DIR;
   else process.env.INKMARSHAL_DATA_DIR = previousDataDir;
@@ -136,11 +142,14 @@ describe('local library reset', () => {
 
     const modelPath = path.join(dataDir, 'models', 'keep.gguf');
     const settingsPath = path.join(dataDir, 'provider-connections.json');
+    const logPath = path.join(dataDir, 'logs', 'app.log');
     const appVaultPath = path.join(dataDir, 'vaults', 'old-novel', 'worlds', 'city.md');
     mkdirSync(path.dirname(modelPath), { recursive: true });
+    mkdirSync(path.dirname(logPath), { recursive: true });
     mkdirSync(path.dirname(appVaultPath), { recursive: true });
     writeFileSync(modelPath, 'model-bytes');
     writeFileSync(settingsPath, '{"keep":true}');
+    writeFileSync(logPath, 'keep-logs');
     writeFileSync(appVaultPath, 'obsolete-vault');
 
     resetLocalLibrary();
@@ -148,9 +157,64 @@ describe('local library reset', () => {
     expect(migrationBackups.every(filePath => !existsSync(filePath))).toBe(true);
     expect(readFileSync(modelPath, 'utf8')).toBe('model-bytes');
     expect(readFileSync(settingsPath, 'utf8')).toBe('{"keep":true}');
+    expect(readFileSync(logPath, 'utf8')).toBe('keep-logs');
     expect(existsSync(appVaultPath)).toBe(false);
     expect(
       getDb().prepare("SELECT name FROM sqlite_master WHERE name = 'reset_sentinel'").get(),
     ).toBeUndefined();
+  });
+
+  it('restores every SQLite artifact and the app-owned Vault when new library validation fails', () => {
+    const live = getDb();
+    const now = new Date().toISOString();
+    live.prepare('INSERT INTO novels (id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .run('novel-keep', 'local-user', now, now);
+    live.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('inkmarshal_settings', '{"theme":"restore-me"}', now);
+    const walPath = `${dbPath()}-wal`;
+    const shmPath = `${dbPath()}-shm`;
+    const journalPath = `${dbPath()}-journal`;
+    const backupPath = `${dbPath()}.pre-migration-v20-2026-08-01T00-00-00-000Z.bak`;
+    const appVaultPath = path.join(dataDir, 'vaults', 'novel-keep', 'characters', 'hero.md');
+    mkdirSync(path.dirname(appVaultPath), { recursive: true });
+    writeFileSync(appVaultPath, 'vault-keep');
+    const modelPath = path.join(dataDir, 'models', 'keep.gguf');
+    mkdirSync(path.dirname(modelPath), { recursive: true });
+    writeFileSync(modelPath, 'model-bytes');
+
+    // Snapshot after close so the main DB includes checkpointed writes, then
+    // plant exact allowlisted sidecars that must round-trip through failure.
+    closeDbForTest();
+    const originalDb = readFileSync(dbPath());
+    writeFileSync(walPath, 'wal-bytes');
+    writeFileSync(shmPath, 'shm-bytes');
+    writeFileSync(journalPath, 'journal-bytes');
+    writeFileSync(backupPath, 'backup-bytes');
+    __localLibraryResetTest.afterArtifactsQuarantined = () => {
+      // Occupy the live DB path so the replacement library cannot be created.
+      mkdirSync(dbPath());
+    };
+
+    expect(() => resetLocalLibrary()).toThrow();
+
+    expect(readFileSync(dbPath())).toEqual(originalDb);
+    expect(readFileSync(walPath, 'utf8')).toBe('wal-bytes');
+    expect(readFileSync(shmPath, 'utf8')).toBe('shm-bytes');
+    expect(readFileSync(journalPath, 'utf8')).toBe('journal-bytes');
+    expect(readFileSync(backupPath, 'utf8')).toBe('backup-bytes');
+    expect(readFileSync(appVaultPath, 'utf8')).toBe('vault-keep');
+    expect(readFileSync(modelPath, 'utf8')).toBe('model-bytes');
+    expect(readdirSync(dataDir).some(name => name.startsWith('.library-reset-'))).toBe(false);
+    expect(readdirSync(dataDir).some(name => name.startsWith('.vaults-clear-'))).toBe(false);
+
+    // Drop the intentionally invalid sidecars before verifying SQL content.
+    rmSync(walPath, { force: true });
+    rmSync(shmPath, { force: true });
+    rmSync(journalPath, { force: true });
+    const restored = getDb();
+    expect(restored.prepare('SELECT id FROM novels WHERE id = ?').get('novel-keep'))
+      .toEqual({ id: 'novel-keep' });
+    expect(restored.prepare('SELECT value FROM app_settings WHERE key = ?').get('inkmarshal_settings'))
+      .toEqual({ value: '{"theme":"restore-me"}' });
   });
 });

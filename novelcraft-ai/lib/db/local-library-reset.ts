@@ -5,6 +5,12 @@ import path from 'node:path';
 
 import { LOCAL_DB_FILE, resolveLocalDbDir } from '@/lib/db-local-path';
 import { closeDb, getDb } from '@/lib/db/connection';
+import {
+  discardAppOwnedVaultQuarantine,
+  quarantineAppOwnedVaultRoot,
+  restoreAppOwnedVaultQuarantine,
+  type AppOwnedVaultQuarantine,
+} from '@/lib/vault/app-owned-cleanup';
 
 function isLocalLibraryArtifact(fileName: string): boolean {
   if (
@@ -18,32 +24,66 @@ function isLocalLibraryArtifact(fileName: string): boolean {
     && (fileName.endsWith('.bak') || fileName.endsWith('.bak.tmp'));
 }
 
-interface VaultQuarantine {
+interface ArtifactQuarantine {
   source: string;
   quarantine: string;
 }
 
-function quarantineAppOwnedVaults(dbDir: string): VaultQuarantine | null {
-  // The default Vault root is an app-owned child of the canonical app data
-  // directory. Custom/external Vault paths are never derived or traversed.
-  const source = path.join(dbDir, 'vaults');
-  if (!existsSync(source)) return null;
-  const quarantine = path.join(dbDir, `.vaults-clear-${crypto.randomUUID()}`);
-  renameSync(source, quarantine);
-  return { source, quarantine };
-}
+/** @internal Test seam: runs after SQLite artifacts are quarantined, before getDb(). */
+export const __localLibraryResetTest = {
+  afterArtifactsQuarantined: null as null | (() => void),
+};
 
-function restoreVaultQuarantine(value: VaultQuarantine | null): void {
-  if (!value || !existsSync(value.quarantine)) return;
-  if (existsSync(value.source)) {
-    throw new Error('Could not restore the app-owned Vault because its original path was recreated.');
+function quarantineLocalLibraryArtifacts(dbDir: string): ArtifactQuarantine[] {
+  const token = crypto.randomUUID();
+  const quarantines: ArtifactQuarantine[] = [];
+  try {
+    for (const entry of readdirSync(dbDir, { withFileTypes: true })) {
+      if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+      if (!isLocalLibraryArtifact(entry.name)) continue;
+      const source = path.join(dbDir, entry.name);
+      // Same-directory rename keeps the quarantine on the same volume and leaves
+      // a reversible handle. The prefix never matches the exact allowlist.
+      const quarantine = path.join(dbDir, `.library-reset-${token}-${entry.name}`);
+      renameSync(source, quarantine);
+      quarantines.push({ source, quarantine });
+    }
+  } catch (error) {
+    // A later rename can fail after earlier artifacts already moved. Roll back
+    // here because the caller cannot receive a partially built return value.
+    restoreArtifactQuarantines(quarantines);
+    throw error;
   }
-  renameSync(value.quarantine, value.source);
+  return quarantines;
 }
 
-function discardVaultQuarantine(value: VaultQuarantine | null): void {
-  if (!value) return;
-  rmSync(value.quarantine, { recursive: true, force: true });
+function removeNewlyCreatedLibraryArtifacts(
+  dbDir: string,
+  quarantines: readonly ArtifactQuarantine[],
+): void {
+  const quarantinePaths = new Set(quarantines.map(item => item.quarantine));
+  for (const entry of readdirSync(dbDir, { withFileTypes: true })) {
+    if (!isLocalLibraryArtifact(entry.name)) continue;
+    const fullPath = path.join(dbDir, entry.name);
+    if (quarantinePaths.has(fullPath)) continue;
+    rmSync(fullPath, { recursive: true, force: true });
+  }
+}
+
+function restoreArtifactQuarantines(quarantines: readonly ArtifactQuarantine[]): void {
+  for (const item of quarantines) {
+    if (!existsSync(item.quarantine)) continue;
+    if (existsSync(item.source)) {
+      rmSync(item.source, { recursive: true, force: true });
+    }
+    renameSync(item.quarantine, item.source);
+  }
+}
+
+function discardArtifactQuarantines(quarantines: readonly ArtifactQuarantine[]): void {
+  for (const item of quarantines) {
+    rmSync(item.quarantine, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -54,8 +94,7 @@ function discardVaultQuarantine(value: VaultQuarantine | null): void {
  */
 export function clearLocalLibraryContent(): void {
   const db = getDb();
-  const dbDir = resolveLocalDbDir();
-  const vaultQuarantine = quarantineAppOwnedVaults(dbDir);
+  const vaultQuarantine = quarantineAppOwnedVaultRoot();
   const clear = db.transaction(() => {
     // These two tables are not fully owned by a novel FK and would otherwise
     // leave user activity behind after every novel is removed.
@@ -69,35 +108,42 @@ export function clearLocalLibraryContent(): void {
   try {
     clear();
   } catch (error) {
-    restoreVaultQuarantine(vaultQuarantine);
+    restoreAppOwnedVaultQuarantine(vaultQuarantine);
     throw error;
   }
-  discardVaultQuarantine(vaultQuarantine);
+  discardAppOwnedVaultQuarantine(vaultQuarantine);
 }
 
 /**
  * Permanently clears the local writing library after explicit UI confirmation.
  * App-owned model files, provider files, logs, and external Vault directories
  * are outside this exact-name allowlist and remain untouched.
+ *
+ * Failure restores every previous SQLite artifact and the app-owned Vault.
+ * Success creates a verified current-schema library before discarding quarantine.
  */
 export function resetLocalLibrary(): void {
   const dbDir = resolveLocalDbDir();
   closeDb();
   mkdirSync(dbDir, { recursive: true });
-  const vaultQuarantine = quarantineAppOwnedVaults(dbDir);
 
-  for (const entry of readdirSync(dbDir, { withFileTypes: true })) {
-    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-    if (!isLocalLibraryArtifact(entry.name)) continue;
-    rmSync(path.join(dbDir, entry.name), { force: true });
-  }
-
-  // Return success only after a clean current-schema library can be opened.
+  let vaultQuarantine: AppOwnedVaultQuarantine | null = null;
+  let artifactQuarantines: ArtifactQuarantine[] = [];
   try {
+    vaultQuarantine = quarantineAppOwnedVaultRoot();
+    artifactQuarantines = quarantineLocalLibraryArtifacts(dbDir);
+    __localLibraryResetTest.afterArtifactsQuarantined?.();
+
+    // Return success only after a clean current-schema library can be opened.
     getDb();
   } catch (error) {
-    restoreVaultQuarantine(vaultQuarantine);
+    closeDb();
+    removeNewlyCreatedLibraryArtifacts(dbDir, artifactQuarantines);
+    restoreArtifactQuarantines(artifactQuarantines);
+    restoreAppOwnedVaultQuarantine(vaultQuarantine);
     throw error;
   }
-  discardVaultQuarantine(vaultQuarantine);
+
+  discardArtifactQuarantines(artifactQuarantines);
+  discardAppOwnedVaultQuarantine(vaultQuarantine);
 }

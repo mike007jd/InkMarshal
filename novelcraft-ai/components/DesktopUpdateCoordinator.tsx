@@ -11,9 +11,11 @@ import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import { isTauriRuntime, openExternal } from '@/lib/desktop-runtime';
 import {
   VERIFIED_MAC_DMG_DOWNLOAD_URL,
+  canReplaceDesktopUpdateResource,
   categorizeDesktopUpdateFailure,
   desktopUpdateFailureMessage,
   installDesktopUpdate,
+  shouldDeferDesktopUpdateCheck,
   type DesktopUpdateInstallSession,
 } from '@/lib/desktop-update-install';
 import { isCriticalDesktopUpdate, updateProgressPercent } from '@/lib/desktop-updates';
@@ -40,20 +42,41 @@ export function DesktopUpdateCoordinator() {
     downloaded: false,
     installed: false,
   });
+  const installingRef = useRef(false);
+  const checkingRef = useRef(false);
+  const updateGenerationRef = useRef(0);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let disposed = false;
-    let checking = false;
 
     const checkForUpdate = async (source: 'startup' | 'manual') => {
-      if (checking) return;
-      checking = true;
+      if (shouldDeferDesktopUpdateCheck({
+        checking: checkingRef.current,
+        installing: installingRef.current,
+      })) {
+        // Keep the current Update + install session. Manual checks still report
+        // that an update is already in flight when one is visible.
+        if (source === 'manual' && updateRef.current) {
+          publishDesktopUpdateCheckResult('update-available');
+        }
+        return;
+      }
+      checkingRef.current = true;
+      const checkGeneration = updateGenerationRef.current;
       if (source === 'manual') publishDesktopUpdateCheckResult('checking');
       try {
         const { check } = await import('@tauri-apps/plugin-updater');
         const result = await check({ timeout: 12_000 });
         if (disposed) {
+          void result?.close();
+          return;
+        }
+        if (!canReplaceDesktopUpdateResource({
+          installing: installingRef.current,
+          activeGeneration: updateGenerationRef.current,
+          checkGeneration,
+        })) {
           void result?.close();
           return;
         }
@@ -63,6 +86,7 @@ export function DesktopUpdateCoordinator() {
         }
         const previous = updateRef.current;
         if (previous && previous !== result) await previous.close().catch(() => undefined);
+        updateGenerationRef.current += 1;
         installSessionRef.current = { downloaded: false, installed: false };
         setCritical(isCriticalDesktopUpdate(result));
         updateRef.current = result;
@@ -73,7 +97,7 @@ export function DesktopUpdateCoordinator() {
         // interrupts local writing. Manual checks report the failure in Settings.
         if (!disposed && source === 'manual') publishDesktopUpdateCheckResult('failed');
       } finally {
-        checking = false;
+        checkingRef.current = false;
       }
     };
 
@@ -97,17 +121,19 @@ export function DesktopUpdateCoordinator() {
   }, []);
 
   const dismiss = useCallback(() => {
-    if (installing) return;
+    if (installingRef.current) return;
     void update?.close();
     updateRef.current = null;
+    updateGenerationRef.current += 1;
     setUpdate(null);
     setError(null);
     setShowVerifiedDmgRecovery(false);
     installSessionRef.current = { downloaded: false, installed: false };
-  }, [installing, update]);
+  }, [update]);
 
   const install = useCallback(async () => {
-    if (!update || installing) return;
+    if (!update || installingRef.current) return;
+    installingRef.current = true;
     setInstalling(true);
     setError(null);
     setShowVerifiedDmgRecovery(false);
@@ -140,10 +166,11 @@ export function DesktopUpdateCoordinator() {
       const category = categorizeDesktopUpdateFailure(cause, t.updateSaveFailed);
       setError(desktopUpdateFailureMessage(category, t));
       setShowVerifiedDmgRecovery(category !== 'save-failed');
+      installingRef.current = false;
       setInstalling(false);
       setProgress(null);
     }
-  }, [installing, t, update]);
+  }, [t, update]);
 
   const openVerifiedDmg = useCallback(async () => {
     try {

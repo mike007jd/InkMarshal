@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   VERIFIED_MAC_DMG_DOWNLOAD_URL,
+  canReplaceDesktopUpdateResource,
   categorizeDesktopUpdateFailure,
   desktopUpdateFailureMessage,
   installDesktopUpdate,
+  shouldDeferDesktopUpdateCheck,
 } from '@/lib/desktop-update-install';
 
 const t = {
@@ -14,6 +16,32 @@ const t = {
   updateInstallPermissionFailed: 'permission-failure',
   updateSaveFailed: 'save-failed',
 };
+
+describe('desktop update check/install exclusion', () => {
+  it('defers checks while another check or install is active', () => {
+    expect(shouldDeferDesktopUpdateCheck({ checking: false, installing: false })).toBe(false);
+    expect(shouldDeferDesktopUpdateCheck({ checking: true, installing: false })).toBe(true);
+    expect(shouldDeferDesktopUpdateCheck({ checking: false, installing: true })).toBe(true);
+  });
+
+  it('binds Update replacement to install generation so active installs keep their session', () => {
+    expect(canReplaceDesktopUpdateResource({
+      installing: false,
+      activeGeneration: 2,
+      checkGeneration: 2,
+    })).toBe(true);
+    expect(canReplaceDesktopUpdateResource({
+      installing: true,
+      activeGeneration: 2,
+      checkGeneration: 2,
+    })).toBe(false);
+    expect(canReplaceDesktopUpdateResource({
+      installing: false,
+      activeGeneration: 3,
+      checkGeneration: 2,
+    })).toBe(false);
+  });
+});
 
 describe('installDesktopUpdate', () => {
   it('downloads, durably flushes, installs, and only then relaunches', async () => {

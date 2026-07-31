@@ -78,26 +78,54 @@ pub fn reveal_local_model(app: tauri::AppHandle, model_path: String) -> Result<(
     reveal_path(&target)
 }
 
+/// Remove imported-model registration metadata only. Never deletes model bytes,
+/// even when the current model root later contains the same path.
 #[tauri::command]
-pub fn remove_installed_local_model(
+pub fn unregister_imported_local_model(
     app: tauri::AppHandle,
     model_path: String,
 ) -> Result<(), String> {
     let root = model_dir_for(&app)?;
-    if let Ok(target_canon) = removable_managed_model_path(&root, &model_path) {
-        let meta_path = metadata_key(&target_canon);
-        if target_canon.is_dir() {
-            std::fs::remove_dir_all(&target_canon)
-                .map_err(|e| io_err("Couldn't remove the model", &e))?;
-        } else {
-            std::fs::remove_file(&target_canon)
-                .map_err(|e| io_err("Couldn't remove the model", &e))?;
-        }
-        let _ = remove_installed_metadata(&app, &meta_path);
-        return Ok(());
+    let imported = read_imported_metadata(&root);
+    let target = PathBuf::from(&model_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&model_path));
+    let key = metadata_key(&target);
+    if !imported.contains_key(&key) {
+        return Err("Model path is not registered as an imported external model".to_string());
     }
-
+    // Re-validate the file is still a real model when present, but never delete it.
+    if target.exists() {
+        let _ =
+            imported_model_from_path(&root, &target, imported.get(&key).map(|m| m.label.clone()));
+    }
     remove_imported_metadata(&app, &model_path)
+}
+
+/// Permanently delete an app-managed model under the current model root.
+/// Requires explicit destructive intent from the caller and native ownership
+/// validation; imported registrations are refused so bytes cannot be deleted
+/// through a stale managed-by-app UI flag after a model-root change.
+#[tauri::command]
+pub fn delete_managed_local_model(app: tauri::AppHandle, model_path: String) -> Result<(), String> {
+    let root = model_dir_for(&app)?;
+    let target_canon = removable_managed_model_path(&root, &model_path)?;
+    let imported = read_imported_metadata(&root);
+    if imported.contains_key(&metadata_key(&target_canon)) {
+        return Err(
+            "Imported external models can only be unregistered; their files are never deleted"
+                .to_string(),
+        );
+    }
+    let meta_path = metadata_key(&target_canon);
+    if target_canon.is_dir() {
+        std::fs::remove_dir_all(&target_canon)
+            .map_err(|e| io_err("Couldn't remove the model", &e))?;
+    } else {
+        std::fs::remove_file(&target_canon).map_err(|e| io_err("Couldn't remove the model", &e))?;
+    }
+    let _ = remove_installed_metadata(&app, &meta_path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -205,7 +233,7 @@ pub(super) fn scan_installed_models_root(root: &Path) -> Result<Vec<InstalledLoc
     let metadata = read_installed_metadata(&root_canon);
     let imported = read_imported_metadata(&root_canon);
     let mut out = Vec::new();
-    scan_installed_models_dir(&root_canon, &root_canon, &metadata, &mut out)?;
+    scan_installed_models_dir(&root_canon, &root_canon, &metadata, &imported, &mut out)?;
     append_imported_models(&root_canon, &imported, &mut out)?;
     out.sort_by(|a, b| {
         a.label
@@ -219,21 +247,33 @@ pub(super) fn scan_installed_models_dir(
     root: &Path,
     dir: &Path,
     metadata: &std::collections::HashMap<String, InstalledModelMetadata>,
+    imported: &std::collections::HashMap<String, ImportedModelMetadata>,
     out: &mut Vec<InstalledLocalModel>,
 ) -> Result<(), String> {
     if is_mlx_model_dir(dir)? && dir != root {
-        let meta = metadata.get(&metadata_key(dir));
+        let key = metadata_key(dir);
+        let imported_meta = imported.get(&key);
+        let meta = metadata.get(&key);
         out.push(InstalledLocalModel {
-            label: meta
+            label: imported_meta
                 .map(|m| m.label.clone())
+                .or_else(|| meta.map(|m| m.label.clone()))
                 .unwrap_or_else(|| model_label(root, dir)),
             model_path: dir.to_string_lossy().into_owned(),
             format: "mlx".to_string(),
             size_bytes: dir_size(dir)?,
-            source_repo: meta.map(|m| m.source_repo.clone()),
+            source_repo: if imported_meta.is_some() {
+                None
+            } else {
+                meta.map(|m| m.source_repo.clone())
+            },
             source_filename: None,
-            installed_at_unix: meta.map(|m| m.installed_at_unix),
-            managed_by_app: true,
+            installed_at_unix: imported_meta
+                .map(|m| m.imported_at_unix)
+                .or_else(|| meta.map(|m| m.installed_at_unix)),
+            // Imported registration wins over directory presence so a model-root
+            // change cannot reclassify external files as managed deletable bytes.
+            managed_by_app: imported_meta.is_none(),
         });
         return Ok(());
     }
@@ -253,7 +293,7 @@ pub(super) fn scan_installed_models_dir(
             if is_snapshot_temp_dir(&path) {
                 continue;
             }
-            scan_installed_models_dir(root, &path, metadata, out)?;
+            scan_installed_models_dir(root, &path, metadata, imported, out)?;
         } else if ftype.is_file()
             && path
                 .extension()
@@ -261,28 +301,39 @@ pub(super) fn scan_installed_models_dir(
                 .map(|ext| ext.eq_ignore_ascii_case("gguf"))
                 .unwrap_or(false)
         {
-            let stored = metadata.get(&metadata_key(&path));
+            let key = metadata_key(&path);
+            let imported_meta = imported.get(&key);
+            let stored = metadata.get(&key);
             out.push(InstalledLocalModel {
-                label: stored.map(|m| m.label.clone()).unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("GGUF model")
-                        .to_string()
-                }),
+                label: imported_meta
+                    .map(|m| m.label.clone())
+                    .or_else(|| stored.map(|m| m.label.clone()))
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("GGUF model")
+                            .to_string()
+                    }),
                 model_path: path.to_string_lossy().into_owned(),
                 format: "gguf".to_string(),
                 size_bytes: entry
                     .metadata()
                     .map_err(|e| io_err("Couldn't read model metadata", &e))?
                     .len(),
-                source_repo: stored.map(|m| m.source_repo.clone()),
-                source_filename: if stored.is_some() {
+                source_repo: if imported_meta.is_some() {
+                    None
+                } else {
+                    stored.map(|m| m.source_repo.clone())
+                },
+                source_filename: if imported_meta.is_none() && stored.is_some() {
                     managed_source_filename(root, &path)
                 } else {
                     None
                 },
-                installed_at_unix: stored.map(|m| m.installed_at_unix),
-                managed_by_app: true,
+                installed_at_unix: imported_meta
+                    .map(|m| m.imported_at_unix)
+                    .or_else(|| stored.map(|m| m.installed_at_unix)),
+                managed_by_app: imported_meta.is_none(),
             });
         }
     }
@@ -482,7 +533,9 @@ pub(super) fn imported_model_from_path(
             source_repo: None,
             source_filename: None,
             installed_at_unix: Some(current_unix()),
-            managed_by_app: path.starts_with(root),
+            // Import never takes filesystem ownership, even when the file already
+            // lives under the current model root.
+            managed_by_app: false,
         });
     }
     if meta.is_dir() && is_mlx_model_dir(path)? {
@@ -494,7 +547,7 @@ pub(super) fn imported_model_from_path(
             source_repo: None,
             source_filename: None,
             installed_at_unix: Some(current_unix()),
-            managed_by_app: path.starts_with(root),
+            managed_by_app: false,
         });
     }
     Err(

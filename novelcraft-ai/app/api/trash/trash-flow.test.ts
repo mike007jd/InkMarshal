@@ -1,7 +1,18 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+
+import { __appOwnedCleanupTest } from '@/lib/vault/app-owned-cleanup';
 
 const PREV_DATA_DIR = process.env.INKMARSHAL_DATA_DIR;
 let tmpDir: string;
@@ -9,6 +20,10 @@ let tmpDir: string;
 beforeAll(() => {
   tmpDir = mkdtempSync(path.join(tmpdir(), 'inkmarshal-trash-flow-'));
   process.env.INKMARSHAL_DATA_DIR = tmpDir;
+});
+
+afterEach(() => {
+  __appOwnedCleanupTest.afterParentValidated = null;
 });
 
 afterAll(async () => {
@@ -124,4 +139,38 @@ describe('canonical Trash flow', () => {
     expect(existsSync(sentinel)).toBe(true);
     rmSync(externalVault, { recursive: true, force: true });
   });
+
+  it.runIf(process.platform !== 'win32')(
+    'refuses to follow a swapped app-owned Vault root or target symlink during quarantine',
+    async () => {
+      const db = await import('@/lib/db');
+      const { DELETE: moveToTrash } = await import('@/app/api/novels/[id]/route');
+      const { DELETE: deletePermanently } = await import('@/app/api/trash/[id]/route');
+      const { setNovelVaultPath } = await import('@/lib/db/queries-vault');
+      const novel = await db.createNovel({ userId: 'local-user', title: 'Race Vault' });
+      const ownedVault = path.join(tmpDir, 'vaults', novel.id);
+      const outside = path.join(tmpDir, 'outside-vault-target');
+      const displaced = path.join(tmpDir, 'displaced-vault-target');
+      mkdirSync(ownedVault, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(path.join(ownedVault, 'notes.md'), 'owned');
+      writeFileSync(path.join(outside, 'escape.md'), 'must-survive');
+      await setNovelVaultPath(novel.id, ownedVault);
+      const params = { params: Promise.resolve({ id: novel.id }) };
+      await moveToTrash(new Request(`http://localhost/api/novels/${novel.id}`, { method: 'DELETE' }), params);
+
+      __appOwnedCleanupTest.afterParentValidated = () => {
+        renameSync(ownedVault, displaced);
+        symlinkSync(outside, ownedVault, 'dir');
+      };
+
+      await expect(
+        deletePermanently(new Request(`http://localhost/api/trash/${novel.id}`, { method: 'DELETE' }), params),
+      ).rejects.toThrow(/identity changed|Invalid app-owned Vault|Invalid Vault/i);
+
+      expect(readFileSync(path.join(outside, 'escape.md'), 'utf8')).toBe('must-survive');
+      expect(existsSync(path.join(displaced, 'notes.md'))).toBe(true);
+      expect(await db.getNovel(novel.id)).toBeDefined();
+    },
+  );
 });

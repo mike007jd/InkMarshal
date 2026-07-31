@@ -1,6 +1,6 @@
 "$schema" = "schemas/schema.json"
 
-# Medium-risk: network + disk — multi-GB model downloads, local import/remove.
+# Medium-risk: network + disk — multi-GB model downloads, local import/unregister/delete.
 [[set]]
 identifier = "models"
 description = "Model acquisition and local install/remove."
@@ -13,5 +13,6 @@ permissions = [
   "allow-reset-model-dir",
   "allow-reveal-model-dir",
   "allow-import-local-model",
-  "allow-remove-installed-local-model",
+  "allow-unregister-imported-local-model",
+  "allow-delete-managed-local-model",
 ]
