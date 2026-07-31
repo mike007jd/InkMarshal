@@ -189,14 +189,16 @@ export function LocalModelsPanel({
   const [healthyConnectionModels, setHealthyConnectionModels] = useState<
     ReadonlyMap<string, ReadonlySet<string>>
   >(() => new Map());
+  const [settingsLoadFailed, setSettingsLoadFailed] = useState(false);
+  const [settingsRetryToken, setSettingsRetryToken] = useState(0);
   const [format, setFormat] = useState<EngineFormat>('gguf');
 
   const [progress, setProgress] = useState<Record<string, ModelProgress>>({});
   const [progressHydrated, setProgressHydrated] = useState(false);
   const [useStates, setUseStates] = useState<Record<string, EngineUseState>>({});
   const [removingPaths, setRemovingPaths] = useState<Record<string, boolean>>({});
-  // Model pending a remove/unregister confirmation — replaces window.confirm so
-  // the gate matches the book Dialog idiom and is localizable.
+  // Only app-managed bytes require confirmation. Removing an external model
+  // registration is reversible by importing it again and runs directly.
   const [pendingRemoval, setPendingRemoval] = useState<InstalledLocalModel | null>(null);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
@@ -372,7 +374,12 @@ export function LocalModelsPanel({
       if (hydrationAttempt) return;
       const attempt = (async () => {
         const result = await hydrateAppSettings();
-        if (cancelled || !mountedRef.current || !result.ok) return;
+        if (cancelled || !mountedRef.current) return;
+        if (!result.ok) {
+          setSettingsLoadFailed(true);
+          return;
+        }
+        setSettingsLoadFailed(false);
         settingsHydratedRef.current = true;
         refreshBindingReadiness(true);
       })().finally(() => {
@@ -408,7 +415,7 @@ export function LocalModelsPanel({
       window.removeEventListener('online', retry);
       window.clearInterval(healthInterval);
     };
-  }, [refresh, refreshBindingReadiness]);
+  }, [refresh, refreshBindingReadiness, settingsRetryToken]);
 
   const platform = isMac ? 'macos' : 'windows';
   const recommended = useMemo(() => {
@@ -1034,7 +1041,6 @@ export function LocalModelsPanel({
     const canInstall =
       desktop &&
       Boolean(status?.model_dir) &&
-      fit.state !== 'bad' &&
       !loadingFiles &&
       state !== 'downloading' &&
       state !== 'verifying' &&
@@ -1134,7 +1140,10 @@ export function LocalModelsPanel({
                 size="sm"
                 className="text-book-danger hover:text-book-danger"
                 disabled={removing}
-                onClick={() => setPendingRemoval(installedModel)}
+                onClick={() => {
+                  if (installedModel.managedByApp) setPendingRemoval(installedModel);
+                  else void removeModel(installedModel);
+                }}
               >
                 {removing ? (
                   <Spinner size="sm" />
@@ -1188,21 +1197,40 @@ export function LocalModelsPanel({
     );
   }
 
+  const settingsLoadFailure = settingsLoadFailed ? (
+    <div role="alert" className="flex flex-wrap items-center gap-2 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-sm text-book-danger">
+      <span className="min-w-0 flex-1">{t.modelSettingsLoadFailed}</span>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setSettingsRetryToken(value => value + 1)}
+      >
+        <RefreshCw className="size-3.5" />
+        {t.toastRetry}
+      </Button>
+    </div>
+  ) : null;
+
   if (installed.length === 0 && !showAdvancedManager) {
     return (
-      <StudioFirstRunWizard
-        installedCount={0}
-        onBrowseAllModels={() => setShowAdvancedManager(true)}
-        onImportGguf={() => void importExistingModel('gguf')}
-        onImportMlx={isMac ? () => void importExistingModel('mlx') : undefined}
-        importing={importing}
-        importError={importError}
-      />
+      <section className="space-y-4">
+        {settingsLoadFailure}
+        <StudioFirstRunWizard
+          installedCount={0}
+          onBrowseAllModels={() => setShowAdvancedManager(true)}
+          onImportGguf={() => void importExistingModel('gguf')}
+          onImportMlx={isMac ? () => void importExistingModel('mlx') : undefined}
+          importing={importing}
+          importError={importError}
+        />
+      </section>
     );
   }
 
   return (
     <section className="space-y-5">
+      {settingsLoadFailure}
       <div className="flex items-center gap-2">
         <Cpu className="h-4 w-4 text-book-ink-muted" />
         <h3 className="flex-1 text-xs font-semibold uppercase tracking-wider text-book-ink-muted">
@@ -1529,7 +1557,10 @@ export function LocalModelsPanel({
                       variant="outline"
                       size="sm"
                       disabled={removing}
-                      onClick={() => setPendingRemoval(model)}
+                      onClick={() => {
+                        if (model.managedByApp) setPendingRemoval(model);
+                        else void removeModel(model);
+                      }}
                     >
                       {removing ? (
                         <Spinner size="sm" />
@@ -1860,10 +1891,10 @@ export function LocalModelsPanel({
           <DialogContent className="max-w-md">
             <DialogHeader>
               <DialogTitle className="font-serif text-xl">
-                {pendingRemoval.managedByApp ? t.modelManagerRemove : t.modelManagerUnregister}
+                {t.modelManagerRemove}
               </DialogTitle>
               <DialogDescription className="leading-relaxed text-book-ink-secondary">
-                {(pendingRemoval.managedByApp ? t.modelManagerRemoveConfirm : t.modelManagerUnregisterConfirm).replace('{model}', pendingRemoval.label)}
+                {t.modelManagerRemoveConfirm.replace('{model}', pendingRemoval.label)}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -1877,7 +1908,7 @@ export function LocalModelsPanel({
               </Button>
               <Button
                 type="button"
-                variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}
+                variant="destructive"
                 onClick={() => {
                   const model = pendingRemoval;
                   setPendingRemoval(null);
@@ -1885,7 +1916,7 @@ export function LocalModelsPanel({
                 }}
                 className="h-auto px-4 py-2 text-sm font-medium"
               >
-                {pendingRemoval.managedByApp ? t.modelManagerRemove : t.modelManagerUnregister}
+                {t.modelManagerRemove}
               </Button>
             </DialogFooter>
           </DialogContent>

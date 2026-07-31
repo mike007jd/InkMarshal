@@ -20,7 +20,6 @@ import {
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
   LocalDatabaseUnavailableError,
-  PreMigrationBackupRequiredError,
   ensureCurrentSchema,
   initializeCurrentSchema,
   inspectSchemaOpenPlan,
@@ -166,8 +165,7 @@ export function getDb(): Database.Database {
     // read/write touched an unsupported on-disk shape.
     if (
       e instanceof DatabaseFromNewerAppVersionError ||
-      e instanceof IncompatibleDatabaseSchemaError ||
-      e instanceof PreMigrationBackupRequiredError
+      e instanceof IncompatibleDatabaseSchemaError
     ) throw e;
     throw new LocalDatabaseUnavailableError(
       `InkMarshal: could not open local database at ${dbPath}: ${(e as Error).message}`,
@@ -178,7 +176,7 @@ export function getDb(): Database.Database {
   return db;
 }
 
-export function closeDbForTest(): void {
+export function closeDb(): void {
   if (_db) {
     try {
       _db.close();
@@ -187,4 +185,8 @@ export function closeDbForTest(): void {
     }
     _db = null;
   }
+}
+
+export function closeDbForTest(): void {
+  closeDb();
 }

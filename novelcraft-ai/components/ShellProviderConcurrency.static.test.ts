@@ -22,14 +22,11 @@ describe('desktop shell and provider mutation concurrency guards', () => {
   it('guards create and delete actions before React busy state can commit', () => {
     const shell = source('components/DesktopShellLayout.tsx');
     const studio = source('components/DesktopStudioShell.tsx');
-    const deleteDialog = source('components/DeleteNovelDialog.tsx');
 
     expect(shell).toContain('const deletingNovelIdsRef = useRef<Set<string>>(new Set())');
     expect(shell).toContain('deletingNovelIdsRef.current.add(id)');
     expect(studio).toContain('const creatingRef = useRef(false)');
     expect(studio).toContain('if (creatingRef.current) return');
-    expect(deleteDialog).toContain('const confirmingRef = useRef(false)');
-    expect(deleteDialog).toContain('if (confirmingRef.current) return');
   });
 
   it('guards provider save and remove actions synchronously', () => {

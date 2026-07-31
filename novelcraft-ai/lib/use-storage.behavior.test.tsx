@@ -4,7 +4,9 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  NOVEL_LIST_INVALIDATED_EVENT,
   NOVEL_UPDATED_EVENT,
+  notifyNovelListInvalidated,
   notifyNovelUpdated,
   useNovel,
   useNovels,
@@ -282,6 +284,29 @@ describe('novel update fan-out', () => {
     });
     expect(result.current.novels).toHaveLength(2);
     expect(result.current.novels.some(n => n.id === 'unknown-novel')).toBe(false);
+  });
+
+  it('refreshes library membership after a cross-layout restore', async () => {
+    const restored = baseNovel({ title: 'Restored Novel', updatedAt: 8 });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => [] } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => [restored] } as Response);
+
+    const listener = vi.fn();
+    window.addEventListener(NOVEL_LIST_INVALIDATED_EVENT, listener);
+    const { result } = renderHook(() => useNovels());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.novels).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith('/api/novels');
+
+    // Undo toast and TrashPanel restore both call this; mounted sidebars converge.
+    act(() => notifyNovelListInvalidated());
+    await waitFor(() => expect(result.current.novels).toEqual([restored]));
+    expect(listener).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/novels');
+    window.removeEventListener(NOVEL_LIST_INVALIDATED_EVENT, listener);
   });
 
   it('merges a title event that arrives before an older initial list GET resolves', async () => {

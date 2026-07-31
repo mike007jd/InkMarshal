@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { Lightbulb, PenLine } from 'lucide-react';
 
 import { ImportManuscriptEntry } from '@/components/studio/import/ImportManuscriptEntry';
+import { LocalLibraryRecovery } from '@/components/LocalLibraryRecovery';
 import { useLanguage } from '@/components/LanguageProvider';
 import { useToast } from '@/components/Toast';
 import { Button } from '@/components/ui/button';
@@ -83,15 +84,17 @@ export default function DesktopStudioShell() {
             >
               <p className="text-sm font-medium text-book-danger">{issueCopy.title}</p>
               <p className="mt-1 text-sm text-book-ink-secondary">{issueCopy.body}</p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="mt-3"
-                onClick={() => void handleRetry()}
-              >
-                {t.toastRetry}
-              </Button>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleRetry()}
+                >
+                  {t.toastRetry}
+                </Button>
+                <LocalLibraryRecovery />
+              </div>
             </div>
           )}
           <div className="mt-8 flex flex-wrap justify-center gap-3">

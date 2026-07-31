@@ -25,6 +25,7 @@ export interface SeriesCopy {
   removeBlockedTitle: string;
   removeBlockedBody: (count: number) => string;
   transferTo: string;
+  keepPrivateOnRemove: string;
   confirmRemove: string;
   cancel: string;
   alreadyInSeries: string;
@@ -97,6 +98,7 @@ const en: SeriesCopy = {
   removeBlockedBody: (count) =>
     `This book is the anchor for ${count} shared ${count === 1 ? 'entry' : 'entries'}. Transfer them to another book before removing it.`,
   transferTo: 'Transfer shared entries to',
+  keepPrivateOnRemove: 'There is no other book to transfer to. The shared entries will stay in this book as private entries.',
   confirmRemove: 'Remove from series',
   cancel: 'Cancel',
   alreadyInSeries: 'In another series',
@@ -168,6 +170,7 @@ const zhCN: SeriesCopy = {
   removeBlockedBody: (count) =>
     `该作品是 ${count} 个共享条目的归属本。移出前请先把它们转移到另一部作品。`,
   transferTo: '将共享条目转移到',
+  keepPrivateOnRemove: '没有其他作品可供转移。共享条目会保留在本书中，并改为私有条目。',
   confirmRemove: '移出系列',
   cancel: '取消',
   alreadyInSeries: '已属其它系列',
@@ -239,6 +242,7 @@ const zhTW: SeriesCopy = {
   removeBlockedBody: (count) =>
     `該作品是 ${count} 個共享條目的歸屬本。移出前請先把它們轉移到另一部作品。`,
   transferTo: '將共享條目轉移到',
+  keepPrivateOnRemove: '沒有其他作品可供轉移。共享條目會保留在本書中，並改為私有條目。',
   confirmRemove: '移出系列',
   alreadyInSeries: '已屬其它系列',
   movePrompt: '該作品已屬其它系列，加入此處將會遷移它。',

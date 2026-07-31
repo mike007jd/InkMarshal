@@ -29,15 +29,12 @@ export interface NovelThreadProps {
   placeholder: string;
   /** Rendered inside the viewport when the thread has no messages. */
   emptyState?: ReactNode;
-  /** Note rendered under the composer (e.g. the AI disclaimer). */
-  composerFooter?: ReactNode;
   /** Optional controls rendered inside the composer beneath the input row. */
   composerControls?: ReactNode;
   /** Prevents sending while an inline composer control is committing state. */
   composerSendDisabled?: boolean;
   errorMessage?: string | null;
   onRetry?: () => void;
-  hideComposer?: boolean;
   completionContent?: ReactNode;
   /**
    * Extra controls injected into every assistant message's action bar. The node
@@ -55,12 +52,10 @@ export interface NovelThreadProps {
 export const NovelThread: FC<NovelThreadProps> = ({
   placeholder,
   emptyState,
-  composerFooter,
   composerControls,
   composerSendDisabled = false,
   errorMessage,
   onRetry,
-  hideComposer = false,
   completionContent,
   assistantActions,
 }) => {
@@ -85,7 +80,7 @@ export const NovelThread: FC<NovelThreadProps> = ({
         </div>
       </ThreadPrimitive.Viewport>
 
-      <div className={cn('border-t border-book-border bg-book-bg-primary px-4 py-4 md:px-6', hideComposer && 'hidden')}>
+      <div className="border-t border-book-border bg-book-bg-primary px-4 py-4 md:px-6">
         {errorMessage ? (
           <div className="mx-auto mb-3 flex max-w-3xl items-center gap-3 rounded-md border border-book-danger-border bg-book-danger-light px-3 py-2 text-sm text-book-danger">
             <AlertCircle className="size-4 shrink-0" />
@@ -109,11 +104,6 @@ export const NovelThread: FC<NovelThreadProps> = ({
           controls={composerControls}
           sendDisabled={composerSendDisabled}
         />
-        {composerFooter ? (
-          <div className="mx-auto mt-3 max-w-3xl text-center text-xs font-medium font-serif text-book-ink-muted">
-            {composerFooter}
-          </div>
-        ) : null}
       </div>
     </ThreadPrimitive.Root>
   );

@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import {
   buildNovelEntryHref,
   buildNovelViewHref,
-  isPostInterviewStage,
   parseViewParam,
 } from '@/lib/novel-workspace-view';
 
@@ -19,9 +18,6 @@ describe('buildNovelEntryHref', () => {
   });
 });
 
-// `parseViewParam` and `isPostInterviewStage` are the only logic-bearing
-// pieces of the new IA layer; everything else is glue/JSX. Pin both so a
-// future stage rename or query-string contract change shows up here.
 describe('parseViewParam', () => {
   it('returns the parsed view for valid keys', () => {
     expect(parseViewParam('agent')).toBe('agent');
@@ -73,23 +69,5 @@ describe('buildNovelViewHref', () => {
   it('canonicalizes legacy aliases when the user switches modes', () => {
     expect(buildNovelViewHref('/novel/n1', '?view=manuscript', 'read-edit'))
       .toBe('/novel/n1?view=read-edit');
-  });
-});
-
-describe('isPostInterviewStage', () => {
-  it('treats discovery + greenlight stages as pre-interview', () => {
-    expect(isPostInterviewStage('discovery_interview')).toBe(false);
-    expect(isPostInterviewStage('ready_for_greenlight')).toBe(false);
-  });
-
-  it('treats writing, unification, completed as post-interview', () => {
-    expect(isPostInterviewStage('autonomous_writing')).toBe(true);
-    expect(isPostInterviewStage('whole_book_unification')).toBe(true);
-    expect(isPostInterviewStage('completed')).toBe(true);
-  });
-
-  it('is null/undefined-safe', () => {
-    expect(isPostInterviewStage(null)).toBe(false);
-    expect(isPostInterviewStage(undefined)).toBe(false);
   });
 });

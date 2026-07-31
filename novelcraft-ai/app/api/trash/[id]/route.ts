@@ -1,7 +1,13 @@
 import { NextResponse } from 'next/server';
 
 import { deleteTrashedNovelPermanently } from '@/lib/db';
+import { getNovelVault } from '@/lib/db/queries-vault';
 import { requireTrashedNovelOwner } from '@/lib/local-auth';
+import {
+  discardAppOwnedNovelVault,
+  quarantineAppOwnedNovelVault,
+  restoreAppOwnedNovelVault,
+} from '@/lib/vault/app-owned-cleanup';
 
 export const runtime = 'nodejs';
 
@@ -12,7 +18,21 @@ export async function DELETE(
   const { id } = await params;
   const ownerCheck = await requireTrashedNovelOwner(id);
   if (ownerCheck instanceof NextResponse) return ownerCheck;
-  const deleted = await deleteTrashedNovelPermanently(id, ownerCheck.user.id);
+  const vault = await getNovelVault(id);
+  const vaultQuarantine = quarantineAppOwnedNovelVault(vault?.vaultPath);
+  let deleted = false;
+  try {
+    deleted = await deleteTrashedNovelPermanently(id, ownerCheck.user.id);
+  } catch (error) {
+    restoreAppOwnedNovelVault(vaultQuarantine);
+    throw error;
+  }
+  if (!deleted) restoreAppOwnedNovelVault(vaultQuarantine);
   if (!deleted) return NextResponse.json({ error: 'Permanent delete failed' }, { status: 409 });
+  try {
+    discardAppOwnedNovelVault(vaultQuarantine);
+  } catch (error) {
+    console.warn('[trash] database deletion succeeded but Vault cleanup did not', error);
+  }
   return NextResponse.json({ ok: true });
 }

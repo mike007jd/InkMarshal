@@ -97,4 +97,27 @@ describe('reading heat-zone UX', () => {
 
     expect(en).toContain("manuscriptEmptyDesc: 'Start in Agent. Once the writing run creates chapters, they will appear here for reading and editing.'");
   });
+
+  it('runs reversible first-draft restores directly and relies on Undo', () => {
+    const revert = source('components/RevertChapterButton.tsx');
+
+    expect(revert).toContain('onClick={() => { void performRevert(); }}');
+    expect(revert).toContain('label: t.revertChapterUndo');
+    expect(revert).not.toContain('confirmOpen');
+    expect(revert).not.toContain('revertChapterConfirmTitle');
+  });
+
+  it('keeps chat, threads, and the composer available in every writing stage', () => {
+    const workspace = source('components/NovelWorkspace.tsx');
+    const agentPane = source('components/novel-workspace/AgentWorkspacePane.tsx');
+    const chat = source('components/ChatArea.tsx');
+
+    expect(workspace).not.toContain('isPostInterviewStage');
+    expect(workspace).not.toContain('conversationThreadsUnlocked=');
+    expect(agentPane).not.toContain('conversationThreadsUnlocked');
+    expect(agentPane).not.toContain('composerCollapsed');
+    expect(chat).not.toContain('hideComposer=');
+    expect(chat).not.toContain('composerFooter=');
+    expect(chat).not.toContain('t.aiWarning');
+  });
 });

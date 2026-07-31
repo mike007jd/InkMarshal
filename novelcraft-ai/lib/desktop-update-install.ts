@@ -13,10 +13,16 @@ interface DurableFlushOutcome {
 
 interface InstallDesktopUpdateOptions {
   update: DownloadableUpdate;
+  session?: DesktopUpdateInstallSession;
   flush: () => Promise<DurableFlushOutcome>;
   relaunch: () => Promise<void>;
   onDownloadEvent?: (event: DownloadEvent) => void;
   saveFailedMessage: string;
+}
+
+export interface DesktopUpdateInstallSession {
+  downloaded: boolean;
+  installed: boolean;
 }
 
 /** Canonical verified Apple Silicon DMG — allowlisted for shell-open recovery. */
@@ -38,15 +44,22 @@ export type DesktopUpdateFailureCategory =
  */
 export async function installDesktopUpdate({
   update,
+  session = { downloaded: false, installed: false },
   flush,
   relaunch,
   onDownloadEvent,
   saveFailedMessage,
 }: InstallDesktopUpdateOptions): Promise<void> {
-  await update.download(onDownloadEvent);
-  const save = await flush();
-  if (!save.ok) throw new Error(saveFailedMessage);
-  await update.install();
+  if (!session.downloaded) {
+    await update.download(onDownloadEvent);
+    session.downloaded = true;
+  }
+  if (!session.installed) {
+    const save = await flush();
+    if (!save.ok) throw new Error(saveFailedMessage);
+    await update.install();
+    session.installed = true;
+  }
   await relaunch();
 }
 

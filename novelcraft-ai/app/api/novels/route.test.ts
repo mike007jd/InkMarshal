@@ -265,7 +265,7 @@ describe('novel API request validation', () => {
       const listBody = await list.json();
       expect(listBody).toEqual({
         code: 'DATABASE_INCOMPATIBLE',
-        error: expect.stringMatching(/incompatible|backup|support/i),
+        error: expect.stringMatching(/clear the local library|start fresh/i),
       });
       expect(JSON.stringify(listBody)).not.toMatch(/\/Users\/|inkmarshal\.db|INKMARSHAL/);
 

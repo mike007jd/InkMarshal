@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -31,6 +31,7 @@ describe('canonical Trash flow', () => {
     const { createKnowledgeEntry, updateKnowledgeEntry } = await import('@/app/actions/knowledge');
     const { getSeriesDetail, runCrossBookCheck, shareKnowledgeEntry, unshareKnowledgeEntry } = await import('@/app/actions/series');
     const { listKnowledgeIndexForNovel } = await import('@/lib/db/queries-knowledge-vault');
+    const { setNovelVaultPath } = await import('@/lib/db/queries-vault');
     const seriesDb = await import('@/lib/db/queries-series');
     const novel = await db.createNovel({
       userId: 'local-user',
@@ -94,8 +95,33 @@ describe('canonical Trash flow', () => {
     expect(await db.getNovel(novel.id)).toBeDefined();
 
     await moveToTrash(new Request(`http://localhost/api/novels/${novel.id}`, { method: 'DELETE' }), params);
+    const ownedVault = path.join(tmpDir, 'vaults', novel.id);
+    mkdirSync(ownedVault, { recursive: true });
+    writeFileSync(path.join(ownedVault, 'notes.md'), 'delete with the book');
+    await setNovelVaultPath(novel.id, ownedVault);
     const deleted = await deletePermanently(new Request(`http://localhost/api/trash/${novel.id}`, { method: 'DELETE' }), params);
     expect(deleted.status).toBe(200);
     expect(await db.getNovel(novel.id)).toBeUndefined();
+    expect(existsSync(ownedVault)).toBe(false);
+  });
+
+  it('never deletes an external Vault during permanent book deletion', async () => {
+    const db = await import('@/lib/db');
+    const { DELETE: moveToTrash } = await import('@/app/api/novels/[id]/route');
+    const { DELETE: deletePermanently } = await import('@/app/api/trash/[id]/route');
+    const { setNovelVaultPath } = await import('@/lib/db/queries-vault');
+    const novel = await db.createNovel({ userId: 'local-user', title: 'External Vault' });
+    const externalVault = mkdtempSync(path.join(tmpdir(), 'inkmarshal-external-vault-'));
+    const sentinel = path.join(externalVault, 'keep.md');
+    writeFileSync(sentinel, 'must survive');
+    await setNovelVaultPath(novel.id, externalVault);
+    const params = { params: Promise.resolve({ id: novel.id }) };
+
+    await moveToTrash(new Request(`http://localhost/api/novels/${novel.id}`, { method: 'DELETE' }), params);
+    const deleted = await deletePermanently(new Request(`http://localhost/api/trash/${novel.id}`, { method: 'DELETE' }), params);
+
+    expect(deleted.status).toBe(200);
+    expect(existsSync(sentinel)).toBe(true);
+    rmSync(externalVault, { recursive: true, force: true });
   });
 });

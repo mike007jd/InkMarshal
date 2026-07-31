@@ -30,6 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { BackupSettings } from '@/components/BackupSettings';
 import { ModelDownloadSourceSettings } from '@/components/ModelDownloadSourceSettings';
+import { LocalLibraryRecovery } from '@/components/LocalLibraryRecovery';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Spinner } from '@/components/ui/spinner';
 import { isUsableReturnFocusTarget } from '@/components/ui/focus-utils';
@@ -144,7 +145,7 @@ function SettingsPanelDrawer({
   );
   const [updateCheckResult, setUpdateCheckResult] = useState<DesktopUpdateCheckResult | null>(null);
   const [activeSection, setActiveSection] = useState<SettingsSection>(
-    initialSection === 'vault' && (!hasNovelContext || !getSettings().developerTools)
+    initialSection === 'vault' && !hasNovelContext
       ? 'general'
       : initialSection ?? 'general',
   );
@@ -161,19 +162,19 @@ function SettingsPanelDrawer({
 
   useEffect(() => {
     if (initialSection) {
-      const nextSection = initialSection === 'vault' && (!hasNovelContext || !settings.developerTools)
+      const nextSection = initialSection === 'vault' && !hasNovelContext
         ? 'general'
         : initialSection;
       const id = window.setTimeout(() => setActiveSection(nextSection), 0);
       return () => window.clearTimeout(id);
     }
-  }, [hasNovelContext, initialSection, settings.developerTools]);
+  }, [hasNovelContext, initialSection]);
 
   useEffect(() => {
-    if ((hasNovelContext && settings.developerTools) || activeSection !== 'vault') return;
+    if (hasNovelContext || activeSection !== 'vault') return;
     const id = window.setTimeout(() => setActiveSection('general'), 0);
     return () => window.clearTimeout(id);
-  }, [activeSection, hasNovelContext, settings.developerTools]);
+  }, [activeSection, hasNovelContext]);
 
   useEffect(() => {
     const unsubscribeHydration = onAppSettingsHydrated(() => {
@@ -214,7 +215,7 @@ function SettingsPanelDrawer({
       label: t.settingsTabWriting,
       Icon: AlignJustify,
     },
-    ...(hasNovelContext && settings.developerTools ? [{
+    ...(hasNovelContext ? [{
       id: 'vault' as const,
       label: t.settingsTabVault,
       Icon: Database,
@@ -399,6 +400,18 @@ function SettingsPanelDrawer({
 
                 <BackupSettings novelId={activeNovelId} />
 
+                <section className="flex flex-col gap-3 border-t border-book-border pt-5">
+                  <div>
+                    <h3 className="text-sm font-semibold text-book-ink-secondary">
+                      {t.localDataSettingsTitle}
+                    </h3>
+                    <p className="mt-1 text-sm leading-relaxed text-book-ink-secondary">
+                      {t.localDataSettingsDescription}
+                    </p>
+                  </div>
+                  <LocalLibraryRecovery placement="settings" />
+                </section>
+
                 <ModelDownloadSourceSettings />
 
                 <section className="flex flex-col gap-3 border-t border-book-border pt-5">
@@ -500,7 +513,7 @@ function SettingsPanelDrawer({
                 </section>
               </TabsContent>
 
-              {activeNovelId && settings.developerTools && (
+              {activeNovelId && (
                 <TabsContent value="vault" className="m-0">
                   <VaultSettings novelId={activeNovelId} />
                 </TabsContent>

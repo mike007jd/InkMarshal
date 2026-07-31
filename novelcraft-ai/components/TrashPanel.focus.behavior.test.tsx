@@ -129,7 +129,6 @@ function TrashFocusHarness({ hideTrigger = false }: { hideTrigger?: boolean }) {
       <TrashPanel
         open={open}
         onOpenChange={setOpen}
-        onLibraryChange={() => undefined}
         returnFocusRef={moreToolsTriggerRef}
         fallbackFocusRef={fallbackFocusRef}
       />

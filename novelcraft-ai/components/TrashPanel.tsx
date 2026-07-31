@@ -16,7 +16,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
 import {
   Sheet,
   SheetContent,
@@ -25,17 +24,16 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet';
 import type { Novel } from '@/lib/db-types';
+import { notifyNovelListInvalidated } from '@/lib/use-storage';
 
 export function TrashPanel({
   open,
   onOpenChange,
-  onLibraryChange,
   returnFocusRef,
   fallbackFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onLibraryChange: () => void;
   /** Stable opener (e.g. More tools). Avoids Radix restoring into a removed menu portal. */
   returnFocusRef?: RefObject<HTMLElement | null>;
   /** Visible narrow-shell control used when the opener leaves the layout. */
@@ -45,6 +43,8 @@ export function TrashPanel({
   const { toast } = useToast();
   const [novels, setNovels] = useState<Novel[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Novel | null>(null);
 
@@ -54,14 +54,19 @@ export function TrashPanel({
     queueMicrotask(() => {
       if (cancelled) return;
       setLoading(true);
+      setLoadError(false);
       void fetch('/api/trash', { cache: 'no-store' })
         .then(response => response.ok ? response.json() as Promise<Novel[]> : Promise.reject(new Error('load_failed')))
         .then(items => { if (!cancelled) setNovels(items); })
-        .catch(() => { if (!cancelled) toast(t.trashLoadFailed, 'error'); })
+        .catch(() => {
+          if (cancelled) return;
+          setLoadError(true);
+          toast(t.trashLoadFailed, 'error');
+        })
         .finally(() => { if (!cancelled) setLoading(false); });
     });
     return () => { cancelled = true; };
-  }, [open, t.trashLoadFailed, toast]);
+  }, [open, retryToken, t.trashLoadFailed, toast]);
 
   const restore = async (novel: Novel) => {
     if (busyId) return;
@@ -70,7 +75,7 @@ export function TrashPanel({
       const response = await fetch(`/api/trash/${novel.id}/restore`, { method: 'POST' });
       if (!response.ok) throw new Error('restore_failed');
       setNovels(current => current.filter(item => item.id !== novel.id));
-      onLibraryChange();
+      notifyNovelListInvalidated();
       toast(t.trashRestoreSuccess.replace('{title}', novel.title), 'success');
     } catch {
       toast(t.trashRestoreFailed, 'error');
@@ -124,6 +129,18 @@ export function TrashPanel({
               <div className="flex items-center justify-center gap-2 py-12 text-sm text-book-ink-muted">
                 <Spinner /> {t.loading}
               </div>
+            ) : loadError ? (
+              <div className="flex flex-col items-center gap-3 py-12 text-center">
+                <p className="text-sm text-book-danger">{t.trashLoadFailed}</p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setRetryToken(value => value + 1)}
+                >
+                  {t.toastRetry}
+                </Button>
+              </div>
             ) : novels.length === 0 ? (
               <div className="py-12 text-center font-serif text-sm italic text-book-ink-muted">{t.trashEmpty}</div>
             ) : (
@@ -176,20 +193,16 @@ function PermanentDeleteDialog({
   onConfirm: () => Promise<void>;
 }) {
   const { t } = useLanguage();
-  const [typed, setTyped] = useState('');
-  const matches = novel !== null && typed.trim() === novel.title.trim() && novel.title.trim().length > 0;
   return (
-    <Dialog open={novel !== null} onOpenChange={next => { if (!next) { setTyped(''); onCancel(); } }}>
+    <Dialog open={novel !== null} onOpenChange={next => { if (!next) onCancel(); }}>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle className="font-serif text-xl">{t.trashDeleteConfirmTitle}</DialogTitle>
           <DialogDescription>{t.trashDeleteConfirmDescription.replace('{title}', novel?.title ?? '')}</DialogDescription>
         </DialogHeader>
-        <label className="text-xs text-book-ink-secondary">{t.trashDeleteTypeTitle}</label>
-        <Input value={typed} onChange={event => setTyped(event.target.value)} autoFocus />
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onCancel}>{t.cancel}</Button>
-          <Button type="button" variant="destructive" disabled={!matches || busy} onClick={() => void onConfirm()}>
+          <Button type="button" variant="destructive" disabled={busy} onClick={() => void onConfirm()}>
             {busy ? <Spinner /> : null}
             {t.trashDeletePermanently}
           </Button>

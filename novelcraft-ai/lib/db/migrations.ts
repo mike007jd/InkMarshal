@@ -35,12 +35,10 @@ CREATE TABLE _schema_version (
 `;
 
 const PUBLISHED_USER_GUIDANCE =
-  'Preserve a backup of your InkMarshal data directory, then update InkMarshal or contact support. ' +
-  'Do not delete or reset the database to recover.';
+  'Retry, update InkMarshal, or explicitly clear the local library and start fresh.';
 
 /** Stable, non-secret API codes for authenticated desktop database failures. */
 const LOCAL_DATABASE_ERROR_CODES = {
-  BACKUP_REQUIRED: 'DATABASE_BACKUP_REQUIRED',
   INCOMPATIBLE: 'DATABASE_INCOMPATIBLE',
   NEWER_VERSION: 'DATABASE_NEWER_VERSION',
   UNAVAILABLE: 'DATABASE_UNAVAILABLE',
@@ -67,16 +65,6 @@ export class IncompatibleDatabaseSchemaError extends Error {
   constructor(message: string) {
     super(`InkMarshal local database is incompatible with this build: ${message} ${PUBLISHED_USER_GUIDANCE}`);
     this.name = 'IncompatibleDatabaseSchemaError';
-  }
-}
-
-export class PreMigrationBackupRequiredError extends Error {
-  constructor(message: string) {
-    super(
-      `InkMarshal refused a destructive database recovery because a verified pre-migration ` +
-        `backup could not be created: ${message}`,
-    );
-    this.name = 'PreMigrationBackupRequiredError';
   }
 }
 
@@ -521,23 +509,6 @@ function fromVersionForPlan(kind: Exclude<SchemaOpenPlan, 'current'>): number {
   return SCHEMA_20_VERSION;
 }
 
-function requireVerifiedBackup(
-  db: Database.Database,
-  fromVersion: number,
-  backupFn: (db: Database.Database, fromVersion: number) => string | null,
-): void {
-  let backupPath: string | null;
-  try {
-    backupPath = backupFn(db, fromVersion);
-  } catch (error) {
-    throw new PreMigrationBackupRequiredError((error as Error).message);
-  }
-  const dbPath = db.name;
-  if (dbPath && dbPath !== ':memory:' && !backupPath) {
-    throw new PreMigrationBackupRequiredError('backup path was not produced for an on-disk database.');
-  }
-}
-
 /**
  * Validate an existing nonempty database and, when it is an exact published
  * schema 18, exact known dual-marker review_items legacy shape, exact legacy
@@ -557,20 +528,15 @@ export function ensureCurrentSchema(
 
   const fromVersion = fromVersionForPlan(kind);
 
-  if (kind === 'known_legacy_review_items_to_21') {
-    // The obsolete table is empty, but its removal is still guarded by a
-    // verified snapshot. Backup failure aborts before the migration transaction.
-    requireVerifiedBackup(db, fromVersion, backupFn);
-  } else {
-    // Additive promotion: a backup failure warns and proceeds so a backup-dir
-    // hiccup cannot wedge startup on published user data.
-    try {
-      backupFn(db, fromVersion);
-    } catch (error) {
-      console.warn(
-        `[migrations] pre-migration backup failed (proceeding: additive schema ${fromVersion}→${CURRENT_SCHEMA_VERSION}): ${(error as Error).message}`,
-      );
-    }
+  // Every accepted source shape is fully fingerprinted and promoted inside a
+  // transaction. Keep the backup, but never turn a backup-path hiccup into a
+  // startup dead end for a known-compatible database.
+  try {
+    backupFn(db, fromVersion);
+  } catch (error) {
+    console.warn(
+      `[migrations] pre-migration backup failed (proceeding: known schema ${fromVersion}→${CURRENT_SCHEMA_VERSION}): ${(error as Error).message}`,
+    );
   }
 
   applyPromotion(db, kind);
@@ -620,25 +586,18 @@ export function mapLocalDatabaseApiError(error: unknown): {
       error: 'Local database was created by a newer InkMarshal version. Update InkMarshal before opening this library.',
     };
   }
-  if (error instanceof PreMigrationBackupRequiredError) {
-    return {
-      status: 503,
-      code: LOCAL_DATABASE_ERROR_CODES.BACKUP_REQUIRED,
-      error: 'InkMarshal did not change the local database because a safety backup could not be created. Free disk space, check folder permissions, and retry.',
-    };
-  }
   if (error instanceof IncompatibleDatabaseSchemaError) {
     return {
       status: 503,
       code: LOCAL_DATABASE_ERROR_CODES.INCOMPATIBLE,
-      error: 'Local database is incompatible with this InkMarshal build. Preserve a backup and contact support; do not delete the database.',
+      error: 'This local library cannot be opened. Retry, or clear the local library and start fresh.',
     };
   }
   if (error instanceof LocalDatabaseUnavailableError) {
     return {
       status: 503,
       code: LOCAL_DATABASE_ERROR_CODES.UNAVAILABLE,
-      error: 'Local database could not be opened. Preserve a backup and restart InkMarshal, or contact support.',
+      error: 'This local library could not be opened. Retry, or clear the local library and start fresh.',
     };
   }
   return null;

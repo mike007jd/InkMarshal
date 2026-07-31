@@ -77,7 +77,7 @@ describe('useDiffConfirmation', () => {
     );
   });
 
-  it('keeps the proposal pending and does not write when the recovery snapshot fails', async () => {
+  it('still applies an accepted edit when the optional recovery snapshot fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
     const { result, applyTextThroughEditor } = setup();
 
@@ -91,8 +91,8 @@ describe('useDiffConfirmation', () => {
     });
     act(() => { result.current.handleAcceptAll(); });
 
-    await waitFor(() => expect(result.current.changes[0].status).toBe('pending'));
-    expect(applyTextThroughEditor).not.toHaveBeenCalled();
+    await waitFor(() => expect(applyTextThroughEditor).toHaveBeenCalledWith('The slow brown fox'));
+    expect(result.current.changes[0].status).toBe('accepted');
   });
 
   it('does not touch the editor when the only change is rejected', () => {

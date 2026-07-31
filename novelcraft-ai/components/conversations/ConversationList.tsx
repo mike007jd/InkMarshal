@@ -111,7 +111,7 @@ export function ConversationList({
     try {
       setLoading(true);
       const res = await fetch(`/api/novels/${novelId}/conversations`);
-      if (!res.ok) throw new Error('Failed to load conversations');
+      if (!res.ok) throw new Error(t.conversationLoadFailed);
       const data: Conversation[] = await res.json();
       if (activeNovelRef.current === requestNovelId) {
         setConversations(data);
@@ -122,7 +122,7 @@ export function ConversationList({
     } finally {
       if (activeNovelRef.current === requestNovelId) setLoading(false);
     }
-  }, [novelId]);
+  }, [novelId, t.conversationLoadFailed]);
 
   useEffect(() => {
     let cancelled = false;
@@ -248,7 +248,12 @@ export function ConversationList({
         )}
 
         {error && (
-          <p className="px-3 py-4 text-xs text-book-danger text-center">{error}</p>
+          <div role="alert" className="flex flex-col items-center gap-2 px-3 py-4 text-center text-xs text-book-danger">
+            <p>{error}</p>
+            <Button type="button" variant="outline" size="sm" onClick={() => void fetchConversations()}>
+              {t.toastRetry}
+            </Button>
+          </div>
         )}
 
         {!loading && conversations.length === 0 && !error && (

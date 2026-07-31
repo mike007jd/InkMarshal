@@ -1,5 +1,3 @@
-import type { NovelStage } from '@/lib/novel-stages';
-
 // Pure helpers for NovelWorkspace + NovelTopBar. Lives outside the React
 // component so the same logic can be unit-tested under the vitest `node`
 // environment (no DOM, no React).
@@ -53,19 +51,4 @@ export function buildNovelViewHref(
   const params = new URLSearchParams(search);
   params.set('view', view);
   return `${pathname}?${params.toString()}${hash}`;
-}
-
-/**
- * Stages where the user has crossed from "planning" into "writing". The
- * NovelTopBar uses this to flip the visual weight of Chat (demoted) and
- * Manuscript (promoted) so the chrome echoes the user's centre of gravity.
- */
-const POST_INTERVIEW_STAGES: ReadonlySet<NovelStage> = new Set<NovelStage>([
-  'autonomous_writing',
-  'whole_book_unification',
-  'completed',
-]);
-
-export function isPostInterviewStage(stage: NovelStage | null | undefined): boolean {
-  return !!stage && POST_INTERVIEW_STAGES.has(stage);
 }

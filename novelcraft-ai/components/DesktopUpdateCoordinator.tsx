@@ -14,6 +14,7 @@ import {
   categorizeDesktopUpdateFailure,
   desktopUpdateFailureMessage,
   installDesktopUpdate,
+  type DesktopUpdateInstallSession,
 } from '@/lib/desktop-update-install';
 import { isCriticalDesktopUpdate, updateProgressPercent } from '@/lib/desktop-updates';
 import {
@@ -35,6 +36,10 @@ export function DesktopUpdateCoordinator() {
   const updateRef = useRef<Update | null>(null);
   const downloadedRef = useRef(0);
   const totalBytesRef = useRef<number | undefined>(undefined);
+  const installSessionRef = useRef<DesktopUpdateInstallSession>({
+    downloaded: false,
+    installed: false,
+  });
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -56,6 +61,9 @@ export function DesktopUpdateCoordinator() {
           if (source === 'manual') publishDesktopUpdateCheckResult('up-to-date');
           return;
         }
+        const previous = updateRef.current;
+        if (previous && previous !== result) await previous.close().catch(() => undefined);
+        installSessionRef.current = { downloaded: false, installed: false };
         setCritical(isCriticalDesktopUpdate(result));
         updateRef.current = result;
         setUpdate(result);
@@ -95,6 +103,7 @@ export function DesktopUpdateCoordinator() {
     setUpdate(null);
     setError(null);
     setShowVerifiedDmgRecovery(false);
+    installSessionRef.current = { downloaded: false, installed: false };
   }, [installing, update]);
 
   const install = useCallback(async () => {
@@ -102,13 +111,14 @@ export function DesktopUpdateCoordinator() {
     setInstalling(true);
     setError(null);
     setShowVerifiedDmgRecovery(false);
-    setProgress(0);
+    setProgress(installSessionRef.current.downloaded ? 100 : 0);
     downloadedRef.current = 0;
     totalBytesRef.current = undefined;
     try {
       const { relaunch } = await import('@tauri-apps/plugin-process');
       await installDesktopUpdate({
         update,
+        session: installSessionRef.current,
         flush: () => requestManuscriptFlush({ createSnapshot: true }),
         relaunch,
         saveFailedMessage: t.updateSaveFailed,
@@ -199,7 +209,7 @@ export function DesktopUpdateCoordinator() {
           disabled={installing}
         >
           {installing ? <Spinner size="sm" /> : <Download className="h-3.5 w-3.5" />}
-          {installing ? t.updateInstalling : t.updateInstall}
+          {installing ? t.updateInstalling : error ? t.updateRetry : t.updateInstall}
         </Button>
         <Button
           type="button"

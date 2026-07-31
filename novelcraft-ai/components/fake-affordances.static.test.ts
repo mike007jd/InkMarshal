@@ -14,7 +14,8 @@ describe('visible affordances stay honest', () => {
     expect(settings).toContain('<TabsContent value="writing"');
     expect(settings).toContain('<TabsContent value="vault"');
     expect(settings).toContain('<VaultSettings novelId={activeNovelId} />');
-    expect(settings).toContain("initialSection === 'vault' && (!hasNovelContext || !getSettings().developerTools)");
+    expect(settings).toContain("initialSection === 'vault' && !hasNovelContext");
+    expect(settings).not.toContain("!getSettings().developerTools");
     expect(settings).toContain("import { ScrollArea } from '@/components/ui/scroll-area';");
     expect(settings).toContain("} from '@/components/ui/sheet';");
     expect(settings).toContain("import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';");
