@@ -88,6 +88,7 @@ vi.mock('@/components/Toast', () => ({
 }));
 
 vi.mock('@/lib/use-storage', () => ({
+  localDatabaseIssueCopy: () => ({ title: '', body: '' }),
   useNovels: () => ({
     novels: [
       {
@@ -101,6 +102,7 @@ vi.mock('@/lib/use-storage', () => ({
     ],
     loading: false,
     error: null,
+    databaseIssue: null,
     refresh: vi.fn(),
     remove: vi.fn(),
   }),

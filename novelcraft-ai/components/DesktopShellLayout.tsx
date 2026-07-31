@@ -35,7 +35,7 @@ import {
 import { InkMarshalLogo, ManuscriptIcon } from '@/components/Icons';
 import { OrnamentalDivider } from '@/components/BookOrnaments';
 import { useLanguage } from '@/components/LanguageProvider';
-import { useNovels } from '@/lib/use-storage';
+import { localDatabaseIssueCopy, useNovels } from '@/lib/use-storage';
 import { useRegisterSearchScope, type NovelListScope } from '@/components/search/GlobalSearchProvider';
 import {
   engineStatus,
@@ -95,7 +95,15 @@ export function DesktopShell({ children }: DesktopShellProps) {
   const activeNovelId = (params?.id as string | undefined) ?? null;
   const rememberedNovelViews = useRememberedNovelViews();
 
-  const { novels, loading: novelsLoading, error: novelsError, refresh, remove } = useNovels();
+  const {
+    novels,
+    loading: novelsLoading,
+    error: novelsError,
+    databaseIssue,
+    refresh,
+    remove,
+  } = useNovels();
+  const databaseIssueCopy = databaseIssue ? localDatabaseIssueCopy(t, databaseIssue) : null;
   const [deleteTarget, setDeleteTarget] = useState<Novel | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showTrash, setShowTrash] = useState(false);
@@ -603,7 +611,16 @@ export function DesktopShell({ children }: DesktopShellProps) {
                 {t.loading || 'Loading'}
               </div>
             )}
-            {!novelsLoading && novelsError && novels.length === 0 && (
+            {!novelsLoading && databaseIssueCopy && novels.length === 0 && (
+              <div role="alert" className="flex flex-col items-start gap-2 px-3 py-6 text-left">
+                <p className="text-sm font-medium text-book-danger">{databaseIssueCopy.title}</p>
+                <p className="text-sm text-book-ink-secondary">{databaseIssueCopy.body}</p>
+                <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
+                  {t.toastRetry}
+                </Button>
+              </div>
+            )}
+            {!novelsLoading && !databaseIssueCopy && novelsError && novels.length === 0 && (
               <div className="flex flex-col items-center gap-3 px-3 py-6 text-center">
                 <p className="text-sm text-book-danger">{t.errorLoadProjects}</p>
                 <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
@@ -611,7 +628,7 @@ export function DesktopShell({ children }: DesktopShellProps) {
                 </Button>
               </div>
             )}
-            {!novelsLoading && !novelsError && novels.length === 0 && (
+            {!novelsLoading && !databaseIssueCopy && !novelsError && novels.length === 0 && (
               <div className="px-3 py-6 text-center text-sm text-book-ink-secondary">
                 {t.noNovels}
               </div>

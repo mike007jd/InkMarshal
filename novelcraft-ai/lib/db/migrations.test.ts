@@ -5,14 +5,21 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDbForTest, getDb } from '@/lib/db/connection';
+import {
+  closeDbForTest,
+  getDb,
+  inspectExistingDatabaseWithoutTouchingSource,
+} from '@/lib/db/connection';
 import {
   assertCurrentSchema,
   createVerifiedBackup,
   DatabaseFromNewerAppVersionError,
   IncompatibleDatabaseSchemaError,
+  LocalDatabaseUnavailableError,
+  PreMigrationBackupRequiredError,
   ensureCurrentSchema,
   initializeCurrentSchema,
+  knownLegacyReviewItemsFingerprint,
   legacySchema1Fingerprint,
   publishedSchema18Fingerprint,
   publishedSchema19Fingerprint,
@@ -26,6 +33,8 @@ import {
 import {
   CURRENT_SCHEMA_TABLES,
   CURRENT_SCHEMA_VERSION,
+  KNOWN_LEGACY_REVIEW_ITEMS_DDL,
+  KNOWN_LEGACY_REVIEW_ITEMS_MARKERS,
   LEGACY_SCHEMA_1_DDL,
   LEGACY_SCHEMA_1_SQL_ORACLE,
   LEGACY_SCHEMA_1_SQL_ORACLE_OBJECT_COUNT,
@@ -61,6 +70,15 @@ function tables(db: Database.Database): string[] {
 
 function digest(filePath: string): string {
   return createHash('sha256').update(readFileSync(filePath)).digest('hex');
+}
+
+function databaseFileState(): Record<string, string> {
+  const base = dbPath();
+  return Object.fromEntries(
+    [base, `${base}-wal`, `${base}-shm`]
+      .filter(existsSync)
+      .map(filePath => [path.basename(filePath), digest(filePath)]),
+  );
 }
 
 function stampVersion(db: Database.Database, version: number, description: string): void {
@@ -109,6 +127,28 @@ function seedSchema20(db: Database.Database): void {
   expect(SCHEMA_21_CHAT_TURNS_DDL).toContain('chat_turns');
   db.exec(SCHEMA_20_DDL);
   stampVersion(db, SCHEMA_20_VERSION, 'current_epoch_v20');
+}
+
+/** Schema-only known dual-marker legacy: published-18 + obsolete review_items. */
+function seedKnownLegacyReviewItems(db: Database.Database): void {
+  expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('review_items');
+  expect(KNOWN_LEGACY_REVIEW_ITEMS_DDL).toContain('CREATE TABLE review_items');
+  db.exec(PUBLISHED_SCHEMA_18_DDL);
+  db.exec(KNOWN_LEGACY_REVIEW_ITEMS_DDL);
+  db.exec(`
+CREATE TABLE _schema_version (
+  version     INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  applied_at  TEXT NOT NULL
+);
+`);
+  const insert = db.prepare(
+    'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+  );
+  for (const marker of KNOWN_LEGACY_REVIEW_ITEMS_MARKERS) {
+    insert.run(marker.version, marker.description, '2026-07-01T00:00:00.000Z');
+  }
+  db.pragma(`user_version = ${PUBLISHED_SCHEMA_18_VERSION}`);
 }
 
 
@@ -454,6 +494,275 @@ describe('schema 20 → 21', () => {
   });
 });
 
+describe('known dual-marker review_items legacy → 21', () => {
+  it('migrates an exact empty review_items legacy shape and preserves supported rows', () => {
+    const setup = new Database(dbPath());
+    seedKnownLegacyReviewItems(setup);
+    expect(computeSchemaFingerprint(setup).digest).toBe(knownLegacyReviewItemsFingerprint().digest);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Legacy Recovery Book', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO chapters
+         (id, novel_id, chapter_number, title, content, word_count, version, created_at)
+       VALUES ('c1', 'n1', 1, 'One', 'Preserved body', 2, 0, ?)`,
+    ).run(now);
+    setup.close();
+
+    const db = getDb();
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
+    expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 1 });
+    expect(db.prepare('SELECT version, description FROM _schema_version').get()).toEqual({
+      version: CURRENT_SCHEMA_VERSION,
+      description: `current_epoch_v${CURRENT_SCHEMA_VERSION}`,
+    });
+    expect(db.prepare('SELECT title FROM novels WHERE id = ?').get('n1')).toEqual({
+      title: 'Legacy Recovery Book',
+    });
+    expect(db.prepare('SELECT content, processing_status FROM chapters WHERE id = ?').get('c1')).toEqual({
+      content: 'Preserved body',
+      processing_status: 'complete',
+    });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").get(),
+    ).toBeUndefined();
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+
+    const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v18-') && name.endsWith('.bak'));
+    expect(backups.length).toBe(1);
+    const backup = new Database(path.join(dataDir, backups[0]!), { readonly: true });
+    expect(backup.prepare('SELECT COUNT(*) AS count FROM review_items').get()).toEqual({ count: 0 });
+    backup.close();
+  });
+
+  it('refuses to discard nonempty review_items data and leaves the database unchanged', () => {
+    const setup = new Database(dbPath());
+    seedKnownLegacyReviewItems(setup);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Legacy Review Data', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO review_items
+         (id, novel_id, source, severity, status, created_at, updated_at)
+       VALUES ('r1', 'n1', 'author_todo', 'minor', 'open', ?, ?)`,
+    ).run(now, now);
+    setup.close();
+    const before = digest(dbPath());
+
+    expect(() => getDb()).toThrow(/review_items table contains data/);
+    expect(digest(dbPath())).toBe(before);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.bak'))).toHaveLength(0);
+
+    const verify = new Database(dbPath(), { readonly: true });
+    expect(verify.prepare('SELECT id FROM review_items').get()).toEqual({ id: 'r1' });
+    verify.close();
+  });
+
+  it('rejects a nonempty WAL legacy snapshot without touching source DB/WAL/SHM files', () => {
+    const writer = new Database(dbPath());
+    writer.pragma('journal_mode = WAL');
+    seedKnownLegacyReviewItems(writer);
+    const now = new Date().toISOString();
+    writer.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    writer.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'WAL Legacy Review Data', ?, ?)`,
+    ).run(now, now);
+    writer.prepare(
+      `INSERT INTO review_items
+         (id, novel_id, source, severity, status, created_at, updated_at)
+       VALUES ('r1', 'n1', 'author_todo', 'minor', 'open', ?, ?)`,
+    ).run(now, now);
+    expect(existsSync(`${dbPath()}-wal`)).toBe(true);
+    expect(existsSync(`${dbPath()}-shm`)).toBe(true);
+    const before = databaseFileState();
+
+    expect(() => getDb()).toThrow(/review_items table contains data/);
+    expect(databaseFileState()).toEqual(before);
+    expect(writer.prepare('SELECT id FROM review_items').get()).toEqual({ id: 'r1' });
+    writer.close();
+  });
+
+  it('retries the inspection snapshot when a WAL checkpoint races the main/WAL copy', () => {
+    const writer = new Database(dbPath());
+    writer.pragma('journal_mode = WAL');
+    seedKnownLegacyReviewItems(writer);
+    expect(existsSync(`${dbPath()}-wal`)).toBe(true);
+    let checkpointInjected = false;
+
+    expect(() => inspectExistingDatabaseWithoutTouchingSource(dbPath(), () => {
+      if (checkpointInjected) return;
+      checkpointInjected = true;
+      writer.pragma('wal_checkpoint(TRUNCATE)');
+    })).not.toThrow();
+    expect(checkpointInjected).toBe(true);
+    expect(writer.prepare('SELECT COUNT(*) AS count FROM review_items').get()).toEqual({ count: 0 });
+    writer.close();
+  });
+
+  it('requires a verified backup before dropping review_items and leaves bytes unchanged on backup failure', () => {
+    const setup = new Database(dbPath());
+    seedKnownLegacyReviewItems(setup);
+    setup.close();
+    const before = digest(dbPath());
+
+    const db = new Database(dbPath());
+    expect(() => ensureCurrentSchema(db, () => {
+      throw new Error('disk full');
+    })).toThrow(PreMigrationBackupRequiredError);
+    db.close();
+    expect(digest(dbPath())).toBe(before);
+
+    const verify = new Database(dbPath(), { readonly: true });
+    expect(verify.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 2 });
+    expect(
+      verify.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").get(),
+    ).toEqual({ name: 'review_items' });
+    verify.close();
+  });
+
+  it('rolls back a failed destructive promotion and preserves the legacy shape', () => {
+    const db = new Database(':memory:');
+    seedKnownLegacyReviewItems(db);
+    db.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Keep', '', '')`,
+    ).run();
+
+    const boom = new Error('forced ddl failure');
+    const exec = db.exec.bind(db);
+    vi.spyOn(db, 'exec').mockImplementation((sql: string) => {
+      if (typeof sql === 'string' && sql.includes('knowledge_vault_outbox')) throw boom;
+      return exec(sql);
+    });
+
+    expect(() => ensureCurrentSchema(db, () => null)).toThrow('forced ddl failure');
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").get(),
+    ).toEqual({ name: 'review_items' });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 2 });
+    expect(db.prepare('SELECT title FROM novels WHERE id = ?').get('n1')).toEqual({ title: 'Keep' });
+    db.close();
+  });
+
+  it('revalidates under the write lock and preserves a review item inserted after backup', () => {
+    const setup = new Database(dbPath());
+    seedKnownLegacyReviewItems(setup);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Concurrent Legacy Data', ?, ?)`,
+    ).run(now, now);
+    setup.close();
+
+    const primary = new Database(dbPath());
+    expect(() => ensureCurrentSchema(primary, () => {
+      const concurrent = new Database(dbPath());
+      try {
+        concurrent.prepare(
+          `INSERT INTO review_items
+             (id, novel_id, source, severity, status, created_at, updated_at)
+           VALUES ('r1', 'n1', 'author_todo', 'minor', 'open', ?, ?)`,
+        ).run(now, now);
+      } finally {
+        concurrent.close();
+      }
+      return `${dbPath()}.verified-fixture.bak`;
+    })).toThrow(/review_items table contains data/);
+    expect(primary.prepare('SELECT id FROM review_items').get()).toEqual({ id: 'r1' });
+    expect(primary.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 2 });
+    primary.close();
+  });
+
+  it('rejects a semantically similar but non-identical legacy SQL oracle', () => {
+    const bad = new Database(dbPath());
+    bad.exec(PUBLISHED_SCHEMA_18_DDL);
+    bad.exec(KNOWN_LEGACY_REVIEW_ITEMS_DDL.replace(
+      'source          TEXT NOT NULL',
+      'source          TEXT COLLATE NOCASE NOT NULL',
+    ));
+    bad.exec(`
+CREATE TABLE _schema_version (
+  version     INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  applied_at  TEXT NOT NULL
+);
+`);
+    const insert = bad.prepare(
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const marker of KNOWN_LEGACY_REVIEW_ITEMS_MARKERS) {
+      insert.run(marker.version, marker.description, '2026-07-01T00:00:00.000Z');
+    }
+    bad.pragma(`user_version = ${PUBLISHED_SCHEMA_18_VERSION}`);
+    expect(computeSchemaFingerprint(bad).digest).toBe(knownLegacyReviewItemsFingerprint().digest);
+    bad.close();
+    const before = databaseFileState();
+
+    expect(() => getDb()).toThrow(/SQL oracle does not match/);
+    expect(databaseFileState()).toEqual(before);
+  });
+
+  it('rejects dual markers without the exact review_items fingerprint without mutation', () => {
+    const bad = new Database(dbPath());
+    seedPublishedSchema18(bad);
+    bad.prepare('DELETE FROM _schema_version').run();
+    const insert = bad.prepare(
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const marker of KNOWN_LEGACY_REVIEW_ITEMS_MARKERS) {
+      insert.run(marker.version, marker.description, '2026-07-01T00:00:00.000Z');
+    }
+    bad.close();
+    const before = digest(dbPath());
+
+    expect(() => getDb()).toThrow(/known legacy review_items structural fingerprint/);
+    expect(digest(dbPath())).toBe(before);
+  });
+
+  it('rejects forged extra objects on the known legacy shape without mutation', () => {
+    const bad = new Database(dbPath());
+    seedKnownLegacyReviewItems(bad);
+    bad.exec('CREATE TABLE unexpected_extra (id TEXT PRIMARY KEY)');
+    bad.close();
+    const before = digest(dbPath());
+
+    expect(() => getDb()).toThrow(/known legacy review_items structural fingerprint/);
+    expect(digest(dbPath())).toBe(before);
+  });
+
+  it('rejects arbitrary multi-row markers without mutation', () => {
+    const bad = new Database(dbPath());
+    seedPublishedSchema18(bad);
+    bad.prepare(
+      'INSERT INTO _schema_version (version, description, applied_at) VALUES (?, ?, ?)',
+    ).run(17, 'forged_extra', '2026-07-01T00:00:00.000Z');
+    bad.close();
+    const before = digest(dbPath());
+
+    expect(() => getDb()).toThrow(/schema marker is missing or ambiguous/);
+    expect(digest(dbPath())).toBe(before);
+  });
+});
+
 describe('fail-closed unknown / future schemas', () => {
   it('leaves an incompatible nonempty database byte-identical and avoids destructive reset guidance', () => {
     const old = new Database(dbPath());
@@ -551,6 +860,30 @@ describe('fail-closed unknown / future schemas', () => {
   });
 });
 
+describe('mapLocalDatabaseApiError', () => {
+  it('returns stable non-secret codes for typed database failures', async () => {
+    const { mapLocalDatabaseApiError, PreMigrationBackupRequiredError } = await import('@/lib/db/migrations');
+    expect(mapLocalDatabaseApiError(new DatabaseFromNewerAppVersionError(99, 21))).toMatchObject({
+      code: 'DATABASE_NEWER_VERSION',
+      status: 503,
+    });
+    expect(mapLocalDatabaseApiError(new IncompatibleDatabaseSchemaError('fixture'))).toMatchObject({
+      code: 'DATABASE_INCOMPATIBLE',
+      status: 503,
+    });
+    expect(mapLocalDatabaseApiError(new PreMigrationBackupRequiredError('disk full'))).toMatchObject({
+      code: 'DATABASE_BACKUP_REQUIRED',
+      status: 503,
+    });
+    expect(mapLocalDatabaseApiError(new LocalDatabaseUnavailableError('internal path detail'))).toMatchObject({
+      code: 'DATABASE_UNAVAILABLE',
+      status: 503,
+    });
+    expect(mapLocalDatabaseApiError(new Error('InkMarshal: could not open local database at /secret/path'))).toBeNull();
+    expect(mapLocalDatabaseApiError(new Error('validation failed'))).toBeNull();
+  });
+});
+
 describe('createVerifiedBackup', () => {
   it('writes an integrity-checked backup beside an on-disk database', () => {
     const db = new Database(dbPath());
@@ -568,6 +901,22 @@ describe('createVerifiedBackup', () => {
     const db = new Database(':memory:');
     initializeCurrentSchema(db);
     expect(createVerifiedBackup(db, 19)).toBeNull();
+    db.close();
+  });
+
+  it('removes an unpublished temporary backup when verification setup fails', () => {
+    const db = new Database(dbPath());
+    initializeCurrentSchema(db);
+    const exec = db.exec.bind(db);
+    vi.spyOn(db, 'exec').mockImplementation((sql: string) => {
+      const result = exec(sql);
+      if (sql.startsWith('VACUUM INTO')) throw new Error('forced post-write failure');
+      return result;
+    });
+
+    expect(() => createVerifiedBackup(db, 19)).toThrow('forced post-write failure');
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.tmp'))).toHaveLength(0);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.bak'))).toHaveLength(0);
     db.close();
   });
 });

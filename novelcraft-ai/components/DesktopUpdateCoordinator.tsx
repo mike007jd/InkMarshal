@@ -8,8 +8,13 @@ import { useLanguage } from '@/components/LanguageProvider';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
-import { isTauriRuntime } from '@/lib/desktop-runtime';
-import { installDesktopUpdate } from '@/lib/desktop-update-install';
+import { isTauriRuntime, openExternal } from '@/lib/desktop-runtime';
+import {
+  VERIFIED_MAC_DMG_DOWNLOAD_URL,
+  categorizeDesktopUpdateFailure,
+  desktopUpdateFailureMessage,
+  installDesktopUpdate,
+} from '@/lib/desktop-update-install';
 import { isCriticalDesktopUpdate, updateProgressPercent } from '@/lib/desktop-updates';
 import {
   DESKTOP_UPDATE_MANUAL_CHECK_EVENT,
@@ -26,6 +31,7 @@ export function DesktopUpdateCoordinator() {
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showVerifiedDmgRecovery, setShowVerifiedDmgRecovery] = useState(false);
   const updateRef = useRef<Update | null>(null);
   const downloadedRef = useRef(0);
   const totalBytesRef = useRef<number | undefined>(undefined);
@@ -88,12 +94,14 @@ export function DesktopUpdateCoordinator() {
     updateRef.current = null;
     setUpdate(null);
     setError(null);
+    setShowVerifiedDmgRecovery(false);
   }, [installing, update]);
 
   const install = useCallback(async () => {
     if (!update || installing) return;
     setInstalling(true);
     setError(null);
+    setShowVerifiedDmgRecovery(false);
     setProgress(0);
     downloadedRef.current = 0;
     totalBytesRef.current = undefined;
@@ -119,11 +127,21 @@ export function DesktopUpdateCoordinator() {
         },
       });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t.updateInstallFailed);
+      const category = categorizeDesktopUpdateFailure(cause, t.updateSaveFailed);
+      setError(desktopUpdateFailureMessage(category, t));
+      setShowVerifiedDmgRecovery(category !== 'save-failed');
       setInstalling(false);
       setProgress(null);
     }
-  }, [installing, t.updateInstallFailed, t.updateSaveFailed, update]);
+  }, [installing, t, update]);
+
+  const openVerifiedDmg = useCallback(async () => {
+    try {
+      await openExternal(VERIFIED_MAC_DMG_DOWNLOAD_URL);
+    } catch {
+      // Keep the localized failure message; do not surface shell/path details.
+    }
+  }, []);
 
   if (!update) return null;
 
@@ -158,6 +176,20 @@ export function DesktopUpdateCoordinator() {
             </p>
           ) : null}
           {error ? <p className="mt-2 text-xs text-book-danger">{error}</p> : null}
+          {showVerifiedDmgRecovery ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="text-xs text-book-ink-secondary">{t.updateVerifiedDmgRecoveryHint}</p>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => void openVerifiedDmg()}
+                disabled={installing}
+              >
+                {t.updateDownloadVerifiedDmg}
+              </Button>
+            </div>
+          ) : null}
         </div>
         <Button
           type="button"

@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
+import { useToast } from '@/components/Toast';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -175,6 +176,7 @@ export function LocalModelsPanel({
   openProviders?: () => void;
 }) {
   const { t } = useLanguage();
+  const { toast } = useToast();
   const desktop = isTauriRuntime();
 
   const [status, setStatus] = useState<DesktopStatus | null>(null);
@@ -875,6 +877,7 @@ export function LocalModelsPanel({
         const running = runningByPath.get(normalizeModelPathForCompare(model.modelPath)) ?? [];
         await Promise.all(running.map(engine => stopModel(engine.engineId)));
         await removeInstalledLocalModel(model.modelPath);
+        setInstalled(current => current.filter(item => item.modelPath !== model.modelPath));
         setProgress(prev => {
           const next = { ...prev };
           for (const [key, item] of Object.entries(next)) {
@@ -882,7 +885,18 @@ export function LocalModelsPanel({
           }
           return next;
         });
-        await refresh();
+        notifyLocalModelStateChanged();
+        // The destructive command already succeeded. Keep the confirmed
+        // removal visible even if a follow-up status refresh is transiently
+        // unavailable; the next regular refresh will reconcile the rest.
+        await refresh().catch(() => {});
+      } catch {
+        toast(
+          model.managedByApp
+            ? t.modelManagerRemoveFailed
+            : t.modelManagerUnregisterFailed,
+          'error',
+        );
       } finally {
         removingModelPathsRef.current.delete(model.modelPath);
         if (mountedRef.current) {
@@ -894,6 +908,9 @@ export function LocalModelsPanel({
       refresh,
       runningByPath,
       stopModel,
+      t.modelManagerRemoveFailed,
+      t.modelManagerUnregisterFailed,
+      toast,
     ],
   );
 
@@ -1011,6 +1028,7 @@ export function LocalModelsPanel({
     const modelPath = installedModel?.modelPath ?? item?.modelPath;
     const engineUseState = modelPath ? useStates[modelPath]?.state : undefined;
     const running = modelPath ? runningByPath.get(normalizeModelPathForCompare(modelPath))?.[0] : undefined;
+    const removing = installedModel ? Boolean(removingPaths[installedModel.modelPath]) : false;
     const catalogKey = starterCatalogFilesKey(entry, RECOMMENDED_FORMAT);
     const loadingFiles = Boolean(catalogFilesLoading[catalogKey]);
     const canInstall =
@@ -1107,6 +1125,27 @@ export function LocalModelsPanel({
                       : installed.length > 0
                         ? t.modelManagerInstallSupplement
                         : t.modelManagerInstallAndUse}
+              </Button>
+            )}
+            {installedModel && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="text-book-danger hover:text-book-danger"
+                disabled={removing}
+                onClick={() => setPendingRemoval(installedModel)}
+              >
+                {removing ? (
+                  <Spinner size="sm" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {removing
+                  ? t.modelManagerRemoving
+                  : installedModel.managedByApp
+                    ? t.modelManagerRemove
+                    : t.modelManagerUnregister}
               </Button>
             )}
             {(state === 'downloading' || state === 'verifying') && (
@@ -1838,7 +1877,7 @@ export function LocalModelsPanel({
               </Button>
               <Button
                 type="button"
-                variant="accent"
+                variant={pendingRemoval.managedByApp ? 'destructive' : 'accent'}
                 onClick={() => {
                   const model = pendingRemoval;
                   setPendingRemoval(null);

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -242,6 +242,48 @@ describe('novel API request validation', () => {
       expect((await getNovel(novel.id))?.updatedAt).toBe(Date.parse(stale));
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('maps typed local-database failures to stable non-secret codes', async () => {
+    const { GET, POST } = await import('@/app/api/novels/route');
+    const dbModule = await import('@/lib/db');
+    const {
+      DatabaseFromNewerAppVersionError,
+      IncompatibleDatabaseSchemaError,
+    } = await import('@/lib/db/migrations');
+    const getActiveSpy = vi.spyOn(dbModule, 'getActiveNovels').mockImplementation(() => {
+      throw new IncompatibleDatabaseSchemaError('fixture incompatible shape.');
+    });
+    const createSpy = vi.spyOn(dbModule, 'createNovel').mockImplementation(() => {
+      throw new DatabaseFromNewerAppVersionError(99, 21);
+    });
+
+    try {
+      const list = await GET();
+      expect(list.status).toBe(503);
+      const listBody = await list.json();
+      expect(listBody).toEqual({
+        code: 'DATABASE_INCOMPATIBLE',
+        error: expect.stringMatching(/incompatible|backup|support/i),
+      });
+      expect(JSON.stringify(listBody)).not.toMatch(/\/Users\/|inkmarshal\.db|INKMARSHAL/);
+
+      const created = await POST(new Request('http://localhost/api/novels', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'Blocked Create' }),
+      }));
+      expect(created.status).toBe(503);
+      const createdBody = await created.json();
+      expect(createdBody).toEqual({
+        code: 'DATABASE_NEWER_VERSION',
+        error: expect.stringMatching(/newer|update/i),
+      });
+      expect(JSON.stringify(createdBody)).not.toMatch(/\/Users\/|inkmarshal\.db/);
+    } finally {
+      getActiveSpy.mockRestore();
+      createSpy.mockRestore();
     }
   });
 

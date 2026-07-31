@@ -87,7 +87,10 @@ Also confirm:
 - `codesign --verify --deep --strict` succeeds for the final app;
 - Gatekeeper accepts the final DMG/app;
 - stapling validates;
-- the updater archive signature and `latest.json` match the final archive;
+- the updater archive is created with `COPYFILE_DISABLE=1`;
+- `scripts/verify-updater-archive.mjs` confirms one signed `InkMarshal.app` root
+  with no AppleDouble, `._*`, or `.DS_Store` members;
+- the updater Minisign signature and `latest.json` match the final archive;
 - exactly one running InkMarshal process points inside the current DMG mount.
 
 Run [RELEASE_SMOKE_CHECKLIST.md](RELEASE_SMOKE_CHECKLIST.md) against that package before calling it ready.
@@ -112,7 +115,7 @@ Block release when:
 - the exact final DMG is not signed, notarized, stapled, or Gatekeeper-accepted;
 - more than one InkMarshal instance runs during package smoke;
 - the running executable is not inside the current final DMG mount;
-- updater assets are missing, inconsistent, or unreachable;
+- updater assets are missing, inconsistent, unreachable, or fail the raw-tar AppleDouble gate;
 - manual first-run, model, offline, writing, export, or recovery smoke fails;
 - a platform URL is configured without a signed validated build;
 - secrets or local user data appear in source or release assets.

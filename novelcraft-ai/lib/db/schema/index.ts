@@ -1,4 +1,5 @@
 import { sql as currentSchemaSql } from '@/lib/db/schema/0001_initial';
+import { KNOWN_LEGACY_REVIEW_ITEMS_DDL } from '@/lib/db/schema/frozen/known-legacy-review-items.sql';
 import { LEGACY_SCHEMA_1_DDL } from '@/lib/db/schema/frozen/legacy-schema-1.sql';
 import { PUBLISHED_SCHEMA_18_DDL } from '@/lib/db/schema/frozen/published-schema-18.sql';
 import { PUBLISHED_SCHEMA_19_DDL } from '@/lib/db/schema/frozen/published-schema-19.sql';
@@ -12,6 +13,12 @@ export {
   CURRENT_SCHEMA_DESCRIPTION,
   CURRENT_SCHEMA_VERSION,
 } from '@/lib/db/schema/version';
+
+/** Exact dual-marker history for the known review_items legacy recovery path. */
+export const KNOWN_LEGACY_REVIEW_ITEMS_MARKERS = [
+  { version: 1, description: 'current_baseline' },
+  { version: 18, description: 'baseline_epoch_v18' },
+] as const;
 
 /**
  * Current published on-disk schema epoch.
@@ -210,6 +217,7 @@ CREATE INDEX IF NOT EXISTS idx_brainstorm_receipts_novel
 
 export {
   currentSchemaSql,
+  KNOWN_LEGACY_REVIEW_ITEMS_DDL,
   LEGACY_SCHEMA_1_DDL,
   PUBLISHED_SCHEMA_18_DDL,
   PUBLISHED_SCHEMA_19_DDL,

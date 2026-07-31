@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { assertUpdaterArchiveClean } from './verify-updater-archive.mjs';
 
 const MAC_RELEASE_ASSET_NAME = 'InkMarshal-mac-aarch64.dmg';
 const MAC_RELEASE_TARGET = 'aarch64-apple-darwin';
@@ -109,7 +110,7 @@ function validateUpdaterManifest(manifest, signature) {
   if (typeof manifest?.critical !== 'boolean') fail('latest.json critical must be an explicit boolean.');
 }
 
-function validateMacBundleSignature() {
+async function validateMacBundleSignature() {
   if (process.platform !== 'darwin') {
     fail('CHECK_LOCAL_MAC_BUNDLE=1 requires macOS signing tools.');
     return;
@@ -151,10 +152,10 @@ function validateMacBundleSignature() {
     fail(`Gatekeeper assessment is inconclusive on this host: ${spctlOutput}`);
   }
   runRequired('xcrun', ['stapler', 'validate', stableDmgPath], 'notarization ticket validation');
-  validateLocalUpdaterAssets();
+  await validateLocalUpdaterAssets();
 }
 
-function validateLocalUpdaterAssets() {
+async function validateLocalUpdaterAssets() {
   const releaseDir = join(process.cwd(), 'dist/release');
   const archivePath = join(releaseDir, UPDATER_ASSET_NAME);
   const signaturePath = join(releaseDir, UPDATER_SIGNATURE_NAME);
@@ -177,6 +178,12 @@ function validateLocalUpdaterAssets() {
     return;
   }
   validateUpdaterManifest(manifest, signature);
+  try {
+    await assertUpdaterArchiveClean(archivePath);
+  } catch (error) {
+    fail(`local updater archive raw-tar gate failed: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
   verifyUpdaterSignature(archivePath, signaturePath);
 }
 
@@ -214,6 +221,7 @@ async function validatePublishedUpdater() {
     }
     await pipeline(Readable.fromWeb(archiveResponse.body), createWriteStream(archivePath));
     writeFileSync(signaturePath, `${signature}\n`, { mode: 0o600 });
+    await assertUpdaterArchiveClean(archivePath);
     verifyUpdaterSignature(archivePath, signaturePath);
   } catch (error) {
     fail(`published updater verification failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -224,7 +232,7 @@ async function validatePublishedUpdater() {
 }
 
 validateUpdaterConfiguration();
-if (readEnv('CHECK_LOCAL_MAC_BUNDLE') === '1') validateMacBundleSignature();
+if (readEnv('CHECK_LOCAL_MAC_BUNDLE') === '1') await validateMacBundleSignature();
 await validateRemoteAsset(CANONICAL_MAC_DOWNLOAD_URL, 'canonical macOS release asset');
 if (readEnv('CHECK_PUBLISHED_UPDATER') === '1') {
   await validatePublishedUpdater();

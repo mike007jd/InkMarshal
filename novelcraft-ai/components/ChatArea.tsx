@@ -1,17 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { ChatStatus } from 'ai';
 import { useLanguage } from '@/components/LanguageProvider';
 import { joinLocalizedDisplayList } from '@/lib/i18n';
 import { EmptyChatInterviewGuide } from '@/components/EmptyChatInterviewGuide';
-import { WritingModelStatusBar } from '@/components/WritingModelStatusBar';
 import { useToast } from '@/components/Toast';
 import { NovelThread } from '@/components/assistant-ui/thread';
 import { useNovelChatRuntime } from '@/components/assistant-ui/useNovelChatRuntime';
 import { CreativityPicker } from '@/components/writing/CreativityPicker';
+import { ChatModelPicker } from '@/components/writing/ChatModelPicker';
 import { useNovelCreativity } from '@/hooks/useNovelCreativity';
 import type { CreativityLevel } from '@/lib/ai/generation-presets';
 
@@ -126,6 +126,7 @@ export function ChatArea({
     onStatusChange?.(status);
   }, [onStatusChange, status]);
   const submittedRequestRef = useRef(0);
+  const [modelSelectionPending, setModelSelectionPending] = useState(false);
   useEffect(() => {
     if (
       autoSubmitRequest <= 0
@@ -133,14 +134,21 @@ export function ChatArea({
       || !autoSubmitText
       || loading
       || status !== 'ready'
+      || modelSelectionPending
     ) return;
     submittedRequestRef.current = autoSubmitRequest;
     void sendMessage(autoSubmitText, { repairStoryDeck: true });
-  }, [autoSubmitRequest, autoSubmitText, loading, sendMessage, status]);
+  }, [
+    autoSubmitRequest,
+    autoSubmitText,
+    loading,
+    modelSelectionPending,
+    sendMessage,
+    status,
+  ]);
 
   return (
     <div className="flex-1 flex flex-col h-full book-texture-parchment relative overflow-hidden">
-      <WritingModelStatusBar operation="chat" />
       {/* Creativity picker — chat-level slider rather than per-message so it
           stays visible while scrolling history. */}
       <div className="flex items-center justify-end gap-3 border-b border-book-border bg-book-bg-card/40 px-3 py-1">
@@ -153,6 +161,8 @@ export function ChatArea({
             placeholder={t.typeMessage}
             emptyState={<EmptyChatInterviewGuide />}
             composerFooter={t.aiWarning}
+            composerControls={<ChatModelPicker onSavingChange={setModelSelectionPending} />}
+            composerSendDisabled={modelSelectionPending}
             errorMessage={errorMessage}
             onRetry={() => void retry()}
             hideComposer={composerCollapsed}

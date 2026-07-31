@@ -31,6 +31,10 @@ export interface NovelThreadProps {
   emptyState?: ReactNode;
   /** Note rendered under the composer (e.g. the AI disclaimer). */
   composerFooter?: ReactNode;
+  /** Optional controls rendered inside the composer beneath the input row. */
+  composerControls?: ReactNode;
+  /** Prevents sending while an inline composer control is committing state. */
+  composerSendDisabled?: boolean;
   errorMessage?: string | null;
   onRetry?: () => void;
   hideComposer?: boolean;
@@ -52,6 +56,8 @@ export const NovelThread: FC<NovelThreadProps> = ({
   placeholder,
   emptyState,
   composerFooter,
+  composerControls,
+  composerSendDisabled = false,
   errorMessage,
   onRetry,
   hideComposer = false,
@@ -98,7 +104,11 @@ export const NovelThread: FC<NovelThreadProps> = ({
             ) : null}
           </div>
         ) : null}
-        <Composer placeholder={placeholder} />
+        <Composer
+          placeholder={placeholder}
+          controls={composerControls}
+          sendDisabled={composerSendDisabled}
+        />
         {composerFooter ? (
           <div className="mx-auto mt-3 max-w-3xl text-center text-xs font-medium font-serif text-book-ink-muted">
             {composerFooter}
@@ -196,7 +206,17 @@ const UserMessage: FC = () => {
   );
 };
 
-const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
+type ComposerProps = {
+  controls?: ReactNode;
+  placeholder: string;
+  sendDisabled?: boolean;
+};
+
+const Composer: FC<ComposerProps> = ({
+  controls,
+  placeholder,
+  sendDisabled = false,
+}) => {
   const { t } = useLocale();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Stop owns focus while streaming; when it unmounts after a user cancel the
@@ -245,11 +265,12 @@ const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
           placeholder={placeholder}
           rows={1}
           autoFocus
+          disabled={sendDisabled}
           aria-label={placeholder}
-          className="max-h-48 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-3 text-chat text-book-ink-primary outline-none placeholder:text-book-ink-muted"
+          className="max-h-48 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-3 text-chat text-book-ink-primary outline-none placeholder:text-book-ink-muted disabled:cursor-wait disabled:opacity-60"
         />
         <AuiIf condition={(s) => !s.thread.isRunning}>
-          <ComposerPrimitive.Send asChild>
+          <ComposerPrimitive.Send asChild disabled={sendDisabled}>
             <Button
               variant="ink"
               type="button"
@@ -276,6 +297,11 @@ const Composer: FC<{ placeholder: string }> = ({ placeholder }) => {
           </ComposerPrimitive.Cancel>
         </AuiIf>
       </div>
+      {controls ? (
+        <div className="flex min-w-0 items-center px-1 pb-0.5">
+          {controls}
+        </div>
+      ) : null}
     </ComposerPrimitive.Root>
   );
 };
