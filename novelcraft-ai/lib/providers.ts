@@ -5,18 +5,17 @@
 // (source-backed lastVerifiedAt values, a 30-day staleness window, retired ids
 // absent, model-id shape).
 //
-// IT IS NOT A RESOLVER INPUT. The runtime model resolver (server-resolve.ts)
-// builds the live model from request headers / runtime health, not from this
-// catalog — so nothing here flows into generation. (R-14: an earlier synthetic
-// `resolved.preset` of this shape was built by the resolver and discarded by
-// ai-usage; that dead value flow has been removed. The catalog stays as the
-// freshness record it is documented to be.)
-import type { ModelTokenPricing } from '@/lib/model-supply/types';
+// The catalog does not choose a runtime model: server-resolve still gets the
+// active endpoint/model from the user's capability binding. Exact catalog
+// matches may, however, supply transport and narrowly scoped request-compat
+// metadata so verified provider quirks are handled once for every writing path.
+import type { ModelTokenPricing, RuntimeTransport } from '@/lib/model-supply/types';
 import type { Translations } from '@/lib/i18n';
 
 type ProviderNameKey =
   | 'providerNameDeepseek'
   | 'providerNameMoonshot'
+  | 'providerNameKimiCode'
   | 'providerNameDashscope'
   | 'providerNameVolcengine'
   | 'providerNameStepfun'
@@ -26,10 +25,24 @@ type ProviderNameKey =
   | 'providerNameAnthropic'
   | 'providerNameOpenrouter';
 
+/**
+ * Request quirks for a curated model. Consumed by the shared request-compat
+ * layer (server-resolve fetch wrapping + creativity UI). Prefer declaring
+ * quirks here over provider-specific conditionals at call sites.
+ */
+export interface ProviderModelRequestCompat {
+  /**
+   * When set, every chat-completions body must use this exact temperature.
+   * Creativity presets are overridden; the UI shows automatic optimization.
+   */
+  temperature?: number;
+}
+
 export interface ProviderPreset {
   id: string;
   nameKey: ProviderNameKey;
   baseUrl: string;
+  transport: RuntimeTransport;
   models: string[];
   defaultModel: string;
   lastVerifiedAt: string;
@@ -45,6 +58,8 @@ export interface ProviderModelMetadata {
   sunsetAt?: string;
   replacementModel?: string;
   note?: string;
+  /** Metadata-driven request compatibility (temperature clamps, etc.). */
+  requestCompat?: ProviderModelRequestCompat;
   /**
    * Optional BYOK price (per million tokens) consumed by the local cost panel's
    * `resolvePricing`. Subject to the SAME freshness discipline as the rest of
@@ -58,7 +73,11 @@ export interface ProviderModelMetadata {
 
 export const PROVIDER_PRESETS_LAST_VERIFIED_AT = '2026-07-01';
 const ANTHROPIC_PRESETS_LAST_VERIFIED_AT = '2026-07-01';
+const KIMI_CODE_PRESETS_LAST_VERIFIED_AT = '2026-08-01';
 const ANTHROPIC_MODELS_SOURCE_URL = 'https://platform.claude.com/docs/en/about-claude/models/overview';
+const KIMI_CODE_MODELS_SOURCE_URL = 'https://www.kimi.com/code/docs/en/kimi-code/models.html';
+export const KIMI_CODE_BASE_URL = 'https://api.kimi.com/coding/v1';
+export const KIMI_CODE_HIGHSPEED_MODEL = 'kimi-for-coding-highspeed';
 const PROVIDER_PRESETS_STALE_AFTER_DAYS = 30;
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
@@ -67,6 +86,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'deepseek',
     nameKey: 'providerNameDeepseek',
     baseUrl: 'https://api.deepseek.com/v1',
+    transport: 'openai-compatible',
     models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
     defaultModel: 'deepseek-v4-flash',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -101,6 +121,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'moonshot',
     nameKey: 'providerNameMoonshot',
     baseUrl: 'https://api.moonshot.ai/v1',
+    transport: 'openai-compatible',
     models: ['kimi-k2.6'],
     defaultModel: 'kimi-k2.6',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -118,9 +139,31 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     },
   },
   {
+    id: 'kimi-code',
+    nameKey: 'providerNameKimiCode',
+    baseUrl: KIMI_CODE_BASE_URL,
+    transport: 'openai-compatible',
+    models: [KIMI_CODE_HIGHSPEED_MODEL],
+    defaultModel: KIMI_CODE_HIGHSPEED_MODEL,
+    lastVerifiedAt: KIMI_CODE_PRESETS_LAST_VERIFIED_AT,
+    sourceUrls: [KIMI_CODE_MODELS_SOURCE_URL],
+    modelMetadata: {
+      [KIMI_CODE_HIGHSPEED_MODEL]: {
+        status: 'recommended',
+        lastVerifiedAt: KIMI_CODE_PRESETS_LAST_VERIFIED_AT,
+        sourceUrls: [KIMI_CODE_MODELS_SOURCE_URL],
+        contextLengthTokens: 262_144,
+        // Live API rejects any temperature other than 1 for this model id.
+        requestCompat: { temperature: 1 },
+        note: 'Verified Kimi Code HighSpeed only; K3 and standard coding ids stay out until separately checked.',
+      },
+    },
+  },
+  {
     id: 'dashscope',
     nameKey: 'providerNameDashscope',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    transport: 'openai-compatible',
     models: ['qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-flash'],
     defaultModel: 'qwen3.7-max',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -153,6 +196,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'volcengine',
     nameKey: 'providerNameVolcengine',
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    transport: 'openai-compatible',
     models: [],
     defaultModel: '',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -163,6 +207,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'stepfun',
     nameKey: 'providerNameStepfun',
     baseUrl: 'https://api.stepfun.com/v1',
+    transport: 'openai-compatible',
     models: ['step-3.7-flash'],
     defaultModel: 'step-3.7-flash',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -186,6 +231,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'siliconflow',
     nameKey: 'providerNameSiliconflow',
     baseUrl: 'https://api.siliconflow.cn/v1',
+    transport: 'openai-compatible',
     models: [],
     defaultModel: '',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -197,6 +243,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'openai',
     nameKey: 'providerNameOpenai',
     baseUrl: 'https://api.openai.com/v1',
+    transport: 'openai-compatible',
     models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano'],
     defaultModel: 'gpt-5.4-mini',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -232,6 +279,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'gemini',
     nameKey: 'providerNameGemini',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    transport: 'openai-compatible',
     models: ['gemini-3.1-pro-preview', 'gemini-3.5-flash'],
     defaultModel: 'gemini-3.5-flash',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -259,6 +307,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'anthropic',
     nameKey: 'providerNameAnthropic',
     baseUrl: 'https://api.anthropic.com',
+    transport: 'anthropic',
     models: ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
     defaultModel: 'claude-sonnet-5',
     lastVerifiedAt: ANTHROPIC_PRESETS_LAST_VERIFIED_AT,
@@ -296,6 +345,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'openrouter',
     nameKey: 'providerNameOpenrouter',
     baseUrl: 'https://openrouter.ai/api/v1',
+    transport: 'openai-compatible',
     models: ['anthropic/claude-sonnet-5', 'openai/gpt-5.4-mini', 'moonshotai/kimi-k2.6', 'stepfun/step-3.7-flash'],
     defaultModel: 'anthropic/claude-sonnet-5',
     lastVerifiedAt: PROVIDER_PRESETS_LAST_VERIFIED_AT,
@@ -365,4 +415,65 @@ export function providerModelsNeedingRefresh(
     if (!meta) return true;
     return isProviderPresetStale({ lastVerifiedAt: meta.lastVerifiedAt }, now);
   });
+}
+
+/** Normalize a base URL for exact preset matching (strip trailing slash). */
+function normalizeProviderBaseUrl(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).toString().replace(/\/$/, '');
+  } catch {
+    return baseUrl.trim().replace(/\/+$/, '');
+  }
+}
+
+function findProviderPresetByBaseUrl(baseUrl: string): ProviderPreset | null {
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  return (
+    PROVIDER_PRESETS.find(
+      preset => normalizeProviderBaseUrl(preset.baseUrl) === normalized,
+    ) ?? null
+  );
+}
+
+/** Look up curated model metadata for an exact baseUrl + modelId pair. */
+function findProviderModelMetadata(
+  baseUrl: string,
+  modelId: string,
+): ProviderModelMetadata | null {
+  const preset = findProviderPresetByBaseUrl(baseUrl);
+  if (!preset) return null;
+  return preset.modelMetadata[modelId] ?? null;
+}
+
+/** Request-compat quirks for an exact curated baseUrl + modelId, or null. */
+export function resolveProviderRequestCompat(
+  baseUrl: string,
+  modelId: string,
+): ProviderModelRequestCompat | null {
+  const meta = findProviderModelMetadata(baseUrl, modelId);
+  const compat = meta?.requestCompat;
+  if (!compat) return null;
+  return { ...compat };
+}
+
+/** True when creativity controls cannot affect sampling for this model. */
+export function modelUsesFixedSampling(baseUrl: string, modelId: string): boolean {
+  const compat = resolveProviderRequestCompat(baseUrl, modelId);
+  return typeof compat?.temperature === 'number';
+}
+
+/**
+ * Apply curated requestCompat onto a chat-completions JSON body.
+ * Returns a new object when a rewrite is needed; otherwise returns the input.
+ * Unrelated models are left untouched.
+ */
+export function applyProviderRequestCompatToBody(
+  baseUrl: string,
+  modelId: string,
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const compat = resolveProviderRequestCompat(baseUrl, modelId);
+  if (!compat || typeof compat.temperature !== 'number') return body;
+  if (body.temperature === compat.temperature) return body;
+  return { ...body, temperature: compat.temperature };
 }

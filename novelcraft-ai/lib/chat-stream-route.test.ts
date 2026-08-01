@@ -66,9 +66,14 @@ interface MockStreamTextOptions {
   abortSignal?: AbortSignal;
   onFinish: (event: {
     text: string;
-    usage: undefined;
+    usage: {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+    } | undefined;
     finishReason?: string;
   }) => Promise<void>;
+  onAbort?: (event: { steps: unknown[] }) => void | Promise<void>;
   onError: (event: { error: unknown }) => Promise<void>;
 }
 
@@ -473,6 +478,232 @@ describe('streamChatTurnResponse', () => {
     });
     expect(persistence.persistStoppedAssistant).toHaveBeenCalledTimes(1);
     expect(persistence.persistAssistant).not.toHaveBeenCalled();
+    expect(persistence.markCancelled).not.toHaveBeenCalled();
+    expect(aiUsage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+    expect(aiUsage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+      aiUsage.settle.mock.invocationCallOrder[0]!,
+    );
+    expect(aiUsage.settle).toHaveBeenCalledTimes(1);
+    expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+  });
+
+  it('captures partial usage before settle on official non-awaited abort-part Stop', async () => {
+    // AI SDK 6.0.208: abort() calls onAbort without awaiting and emits an abort
+    // part — no core onError. UI-stream onFinish({ isAborted }) owns partial
+    // capture + cancelled settlement.
+    const requestController = new AbortController();
+    aiMocks.streamText.mockImplementation((opts: MockStreamTextOptions) => ({
+      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => uiResponse(responseOptions, async () => {
+        requestController.abort();
+        void opts.onAbort?.({ steps: [] });
+        await responseOptions.onFinish?.({
+          responseMessage: uiMessage('assistant-1', 'assistant', 'partial reply'),
+          isAborted: true,
+          isContinuation: false,
+          messages: [uiMessage('user-1', 'user', 'hi'), uiMessage('assistant-1', 'assistant', 'partial reply')],
+        });
+        return { aborted: true };
+      }),
+    }));
+
+    const aiUsage = makeAiUsage();
+    const persistence = makePersistence();
+
+    const response = await streamChatTurnResponse({
+      aiUsage: aiUsage as never,
+      requestSignal: requestController.signal,
+      system: 'sys',
+      history: [{ role: 'user', content: 'hi' }],
+      preset: { temperature: 0.75 },
+      persistence,
+      originalMessages: [uiMessage('user-1', 'user', 'hi')],
+      submittedUserMessage: uiMessage('user-1', 'user', 'hi'),
+      responseMessageId: 'assistant-1',
+      activeClaim: defaultActiveClaim,
+      claimLease: { renewClaim: () => true },
+      stoppedLabel: 'Stopped',
+    });
+    await drain(response);
+
+    expect(persistence.persistStoppedAssistant).toHaveBeenCalledWith(
+      'assistant-1',
+      'partial reply\n\nStopped',
+    );
+    expect(persistence.markCancelled).not.toHaveBeenCalled();
+    expect(aiUsage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+    expect(aiUsage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+      aiUsage.settle.mock.invocationCallOrder[0]!,
+    );
+    expect(aiUsage.settle).toHaveBeenCalledTimes(1);
+    expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+  });
+
+  it('keeps the claim running when core onError races ahead of UI abort onFinish', async () => {
+    // Packaged-app ordering from v0.1.4 QA: Stop aborts the provider, core
+    // onError runs first, then UI-stream onFinish({ isAborted }) persists the
+    // visible partial. Terminalizing the durable claim in the core callback
+    // made persistStoppedAssistant throw "claim lost"; settling usage there
+    // latched null output estimates before the partial was available.
+    const requestController = new AbortController();
+    let claimRunning = true;
+    aiMocks.streamText.mockImplementation((opts: MockStreamTextOptions) => ({
+      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => uiResponse(responseOptions, async () => {
+        requestController.abort();
+        await opts.onError({ error: new DOMException('The operation was aborted.', 'AbortError') });
+        await responseOptions.onFinish?.({
+          responseMessage: uiMessage('assistant-1', 'assistant', 'partial reply'),
+          isAborted: true,
+          isContinuation: false,
+          messages: [uiMessage('user-1', 'user', 'hi'), uiMessage('assistant-1', 'assistant', 'partial reply')],
+        });
+        return { aborted: true };
+      }),
+    }));
+
+    const aiUsage = makeAiUsage();
+    const persistence = makePersistence({
+      markCancelled: vi.fn(async () => {
+        claimRunning = false;
+      }),
+      persistStoppedAssistant: vi.fn(async (id: string, text: string) => {
+        if (!claimRunning) {
+          throw new Error('Chat turn claim lost before assistant persistence');
+        }
+        return msg(id, 'assistant', text);
+      }),
+    });
+
+    const response = await streamChatTurnResponse({
+      aiUsage: aiUsage as never,
+      requestSignal: requestController.signal,
+      system: 'sys',
+      history: [{ role: 'user', content: 'hi' }],
+      preset: { temperature: 0.75 },
+      persistence,
+      originalMessages: [uiMessage('user-1', 'user', 'hi')],
+      submittedUserMessage: uiMessage('user-1', 'user', 'hi'),
+      responseMessageId: 'assistant-1',
+      activeClaim: defaultActiveClaim,
+      claimLease: { renewClaim: () => true },
+      stoppedLabel: 'Stopped',
+    });
+    await drain(response);
+
+    expect(persistence.persistStoppedAssistant).toHaveBeenCalledTimes(1);
+    expect(persistence.persistStoppedAssistant).toHaveBeenCalledWith(
+      'assistant-1',
+      'partial reply\n\nStopped',
+    );
+    expect(persistence.persistAssistant).not.toHaveBeenCalled();
+    expect(persistence.markCancelled).not.toHaveBeenCalled();
+    expect(persistence.markFailed).not.toHaveBeenCalled();
+    expect(aiUsage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+    expect(aiUsage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+      aiUsage.settle.mock.invocationCallOrder[0]!,
+    );
+    expect(aiUsage.settle).toHaveBeenCalledTimes(1);
+    expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+  });
+
+  it('preserves provider usage when cancelled core onFinish settles before UI abort', async () => {
+    const requestController = new AbortController();
+    const providerUsage = { inputTokens: 11, outputTokens: 7, totalTokens: 18 };
+    aiMocks.streamText.mockImplementation((opts: MockStreamTextOptions) => ({
+      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => uiResponse(responseOptions, async () => {
+        requestController.abort();
+        await opts.onFinish({
+          text: 'partial reply',
+          usage: providerUsage as never,
+          finishReason: 'stop',
+        });
+        await responseOptions.onFinish?.({
+          responseMessage: uiMessage('assistant-1', 'assistant', 'partial reply'),
+          isAborted: true,
+          isContinuation: false,
+          messages: [uiMessage('user-1', 'user', 'hi'), uiMessage('assistant-1', 'assistant', 'partial reply')],
+        });
+        return { aborted: true };
+      }),
+    }));
+
+    const aiUsage = makeAiUsage();
+    const persistence = makePersistence();
+
+    const response = await streamChatTurnResponse({
+      aiUsage: aiUsage as never,
+      requestSignal: requestController.signal,
+      system: 'sys',
+      history: [{ role: 'user', content: 'hi' }],
+      preset: { temperature: 0.75 },
+      persistence,
+      originalMessages: [uiMessage('user-1', 'user', 'hi')],
+      submittedUserMessage: uiMessage('user-1', 'user', 'hi'),
+      responseMessageId: 'assistant-1',
+      activeClaim: defaultActiveClaim,
+      claimLease: { renewClaim: () => true },
+      stoppedLabel: 'Stopped',
+    });
+    await drain(response);
+
+    expect(persistence.persistStoppedAssistant).toHaveBeenCalledWith(
+      'assistant-1',
+      'partial reply\n\nStopped',
+    );
+    expect(aiUsage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+    expect(aiUsage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+      aiUsage.settle.mock.invocationCallOrder[0]!,
+    );
+    expect(aiUsage.settle).toHaveBeenCalledTimes(1);
+    expect(aiUsage.settle).toHaveBeenCalledWith({
+      outcome: 'cancelled',
+      usage: providerUsage,
+    });
+  });
+
+  it('marks an empty aborted stream cancelled exactly once after UI onFinish', async () => {
+    const requestController = new AbortController();
+    aiMocks.streamText.mockImplementation((opts: MockStreamTextOptions) => ({
+      toUIMessageStreamResponse: (responseOptions: MockUIMessageResponseOptions) => uiResponse(responseOptions, async () => {
+        requestController.abort();
+        await opts.onError({ error: new DOMException('The operation was aborted.', 'AbortError') });
+        await responseOptions.onFinish?.({
+          responseMessage: uiMessage('assistant-1', 'assistant', ''),
+          isAborted: true,
+          isContinuation: false,
+          messages: [uiMessage('user-1', 'user', 'hi')],
+        });
+        return { aborted: true };
+      }),
+    }));
+
+    const aiUsage = makeAiUsage();
+    const persistence = makePersistence();
+
+    const response = await streamChatTurnResponse({
+      aiUsage: aiUsage as never,
+      requestSignal: requestController.signal,
+      system: 'sys',
+      history: [{ role: 'user', content: 'hi' }],
+      preset: { temperature: 0.75 },
+      persistence,
+      originalMessages: [uiMessage('user-1', 'user', 'hi')],
+      submittedUserMessage: uiMessage('user-1', 'user', 'hi'),
+      responseMessageId: 'assistant-1',
+      activeClaim: defaultActiveClaim,
+      claimLease: { renewClaim: () => true },
+      stoppedLabel: 'Stopped',
+    });
+    await drain(response);
+
+    expect(persistence.persistStoppedAssistant).not.toHaveBeenCalled();
+    expect(persistence.persistAssistant).not.toHaveBeenCalled();
+    expect(persistence.markCancelled).toHaveBeenCalledTimes(1);
+    expect(persistence.markFailed).not.toHaveBeenCalled();
+    // Empty text is still passed through; UserOwnedAIUsageSession ignores it.
+    expect(aiUsage.addPartialOutput).toHaveBeenCalledWith('');
+    expect(aiUsage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+      aiUsage.settle.mock.invocationCallOrder[0]!,
+    );
     expect(aiUsage.settle).toHaveBeenCalledTimes(1);
     expect(aiUsage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
   });

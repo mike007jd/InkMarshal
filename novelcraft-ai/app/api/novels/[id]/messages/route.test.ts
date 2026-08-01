@@ -30,6 +30,7 @@ function mockUsage() {
   const recordUsage = vi.fn(async () => undefined);
   const fail = vi.fn(async () => undefined);
   const settle = vi.fn(async () => undefined);
+  const addPartialOutput = vi.fn();
   vi.doMock('@/lib/ai-usage', async importOriginal => {
     const actual = await importOriginal<typeof import('@/lib/ai-usage')>();
     return {
@@ -38,14 +39,14 @@ function mockUsage() {
         model: {} as never,
         runtimeModel: { id: 'test-model', label: 'Test', provider: 'openai', modelId: 'test', contextWindow: 8192 },
         addPromptText: vi.fn(),
-        addPartialOutput: vi.fn(),
+        addPartialOutput,
         recordUsage,
         settle,
         fail,
       })),
     };
   });
-  return { recordUsage, fail, settle };
+  return { recordUsage, fail, settle, addPartialOutput };
 }
 
 function mockContext() {
@@ -65,6 +66,16 @@ interface MockUIMessageResponseOptions {
   headers?: HeadersInit;
   generateMessageId?: () => string;
   onError?: (error: unknown) => string;
+  onFinish?: (event: {
+    responseMessage: {
+      id: string;
+      role: 'assistant';
+      parts: Array<{ type: 'text'; text: string; state?: 'done' }>;
+    };
+    isAborted: boolean;
+    isContinuation: boolean;
+    messages: unknown[];
+  }) => Promise<void> | void;
 }
 
 function mockUIMessageResponse(
@@ -1831,6 +1842,255 @@ describe('novel messages API', () => {
       ]);
     } finally {
       release();
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('persists a stopped partial once when official non-awaited abort precedes UI onFinish', async () => {
+    const usage = mockUsage();
+    mockContext();
+    const requestController = new AbortController();
+    vi.doMock('ai', async importOriginal => {
+      const actual = await importOriginal<typeof import('ai')>();
+      return {
+        ...actual,
+        streamText: vi.fn((opts: {
+          onAbort?: (event: { steps: unknown[] }) => void | Promise<void>;
+        }) => ({
+          toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+            mockUIMessageResponse(uiOptions, async () => {
+              // AI SDK 6.0.208 abort-part path: non-awaited onAbort, no onError.
+              requestController.abort();
+              void opts.onAbort?.({ steps: [] });
+              const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+              await uiOptions.onFinish?.({
+                responseMessage: {
+                  id,
+                  role: 'assistant',
+                  parts: [{ type: 'text', text: 'partial reply', state: 'done' }],
+                },
+                isAborted: true,
+                isContinuation: false,
+                messages: [],
+              });
+              return { aborted: true, messageId: id };
+            }),
+        })),
+      };
+    });
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Stop Partial Official Abort' });
+    const userMessageId = 'stop-partial-official-abort-user';
+
+    try {
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: requestController.signal,
+        body: JSON.stringify({
+          stoppedLabel: 'Stopped',
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            parts: [{ type: 'text', text: 'stop me after partial' }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await response.text();
+
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        responseText: 'partial reply\n\nStopped',
+      });
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
+        { id: userMessageId, role: 'user', content: 'stop me after partial' },
+        {
+          id: deterministicAssistantMessageId(userMessageId),
+          role: 'assistant',
+          content: 'partial reply\n\nStopped',
+        },
+      ]);
+      expect(usage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+      expect(usage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+        usage.settle.mock.invocationCallOrder[0]!,
+      );
+      expect(usage.settle).toHaveBeenCalledTimes(1);
+      expect(usage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('persists a stopped partial once when core onError races ahead of UI onFinish', async () => {
+    const usage = mockUsage();
+    mockContext();
+    const requestController = new AbortController();
+    vi.doMock('ai', async importOriginal => {
+      const actual = await importOriginal<typeof import('ai')>();
+      return {
+        ...actual,
+        streamText: vi.fn((opts: {
+          onError: (event: { error: unknown }) => Promise<void>;
+        }) => ({
+          toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+            mockUIMessageResponse(uiOptions, async () => {
+              // Packaged Stop ordering: request abort + core onError before
+              // UI-stream onFinish({ isAborted }) owns partial persistence.
+              requestController.abort();
+              await opts.onError({
+                error: new DOMException('The operation was aborted.', 'AbortError'),
+              });
+              const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+              await uiOptions.onFinish?.({
+                responseMessage: {
+                  id,
+                  role: 'assistant',
+                  parts: [{ type: 'text', text: 'partial reply', state: 'done' }],
+                },
+                isAborted: true,
+                isContinuation: false,
+                messages: [],
+              });
+              return { aborted: true, messageId: id };
+            }),
+        })),
+      };
+    });
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Stop Partial Race' });
+    const userMessageId = 'stop-partial-race-user';
+
+    try {
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: requestController.signal,
+        body: JSON.stringify({
+          stoppedLabel: 'Stopped',
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            parts: [{ type: 'text', text: 'stop me after partial' }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await response.text();
+
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        responseText: 'partial reply\n\nStopped',
+      });
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
+        { id: userMessageId, role: 'user', content: 'stop me after partial' },
+        {
+          id: deterministicAssistantMessageId(userMessageId),
+          role: 'assistant',
+          content: 'partial reply\n\nStopped',
+        },
+      ]);
+      expect(usage.addPartialOutput).toHaveBeenCalledWith('partial reply');
+      expect(usage.addPartialOutput.mock.invocationCallOrder[0]).toBeLessThan(
+        usage.settle.mock.invocationCallOrder[0]!,
+      );
+      expect(usage.settle).toHaveBeenCalledTimes(1);
+      expect(usage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('cancels an empty stopped turn and allows a later retry', async () => {
+    const usage = mockUsage();
+    mockContext();
+    const requestController = new AbortController();
+    let attempts = 0;
+    vi.doMock('ai', async importOriginal => {
+      const actual = await importOriginal<typeof import('ai')>();
+      return {
+        ...actual,
+        streamText: vi.fn((opts: {
+          onError: (event: { error: unknown }) => Promise<void>;
+          onFinish: (event: { text: string; usage: undefined }) => Promise<void>;
+        }) => {
+          attempts += 1;
+          return {
+            toUIMessageStreamResponse: (uiOptions: MockUIMessageResponseOptions) =>
+              mockUIMessageResponse(uiOptions, async () => {
+                if (attempts === 1) {
+                  requestController.abort();
+                  await opts.onError({
+                    error: new DOMException('The operation was aborted.', 'AbortError'),
+                  });
+                  const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+                  await uiOptions.onFinish?.({
+                    responseMessage: {
+                      id,
+                      role: 'assistant',
+                      parts: [{ type: 'text', text: '', state: 'done' }],
+                    },
+                    isAborted: true,
+                    isContinuation: false,
+                    messages: [],
+                  });
+                  return { aborted: true, messageId: id };
+                }
+                const id = uiOptions.generateMessageId?.() ?? 'assistant-1';
+                await opts.onFinish({ text: 'retry reply', usage: undefined });
+                return { type: 'text-delta', messageId: id, delta: 'retry reply' };
+              }),
+          };
+        }),
+      };
+    });
+
+    const { createNovel, deleteNovelCascade, getChatTurn, getMessages } = await import('@/lib/db');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Empty Stop Retry' });
+    const userMessageId = 'empty-stop-retry-user';
+    const body = {
+      stoppedLabel: 'Stopped',
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        parts: [{ type: 'text', text: 'empty stop then retry' }],
+      }],
+    };
+
+    try {
+      const stopped = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: requestController.signal,
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      await stopped.text();
+      expect(getChatTurn(novel.id, userMessageId)?.status).toBe('cancelled');
+      expect((await getMessages(novel.id)).map(m => m.role)).toEqual(['user']);
+      expect(usage.settle).toHaveBeenCalledWith({ outcome: 'cancelled', usage: undefined });
+
+      const retried = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      expect(await retried.text()).toContain('retry reply');
+      expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
+        status: 'succeeded',
+        responseText: 'retry reply',
+      });
+      expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
+        { id: userMessageId, role: 'user', content: 'empty stop then retry' },
+        {
+          id: deterministicAssistantMessageId(userMessageId),
+          role: 'assistant',
+          content: 'retry reply',
+        },
+      ]);
+    } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }
   });

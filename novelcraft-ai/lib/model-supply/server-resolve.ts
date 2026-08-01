@@ -38,6 +38,8 @@ import {
   type RuntimeTransport,
 } from './types';
 import { MODEL_CATALOG } from './catalog';
+import { composeFetch, requestCompatFetch } from './request-compat';
+import { resolveProviderRequestCompat } from '@/lib/providers';
 
 function runtimeBaseUrlIsLoopback(baseURL: string): boolean {
   try {
@@ -174,10 +176,21 @@ export async function resolveModelForRole(
     );
   }
 
+  // Metadata-driven request quirks (e.g. fixed temperature). Looked up by the
+  // exact curated baseUrl + modelId; unrelated providers stay untouched.
+  const hasRequestCompat = Boolean(resolveProviderRequestCompat(baseURL, modelId));
+  const compatFetch = hasRequestCompat
+    ? (base: typeof fetch) => requestCompatFetch(baseURL, modelId, base)
+    : null;
+
   let model: LanguageModel;
   switch (transport) {
     case 'anthropic': {
-      model = createAnthropic({ apiKey: secret!, baseURL })(modelId);
+      model = createAnthropic({
+        apiKey: secret!,
+        baseURL,
+        ...(compatFetch ? { fetch: compatFetch(fetch) } : {}),
+      })(modelId);
       break;
     }
     case 'ollama-native': {
@@ -185,6 +198,7 @@ export async function resolveModelForRole(
         name: 'ollama',
         apiKey: secret || 'ollama',
         baseURL,
+        ...(compatFetch ? { fetch: compatFetch(fetch) } : {}),
       }).chatModel(modelId);
       break;
     }
@@ -203,6 +217,11 @@ export async function resolveModelForRole(
       // schema) until their capability is explicitly represented and proven.
       const loopback = runtimeBaseUrlIsLoopback(baseURL);
       const bundledGguf = kind === 'local' && engineFormat === 'gguf' && loopback;
+      const fetchImpl = composeFetch(
+        bundledGguf || loopback ? disableThinkingFetch : null,
+        compatFetch,
+      );
+      const useCustomFetch = bundledGguf || loopback || hasRequestCompat;
       model = createOpenAICompatible({
         name: 'user-runtime',
         apiKey: secret || 'user-owned-runtime',
@@ -210,11 +229,11 @@ export async function resolveModelForRole(
         ...(bundledGguf
           ? {
               supportsStructuredOutputs: true,
-              fetch: disableThinkingFetch(),
+              ...(useCustomFetch ? { fetch: fetchImpl } : {}),
             }
-          : loopback
-            ? { fetch: disableThinkingFetch() }
-          : {}),
+          : useCustomFetch
+            ? { fetch: fetchImpl }
+            : {}),
       }).chatModel(modelId);
       break;
     }

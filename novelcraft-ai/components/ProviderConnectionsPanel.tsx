@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, KeyRound, PlugZap, Plus, ShieldCheck, Trash2, XCircle } from 'lucide-react';
 
 import { useLanguage } from '@/components/LanguageProvider';
@@ -29,6 +29,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
+  getCapabilityProfile,
   getConnection,
   getConnections,
   getConnectionSecret,
@@ -37,6 +38,16 @@ import {
   saveConnectionWithOptionalSecret,
   subscribeConnectionsStore,
 } from '@/lib/model-supply/connections';
+import {
+  connectProviderWithRealProbe,
+  type ConnectFailureCategory,
+} from '@/lib/model-supply/curated-connect';
+import {
+  generationProbeFailureMessage,
+  isGenerationProbeFailureCategory,
+  type GenerationProbeFailureCategory,
+  type GenerationProbeResult,
+} from '@/lib/model-supply/generation-probe';
 import { isTauriRuntime } from '@/lib/desktop-runtime';
 import { categorizeHealthFailure, healthFailureMessage } from '@/lib/model-supply/health-failure';
 import { secretStoreActiveBackend } from '@/lib/model-supply/secret-store';
@@ -45,7 +56,12 @@ import type {
   RuntimeConnectionKind,
   RuntimeTransport,
 } from '@/lib/model-supply/types';
-import { PROVIDER_PRESETS, providerDisplayName } from '@/lib/providers';
+import {
+  PROVIDER_PRESETS,
+  getProviderDefaultModel,
+  providerDisplayName,
+  type ProviderPreset,
+} from '@/lib/providers';
 
 interface DraftForm {
   id?: string;
@@ -54,6 +70,7 @@ interface DraftForm {
   kind: RuntimeConnectionKind;
   transport: RuntimeTransport;
   baseUrl: string;
+  modelId: string;
   apiKey: string;
   hadKey: boolean;
 }
@@ -66,12 +83,90 @@ type SecretBackendState = 'keychain' | 'encrypted_file' | 'unknown' | null;
 function emptyDraft(): DraftForm {
   return {
     label: '',
-    kind: 'provider',
+    kind: 'custom',
     transport: 'openai-compatible',
     baseUrl: '',
+    modelId: '',
     apiKey: '',
     hadKey: false,
   };
+}
+
+function applyPreset(preset: ProviderPreset, current: DraftForm): DraftForm {
+  return {
+    ...current,
+    presetId: preset.id,
+    label: '', // filled from localized name at select time by caller
+    kind: 'provider',
+    transport: preset.transport,
+    baseUrl: preset.baseUrl,
+    modelId: getProviderDefaultModel(preset) ?? '',
+  };
+}
+
+async function resolveDraftSecret(draft: DraftForm): Promise<string | null> {
+  let secret: string | null = draft.apiKey.trim() || null;
+  if (!secret && draft.id && draft.hadKey) {
+    const stored = getConnection(draft.id);
+    const endpointUnchanged = Boolean(
+      stored
+      && stored.kind === draft.kind
+      && stored.transport === draft.transport
+      && stored.baseUrl === draft.baseUrl.trim(),
+    );
+    if (!stored || !endpointUnchanged) return null;
+    try {
+      secret = await getConnectionSecretForSnapshot(stored);
+    } catch {
+      return null;
+    }
+  }
+  return secret;
+}
+
+async function callGenerationProbe(input: {
+  kind: RuntimeConnectionKind;
+  transport: RuntimeTransport;
+  baseUrl: string;
+  modelId: string;
+  secret: string | null;
+}): Promise<GenerationProbeResult> {
+  const response = await fetch('/api/model-supply/generation-probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind: input.kind,
+      transport: input.transport,
+      baseUrl: input.baseUrl,
+      modelId: input.modelId,
+      secret: input.secret,
+    }),
+  });
+  let json: unknown = null;
+  try {
+    json = await response.json();
+  } catch {
+    return { ok: false, category: 'generation-failed' };
+  }
+  if (
+    json
+    && typeof json === 'object'
+    && 'ok' in json
+    && (json as { ok: unknown }).ok === true
+  ) {
+    return { ok: true };
+  }
+  const categoryValue =
+    json
+    && typeof json === 'object'
+    && 'category' in json
+    && typeof (json as { category: unknown }).category === 'string'
+      ? (json as { category: string }).category
+      : null;
+  const category: GenerationProbeFailureCategory = isGenerationProbeFailureCategory(categoryValue)
+    ? categoryValue
+    : 'generation-failed';
+  return { ok: false, category };
 }
 
 // Provider Connections is the BYOK / custom-endpoint fallback surface. Per spec
@@ -88,9 +183,9 @@ export function ProviderConnectionsPanel() {
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  // Inline result of the "Test connection" probe so a wrong/expired key surfaces
-  // here at entry instead of silently saving a green "Key set" badge that only
-  // fails much later mid-generation.
+  // Inline result of the "Test connection" / connect probe so a wrong/expired
+  // key surfaces here at entry instead of silently saving a green "Key set"
+  // badge that only fails much later mid-generation.
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const testingRef = useRef(false);
   const [removeTarget, setRemoveTarget] = useState<RuntimeConnection | null>(null);
@@ -105,6 +200,18 @@ export function ProviderConnectionsPanel() {
   const removeSeqRef = useRef(0);
   const removingRef = useRef(false);
   const backendProbeSeqRef = useRef(0);
+
+  const selectedPreset = useMemo(
+    () => (draft.presetId ? PROVIDER_PRESETS.find(p => p.id === draft.presetId) ?? null : null),
+    [draft.presetId],
+  );
+  const isCustom = !draft.id && !selectedPreset;
+  const isKeyFirst = Boolean(!draft.id && selectedPreset);
+  const needsModelInput = Boolean(draft.id)
+    || isCustom
+    || (isKeyFirst && !getProviderDefaultModel(selectedPreset!));
+  const resolvedModelId = draft.modelId.trim()
+    || (selectedPreset ? getProviderDefaultModel(selectedPreset) ?? '' : '');
 
   useEffect(() => {
     mountedRef.current = true;
@@ -176,12 +283,42 @@ export function ProviderConnectionsPanel() {
     };
   }, [refresh]);
 
+  const connectFailureMessage = useCallback((category: ConnectFailureCategory): string => {
+    switch (category) {
+      case 'desktop-required':
+        return t.modelManagerTestRequiresDesktop;
+      case 'unreachable':
+        return t.runtimeHealthUnreachable;
+      case 'verification-failed':
+        return t.runtimeHealthVerificationFailed;
+      case 'probe-failed':
+        return t.runtimeHealthProbeFailed;
+      case 'model-unavailable':
+        return t.modelManagerProbeModelUnavailable;
+      case 'bind-failed':
+        return t.modelManagerBindFailed;
+      case 'rollback-failed':
+        return t.modelManagerRollbackFailed;
+      case 'save-failed':
+        return t.errorSaveFailed;
+      case 'forbidden':
+      case 'invalid-credentials':
+      case 'plan-restricted':
+      case 'empty-generation':
+      case 'generation-failed':
+        return generationProbeFailureMessage(category, t);
+      default:
+        return t.modelManagerProbeGenerationFailed;
+    }
+  }, [t]);
+
   const openAdd = useCallback(() => {
     editSeqRef.current += 1;
     savingRef.current = false;
     setSaving(false);
     setDraft(emptyDraft());
     setFormError(null);
+    setTestResult(null);
     setDialogOpen(true);
   }, []);
 
@@ -197,21 +334,28 @@ export function ProviderConnectionsPanel() {
       keyReadUnavailable = Boolean(conn.secretRef);
     }
     if (!mountedRef.current || editSeqRef.current !== seq) return;
+    const profile = getCapabilityProfile();
+    const boundModel = Object.values(profile).find(
+      binding => binding?.connectionId === conn.id,
+    )?.modelId ?? '';
     setDraft({
       id: conn.id,
       label: conn.label,
       kind: conn.kind,
       transport: conn.transport,
       baseUrl: conn.baseUrl,
+      modelId: boundModel,
       apiKey: '',
       hadKey,
     });
     setFormError(keyReadUnavailable ? t.modelManagerKeyReadFailed : null);
+    setTestResult(null);
     setDialogOpen(true);
   }, [t.modelManagerKeyReadFailed]);
 
-  const submit = useCallback(async () => {
-    if (!draft.label.trim() || !draft.baseUrl.trim()) return;
+  /** Existing-connection save (no role rebind). New connections use connectAndUse. */
+  const submitEdit = useCallback(async () => {
+    if (!draft.id || !draft.label.trim() || !draft.baseUrl.trim()) return;
     if (savingRef.current) return;
     const seq = ++editSeqRef.current;
     savingRef.current = true;
@@ -244,38 +388,110 @@ export function ProviderConnectionsPanel() {
     }
   }, [draft, refresh, t.errorSaveFailed, t.modelManagerConnectionBaseUrlInvalid]);
 
-  const handleTest = useCallback(async () => {
-    if (!draft.baseUrl.trim() || testingRef.current) return;
-    testingRef.current = true;
-    setTesting(true);
+  const connectAndUse = useCallback(async () => {
+    if (savingRef.current || draft.id) return;
+    const label = isKeyFirst && selectedPreset
+      ? providerDisplayName(selectedPreset, t)
+      : draft.label.trim();
+    const baseUrl = draft.baseUrl.trim();
+    const modelId = resolvedModelId;
+    if (!label || !baseUrl) return;
+    if (!modelId) {
+      setFormError(t.modelManagerConnectionModelRequired);
+      return;
+    }
+    if (isKeyFirst && !draft.apiKey.trim()) {
+      setFormError(t.modelManagerProbeInvalidCredentials);
+      return;
+    }
+
+    const seq = ++editSeqRef.current;
+    savingRef.current = true;
+    setSaving(true);
+    setFormError(null);
     setTestResult(null);
+
     try {
-      const { isTauriRuntime, runtimeHealth } = await import('@/lib/desktop-runtime');
-      if (!isTauriRuntime()) {
+      const { isTauriRuntime: isDesktop, runtimeHealth } = await import('@/lib/desktop-runtime');
+      if (!isDesktop()) {
         setTestResult({ ok: false, message: t.modelManagerTestRequiresDesktop });
         return;
       }
-      // Prefer the in-flight key the user just typed; fall back to the stored
-      // secret when editing an existing connection without re-entering it.
-      let secret: string | null = draft.apiKey.trim() || null;
-      if (!secret && draft.id && draft.hadKey) {
-        const stored = getConnection(draft.id);
-        const endpointUnchanged = Boolean(
-          stored
-          && stored.kind === draft.kind
-          && stored.transport === draft.transport
-          && stored.baseUrl === draft.baseUrl.trim(),
-        );
-        if (!stored || !endpointUnchanged) {
-          setTestResult({ ok: false, message: t.modelManagerKeyReadFailed });
-          return;
-        }
-        try {
-          secret = await getConnectionSecretForSnapshot(stored);
-        } catch {
-          setTestResult({ ok: false, message: t.modelManagerKeyReadFailed });
-          return;
-        }
+
+      const secret = draft.apiKey.trim() || null;
+      const result = await connectProviderWithRealProbe({
+        label,
+        kind: draft.kind,
+        transport: draft.transport,
+        baseUrl,
+        modelId,
+        apiKey: draft.apiKey,
+        checkHealth: () => runtimeHealth({
+          connectionId: 'draft-connect',
+          baseUrl,
+          transport: draft.transport,
+          secret,
+        }),
+        runGenerationProbe: () => callGenerationProbe({
+          kind: draft.kind,
+          transport: draft.transport,
+          baseUrl,
+          modelId,
+          secret,
+        }),
+      });
+
+      if (!mountedRef.current || editSeqRef.current !== seq) return;
+      if (!result.ok) {
+        if (result.saved) refresh();
+        setTestResult({ ok: false, message: connectFailureMessage(result.category) });
+        return;
+      }
+      setTestResult({ ok: true, message: t.modelManagerConnectSuccess });
+      setDialogOpen(false);
+      setDraft(emptyDraft());
+      refresh();
+    } catch {
+      if (!mountedRef.current || editSeqRef.current !== seq) return;
+      setTestResult({ ok: false, message: t.runtimeHealthProbeFailed });
+    } finally {
+      if (mountedRef.current && editSeqRef.current === seq) {
+        savingRef.current = false;
+        setSaving(false);
+      }
+    }
+  }, [
+    connectFailureMessage,
+    draft,
+    isKeyFirst,
+    refresh,
+    resolvedModelId,
+    selectedPreset,
+    t,
+  ]);
+
+  const handleTest = useCallback(async () => {
+    if (!draft.baseUrl.trim() || testingRef.current) return;
+    const modelId = resolvedModelId;
+    if (!modelId) {
+      setFormError(t.modelManagerConnectionModelRequired);
+      setTestResult(null);
+      return;
+    }
+    testingRef.current = true;
+    setTesting(true);
+    setFormError(null);
+    setTestResult(null);
+    try {
+      const { isTauriRuntime: isDesktop, runtimeHealth } = await import('@/lib/desktop-runtime');
+      if (!isDesktop()) {
+        setTestResult({ ok: false, message: t.modelManagerTestRequiresDesktop });
+        return;
+      }
+      const secret = await resolveDraftSecret(draft);
+      if (!secret && draft.kind === 'provider') {
+        setTestResult({ ok: false, message: t.modelManagerKeyReadFailed });
+        return;
       }
       const health = await runtimeHealth({
         connectionId: draft.id || 'draft-test',
@@ -283,14 +499,30 @@ export function ProviderConnectionsPanel() {
         transport: draft.transport,
         secret,
       });
-      const ok = health.reachable && health.transportOk;
+      const healthOk = health.reachable && health.transportOk;
+      if (!healthOk) {
+        setTestResult({
+          ok: false,
+          message: healthFailureMessage(categorizeHealthFailure(health), t),
+        });
+        return;
+      }
+      if (health.models.length > 0 && !health.models.includes(modelId)) {
+        setTestResult({ ok: false, message: t.modelManagerProbeModelUnavailable });
+        return;
+      }
+      const probe = await callGenerationProbe({
+        kind: draft.kind,
+        transport: draft.transport,
+        baseUrl: draft.baseUrl.trim(),
+        modelId,
+        secret,
+      });
       setTestResult({
-        ok,
-        // Never render the raw backend/network message — map the outcome to
-        // localized, actionable copy.
-        message: ok
+        ok: probe.ok,
+        message: probe.ok
           ? t.modelManagerTestReachable
-          : healthFailureMessage(categorizeHealthFailure(health), t),
+          : generationProbeFailureMessage(probe.category, t),
       });
     } catch {
       setTestResult({
@@ -301,7 +533,7 @@ export function ProviderConnectionsPanel() {
       testingRef.current = false;
       if (mountedRef.current) setTesting(false);
     }
-  }, [draft, t]);
+  }, [draft, resolvedModelId, t]);
 
   const confirmRemove = useCallback(async () => {
     if (!removeTarget || removingRef.current) return;
@@ -472,9 +704,10 @@ export function ProviderConnectionsPanel() {
                         ...current,
                         presetId: undefined,
                         label: '',
-                        kind: 'provider',
+                        kind: 'custom',
                         transport: 'openai-compatible',
                         baseUrl: '',
+                        modelId: '',
                       }));
                       setFormError(null);
                       setTestResult(null);
@@ -483,18 +716,14 @@ export function ProviderConnectionsPanel() {
                     const preset = PROVIDER_PRESETS.find(candidate => candidate.id === value);
                     if (!preset) return;
                     setDraft(current => ({
-                      ...current,
-                      presetId: preset.id,
+                      ...applyPreset(preset, current),
                       label: providerDisplayName(preset, t),
-                      kind: 'provider',
-                      transport: preset.id === 'anthropic' ? 'anthropic' : 'openai-compatible',
-                      baseUrl: preset.baseUrl,
                     }));
                     setFormError(null);
                     setTestResult(null);
                   }}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger data-testid="provider-directory-select">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -509,75 +738,103 @@ export function ProviderConnectionsPanel() {
               </label>
             )}
 
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
-                {t.modelManagerConnectionLabel}
-              </span>
-              <Input
-                value={draft.label}
-                placeholder={t.modelManagerConnectionLabelPlaceholder}
-                onChange={e => setDraft(d => ({ ...d, label: e.target.value }))}
-              />
-            </label>
+            {isKeyFirst && (
+              <p className="text-xs-tight text-book-ink-muted" data-testid="key-first-hint">
+                {t.modelManagerKeyFirstHint}
+              </p>
+            )}
 
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
-                {t.modelManagerConnectionKind}
-              </span>
-              <Select
-                value={draft.kind}
-                onValueChange={v =>
-                  setDraft(d => ({ ...d, kind: v as RuntimeConnectionKind }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="local">{t.modelManagerConnectionKindLocal}</SelectItem>
-                  <SelectItem value="provider">{t.modelManagerConnectionKindProvider}</SelectItem>
-                  <SelectItem value="custom">{t.modelManagerConnectionKindCustom}</SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
+            {(!isKeyFirst || draft.id) && (
+              <>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
+                    {t.modelManagerConnectionLabel}
+                  </span>
+                  <Input
+                    value={draft.label}
+                    placeholder={t.modelManagerConnectionLabelPlaceholder}
+                    onChange={e => setDraft(d => ({ ...d, label: e.target.value }))}
+                  />
+                </label>
 
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
-                {t.modelManagerConnectionTransport}
-              </span>
-              <Select
-                value={draft.transport}
-                onValueChange={v =>
-                  setDraft(d => ({ ...d, transport: v as RuntimeTransport }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="openai-compatible">{t.modelManagerTransportOpenai}</SelectItem>
-                  <SelectItem value="anthropic">{t.modelManagerTransportAnthropic}</SelectItem>
-                  <SelectItem value="ollama-native">{t.modelManagerTransportOllama}</SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
+                    {t.modelManagerConnectionKind}
+                  </span>
+                  <Select
+                    value={draft.kind}
+                    onValueChange={v =>
+                      setDraft(d => ({ ...d, kind: v as RuntimeConnectionKind }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="local">{t.modelManagerConnectionKindLocal}</SelectItem>
+                      <SelectItem value="provider">{t.modelManagerConnectionKindProvider}</SelectItem>
+                      <SelectItem value="custom">{t.modelManagerConnectionKindCustom}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
 
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
-                {t.modelManagerConnectionBaseUrl}
-              </span>
-              <Input
-                type="url"
-                value={draft.baseUrl}
-                placeholder="https://api.openai.com/v1"
-                aria-invalid={Boolean(formError)}
-                onChange={e => {
-                  setFormError(null);
-                  setTestResult(null);
-                  setDraft(d => ({ ...d, baseUrl: e.target.value }));
-                }}
-              />
-            </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
+                    {t.modelManagerConnectionTransport}
+                  </span>
+                  <Select
+                    value={draft.transport}
+                    onValueChange={v =>
+                      setDraft(d => ({ ...d, transport: v as RuntimeTransport }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="openai-compatible">{t.modelManagerTransportOpenai}</SelectItem>
+                      <SelectItem value="anthropic">{t.modelManagerTransportAnthropic}</SelectItem>
+                      <SelectItem value="ollama-native">{t.modelManagerTransportOllama}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
+
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
+                    {t.modelManagerConnectionBaseUrl}
+                  </span>
+                  <Input
+                    type="url"
+                    value={draft.baseUrl}
+                    placeholder="https://api.openai.com/v1"
+                    aria-invalid={Boolean(formError)}
+                    onChange={e => {
+                      setFormError(null);
+                      setTestResult(null);
+                      setDraft(d => ({ ...d, baseUrl: e.target.value }));
+                    }}
+                  />
+                </label>
+              </>
+            )}
+
+            {needsModelInput && (
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-book-ink-secondary">
+                  {t.modelManagerConnectionModel}
+                </span>
+                <Input
+                  value={draft.modelId}
+                  placeholder={t.modelManagerConnectionModelPlaceholder}
+                  data-testid="connection-model-input"
+                  onChange={e => {
+                    setFormError(null);
+                    setTestResult(null);
+                    setDraft(d => ({ ...d, modelId: e.target.value }));
+                  }}
+                />
+              </label>
+            )}
 
             <label className="block">
               <span className="mb-1 flex items-center gap-1.5 text-xs font-medium text-book-ink-secondary">
@@ -596,7 +853,9 @@ export function ProviderConnectionsPanel() {
                 placeholder={
                   draft.hadKey
                     ? t.modelManagerReplaceKey
-                    : t.modelManagerConnectionApiKeyOptional
+                    : isKeyFirst
+                      ? t.modelManagerConnectionApiKey
+                      : t.modelManagerConnectionApiKeyOptional
                 }
                 onChange={e => {
                   setTestResult(null);
@@ -634,7 +893,12 @@ export function ProviderConnectionsPanel() {
               type="button"
               variant="outline"
               onClick={() => void handleTest()}
-              disabled={saving || testing || !draft.baseUrl.trim()}
+              disabled={
+                saving
+                || testing
+                || !draft.baseUrl.trim()
+                || !resolvedModelId
+              }
               className="gap-1.5"
             >
               {testing ? <Spinner size="sm" /> : <PlugZap className="h-3.5 w-3.5" aria-hidden />}
@@ -649,13 +913,31 @@ export function ProviderConnectionsPanel() {
               >
                 {t.modelManagerCancel}
               </Button>
-              <Button
-                type="button"
-                onClick={() => void submit()}
-                disabled={saving || !draft.label.trim() || !draft.baseUrl.trim()}
-              >
-                {t.modelManagerSave}
-              </Button>
+              {draft.id ? (
+                <Button
+                  type="button"
+                  onClick={() => void submitEdit()}
+                  disabled={saving || !draft.label.trim() || !draft.baseUrl.trim()}
+                >
+                  {t.modelManagerSave}
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  onClick={() => void connectAndUse()}
+                  disabled={
+                    saving
+                    || testing
+                    || !draft.baseUrl.trim()
+                    || !resolvedModelId
+                    || (isKeyFirst && !draft.apiKey.trim())
+                    || (!isKeyFirst && !draft.label.trim())
+                  }
+                  data-testid="connect-and-use"
+                >
+                  {saving ? t.modelManagerConnecting : t.modelManagerConnectAndUse}
+                </Button>
+              )}
             </div>
           </DialogFooter>
         </DialogContent>

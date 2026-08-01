@@ -99,12 +99,10 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
           }
           aiUsage.addPartialOutput(text);
           if (lifecycle.isCancelled()) {
+            // Durable claim/partial persist stays with UI-stream onFinish.
+            // When core finish still runs on cancel, capture cumulative text and
+            // settle provider usage here before the exactly-once latch.
             await usage.cancelOnce(modelUsage);
-            if (!text.trim()) {
-              await persistence.markCancelled?.().catch((error) => {
-                console.error('Failed to mark cancelled chat turn:', error);
-              });
-            }
             return;
           }
           try {
@@ -133,6 +131,9 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
           activeClaimLease.dispose();
         }
       },
+      // No onAbort settlement: AI SDK 6.0.208 invokes onAbort without awaiting it,
+      // before UI onFinish has responseMessage. Request abort + consumeSseStream
+      // already drive cleanup; cancelled usage settles from core/UI onFinish.
       onError: async () => {
         try {
           if (shouldSkipWorkerSideEffects()) {
@@ -140,16 +141,16 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
             return;
           }
           if (lifecycle.isCancelled()) {
-            await usage.cancelOnce();
-            await persistence.markCancelled?.().catch((error) => {
-              console.error('Failed to mark cancelled chat turn:', error);
-            });
-          } else {
-            await usage.failOnce();
-            await persistence.markFailed?.().catch((error) => {
-              console.error('Failed to mark failed chat turn:', error);
-            });
+            // Do not settle usage or markCancelled: packaged Stop often delivers
+            // core onError before UI onFinish has the visible partial. Settling
+            // here latches null output_tokens/generated_words; cancelling the
+            // claim first drops persistStoppedAssistant.
+            return;
           }
+          await usage.failOnce();
+          await persistence.markFailed?.().catch((error) => {
+            console.error('Failed to mark failed chat turn:', error);
+          });
         } finally {
           activeClaimLease.dispose();
         }
@@ -165,6 +166,7 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
       throw error;
     }
     if (wasCancelled) {
+      // streamText threw before a UI stream existed — no onFinish({ isAborted }).
       await usage.cancelOnce();
       await persistence.markCancelled?.().catch((markError) => {
         console.error('Failed to mark cancelled chat turn:', markError);
@@ -203,8 +205,11 @@ export async function streamChatTurnResponse(args: StreamChatTurnArgs): Promise<
             return;
           }
           if (!isAborted) return;
-          await usage.cancelOnce();
+          // Capture visible stopped text before the exactly-once usage latch so
+          // estimated output_tokens/generated_words are non-null for partials.
           const stoppedText = getUIMessageText(responseMessage);
+          aiUsage.addPartialOutput(stoppedText);
+          await usage.cancelOnce();
           try {
             await persistStoppedAssistantOnce(stoppedText);
             if (!stoppedText.trim()) {

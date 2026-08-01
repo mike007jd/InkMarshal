@@ -5,6 +5,11 @@ import { z } from 'zod';
 import { OPERATION_ROLE, type OperationKind } from './types';
 import { AIUsageError } from '@/lib/ai-error';
 import { ChapterEditSchema } from '@/lib/ai/types';
+import { KIMI_CODE_BASE_URL, KIMI_CODE_HIGHSPEED_MODEL } from '@/lib/providers';
+import {
+  categorizeGenerationProbeFailure,
+  runGenerationProbe,
+} from './generation-probe';
 import {
   disableThinkingFetch,
   resolveBaseUrl,
@@ -612,5 +617,216 @@ describe('openai-compatible structured outputs (supportsStructuredOutputs)', () 
       status: 400,
       category: 'invalid_credentials',
     } satisfies Partial<AIUsageError>);
+  });
+});
+
+describe('metadata-driven requestCompat (fixed temperature)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('forces temperature 1 for exact Kimi Code HighSpeed baseUrl + model', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse('ok');
+      }),
+    );
+
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'draft',
+        'x-im-kind': 'provider',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': KIMI_CODE_BASE_URL,
+        'x-im-model': KIMI_CODE_HIGHSPEED_MODEL,
+        'x-im-secret': 'sk-kimi-test',
+      }),
+      'draft',
+    );
+    expect(resolved).not.toBeNull();
+
+    await generateText({
+      model: resolved!.model,
+      prompt: 'x',
+      temperature: 0.75,
+    });
+
+    expect(seenBody?.temperature).toBe(1);
+    expect(seenBody?.model).toBe(KIMI_CODE_HIGHSPEED_MODEL);
+  });
+
+  it('leaves unrelated hosted provider temperatures untouched', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse('ok');
+      }),
+    );
+
+    const resolved = await resolveModelForRole(
+      localRequest({
+        'x-im-role': 'draft',
+        'x-im-kind': 'provider',
+        'x-im-transport': 'openai-compatible',
+        'x-im-base-url': 'https://api.openai.com/v1',
+        'x-im-model': 'gpt-5.4-mini',
+        'x-im-secret': 'sk-openai-test',
+      }),
+      'draft',
+    );
+    expect(resolved).not.toBeNull();
+
+    await generateText({
+      model: resolved!.model,
+      prompt: 'x',
+      temperature: 0.75,
+    });
+
+    expect(seenBody?.temperature).toBe(0.75);
+  });
+});
+
+describe('runGenerationProbe', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('rejects blank generation as empty-generation (never reports success)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chatCompletionResponse('   ')),
+    );
+
+    const result = await runGenerationProbe(
+      localRequest({}),
+      {
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: KIMI_CODE_BASE_URL,
+        modelId: KIMI_CODE_HIGHSPEED_MODEL,
+        secret: 'sk-kimi-test',
+      },
+    );
+    expect(result).toEqual({ ok: false, category: 'empty-generation' });
+  });
+
+  it('rejects failed generation with a user-safe category', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { message: 'invalid api key' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+
+    const result = await runGenerationProbe(
+      localRequest({}),
+      {
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: KIMI_CODE_BASE_URL,
+        modelId: KIMI_CODE_HIGHSPEED_MODEL,
+        secret: 'sk-bad',
+      },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(['invalid-credentials', 'plan-restricted', 'generation-failed']).toContain(
+        result.category,
+      );
+    }
+  });
+
+  it('returns ok only when generation text is nonblank', async () => {
+    let seenBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return chatCompletionResponse('OK');
+      }),
+    );
+
+    const result = await runGenerationProbe(
+      localRequest({}),
+      {
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: KIMI_CODE_BASE_URL,
+        modelId: KIMI_CODE_HIGHSPEED_MODEL,
+        secret: 'sk-kimi-test',
+      },
+    );
+    expect(result).toEqual({ ok: true });
+    expect(seenBody?.max_tokens ?? seenBody?.max_completion_tokens).toBe(64);
+    expect(seenBody?.temperature).toBe(1);
+  });
+
+  it('forbids non-loopback callers', async () => {
+    const result = await runGenerationProbe(
+      remoteRequest({}),
+      {
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: KIMI_CODE_BASE_URL,
+        modelId: KIMI_CODE_HIGHSPEED_MODEL,
+        secret: 'sk-kimi-test',
+      },
+    );
+    expect(result).toEqual({ ok: false, category: 'forbidden' });
+  });
+
+  it('maps plan-style failures without exposing HTTP or temperature detail', () => {
+    const category = categorizeGenerationProbeFailure(
+      Object.assign(new Error('HighSpeed requires Allegretto'), { statusCode: 401 }),
+    );
+    expect(category).toBe('plan-restricted');
+  });
+
+  it('finds plan entitlement text nested in an SDK response body', () => {
+    const category = categorizeGenerationProbeFailure({
+      statusCode: 403,
+      responseBody: JSON.stringify({
+        error: { message: 'This account does not have HighSpeed entitlement' },
+      }),
+    });
+    expect(category).toBe('plan-restricted');
+  });
+
+  it('aborts a generation endpoint that never responds', async () => {
+    vi.useFakeTimers();
+    let aborted = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new DOMException('Aborted', 'AbortError'));
+        });
+      })),
+    );
+
+    const pending = runGenerationProbe(
+      localRequest({}),
+      {
+        kind: 'provider',
+        transport: 'openai-compatible',
+        baseUrl: KIMI_CODE_BASE_URL,
+        modelId: KIMI_CODE_HIGHSPEED_MODEL,
+        secret: 'sk-kimi-test',
+      },
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    await expect(pending).resolves.toEqual({ ok: false, category: 'unreachable' });
+    expect(aborted).toBe(true);
   });
 });

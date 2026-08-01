@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  KIMI_CODE_BASE_URL,
+  KIMI_CODE_HIGHSPEED_MODEL,
   PROVIDER_PRESETS,
   PROVIDER_PRESETS_LAST_VERIFIED_AT,
+  applyProviderRequestCompatToBody,
   getProviderDefaultModel,
   getRecommendedProviderModels,
   isProviderPresetStale,
+  modelUsesFixedSampling,
   providerDisplayName,
   providerModelsNeedingRefresh,
+  resolveProviderRequestCompat,
 } from './providers';
 import { en } from '@/lib/i18n/en';
 import { zhCN } from '@/lib/i18n/zh-CN';
@@ -21,6 +26,16 @@ describe('PROVIDER_PRESETS freshness', () => {
       zhTW: providerDisplayName(preset, zhTW),
     }]));
 
+    expect(names.moonshot).toEqual({
+      en: 'Kimi Platform',
+      zhCN: 'Kimi 平台',
+      zhTW: 'Kimi 平台',
+    });
+    expect(names['kimi-code']).toEqual({
+      en: 'Kimi Code HighSpeed',
+      zhCN: 'Kimi Code HighSpeed',
+      zhTW: 'Kimi Code HighSpeed',
+    });
     expect(names.dashscope).toEqual({
       en: 'Alibaba Cloud Model Studio (Qwen)',
       zhCN: '阿里云百炼（通义千问）',
@@ -36,6 +51,7 @@ describe('PROVIDER_PRESETS freshness', () => {
 
   it('requires source-backed freshness metadata for every provider and model', () => {
     for (const preset of PROVIDER_PRESETS) {
+      expect(['openai-compatible', 'anthropic', 'ollama-native']).toContain(preset.transport);
       expect(preset.lastVerifiedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/);
       expect(preset.sourceUrls.length).toBeGreaterThan(0);
       for (const url of preset.sourceUrls) expect(url).toMatch(/^https:\/\//);
@@ -143,6 +159,7 @@ describe('PROVIDER_PRESETS freshness', () => {
       'claude-haiku-4-5-20251001',
     ]);
     expect(anthropic!.defaultModel).toBe('claude-sonnet-5');
+    expect(anthropic!.transport).toBe('anthropic');
     expect(anthropic!.modelMetadata['claude-sonnet-5']?.status).toBe('recommended');
     expect(anthropic!.modelMetadata['claude-fable-5']?.status).toBe('current');
     expect(anthropic!.modelMetadata['claude-opus-4-8']?.contextLengthTokens).toBe(1_000_000);
@@ -165,11 +182,58 @@ describe('PROVIDER_PRESETS freshness', () => {
     expect(JSON.stringify(openrouter)).not.toContain('anthropic/claude-sonnet-4.6');
   });
 
-  it('does not expose the unverified Kimi Code endpoint as a public provider preset', () => {
-    expect(PROVIDER_PRESETS.map(preset => preset.id)).not.toContain('kimi-code');
-    const serialized = JSON.stringify(PROVIDER_PRESETS);
-    expect(serialized).not.toContain('kimi-for-coding');
-    expect(serialized).not.toContain('api.kimi.com/coding');
+  it('exposes verified Kimi Code HighSpeed only (no unverified K3 or standard coding ids)', () => {
+    const kimiCode = PROVIDER_PRESETS.find(preset => preset.id === 'kimi-code');
+    expect(kimiCode).toBeDefined();
+    expect(kimiCode!.baseUrl).toBe(KIMI_CODE_BASE_URL);
+    expect(kimiCode!.models).toEqual([KIMI_CODE_HIGHSPEED_MODEL]);
+    expect(kimiCode!.defaultModel).toBe(KIMI_CODE_HIGHSPEED_MODEL);
+    expect(kimiCode!.lastVerifiedAt).toBe('2026-08-01');
+    expect(kimiCode!.sourceUrls).toEqual([
+      'https://www.kimi.com/code/docs/en/kimi-code/models.html',
+    ]);
+    expect(kimiCode!.modelMetadata[KIMI_CODE_HIGHSPEED_MODEL]?.requestCompat).toEqual({
+      temperature: 1,
+    });
+    const serialized = JSON.stringify(kimiCode);
+    expect(serialized).not.toContain('"k3"');
+    expect(serialized).not.toContain('k3-256k');
+    expect(serialized).not.toMatch(/"kimi-for-coding"/);
+    // Platform Moonshot stays a separate preset.
+    expect(PROVIDER_PRESETS.find(p => p.id === 'moonshot')?.baseUrl).toBe(
+      'https://api.moonshot.ai/v1',
+    );
+  });
+
+  it('applies requestCompat only for the exact curated baseUrl + model pair', () => {
+    expect(resolveProviderRequestCompat(KIMI_CODE_BASE_URL, KIMI_CODE_HIGHSPEED_MODEL)).toEqual({
+      temperature: 1,
+    });
+    expect(modelUsesFixedSampling(KIMI_CODE_BASE_URL, KIMI_CODE_HIGHSPEED_MODEL)).toBe(true);
+
+    const body = applyProviderRequestCompatToBody(
+      KIMI_CODE_BASE_URL,
+      KIMI_CODE_HIGHSPEED_MODEL,
+      { model: KIMI_CODE_HIGHSPEED_MODEL, temperature: 0.75, messages: [] },
+    );
+    expect(body.temperature).toBe(1);
+
+    // Unrelated providers / models remain unchanged.
+    const openaiBody = { model: 'gpt-5.4-mini', temperature: 0.75 };
+    expect(
+      applyProviderRequestCompatToBody('https://api.openai.com/v1', 'gpt-5.4-mini', openaiBody),
+    ).toBe(openaiBody);
+    expect(modelUsesFixedSampling('https://api.openai.com/v1', 'gpt-5.4-mini')).toBe(false);
+    expect(
+      resolveProviderRequestCompat('https://api.moonshot.ai/v1', 'kimi-k2.6'),
+    ).toBeNull();
+    expect(
+      applyProviderRequestCompatToBody(
+        KIMI_CODE_BASE_URL,
+        'kimi-for-coding',
+        { temperature: 0.5 },
+      ),
+    ).toEqual({ temperature: 0.5 });
   });
 
   it('exposes a refresh gate for stale provider/model metadata', () => {
@@ -179,7 +243,7 @@ describe('PROVIDER_PRESETS freshness', () => {
       expect(providerModelsNeedingRefresh(preset, baseline), preset.id).toEqual([]);
     }
 
-    const old = new Date('2026-08-15T12:00:00.000Z');
+    const old = new Date('2026-09-15T12:00:00.000Z');
     expect(PROVIDER_PRESETS.some(preset => isProviderPresetStale(preset, old))).toBe(true);
   });
 });

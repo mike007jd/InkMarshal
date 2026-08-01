@@ -121,6 +121,7 @@ export const EditChatbox = forwardRef<HTMLInputElement, EditChatboxProps>(
                   value={creativity}
                   onChange={onCreativityChange}
                   size="sm"
+                  role="rewrite"
                   syncFailed={creativitySyncFailed}
                 />
               )}
