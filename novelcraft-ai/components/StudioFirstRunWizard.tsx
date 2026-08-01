@@ -39,6 +39,7 @@ type StarterDownloadState =
   | 'idle'
   | 'downloading'
   | 'verifying'
+  | 'paused'
   | 'failed'
   | 'binding'
   | 'bindFailed';
@@ -63,8 +64,9 @@ interface StarterProgress {
 export function resolveStarterRowAffordance(
   state: StarterDownloadState | undefined,
   installedHere: boolean,
-): 'download' | 'downloading' | 'binding' | 'bindFailed' | 'ready' {
+): 'download' | 'downloading' | 'paused' | 'binding' | 'bindFailed' | 'ready' {
   if (state === 'downloading' || state === 'verifying') return 'downloading';
+  if (state === 'paused') return 'paused';
   if (state === 'binding') return 'binding';
   if (state === 'bindFailed') return 'bindFailed';
   if (installedHere) return 'ready';
@@ -335,7 +337,7 @@ export function StudioFirstRunWizard({
     [activeFormat, desktop, status, t.modelManagerDesktopOnly, t.modelManagerModelDirUnavailable, markBindFailed, finishBindSuccess],
   );
 
-  const handleCancel = useCallback(async (entry: CuratedModelEntry) => {
+  const handlePause = useCallback(async (entry: CuratedModelEntry) => {
     const current = progress[entry.id];
     if (!current) return;
     downloadSeqRef.current[entry.id] = (downloadSeqRef.current[entry.id] ?? 0) + 1;
@@ -346,9 +348,10 @@ export function StudioFirstRunWizard({
     }
     if (mountedRef.current) {
       setProgress(p => {
-        const next = { ...p };
-        delete next[entry.id];
-        return next;
+        const currentProgress = p[entry.id];
+        return currentProgress
+          ? { ...p, [entry.id]: { ...currentProgress, state: 'paused', error: undefined } }
+          : p;
       });
     }
   }, [progress]);
@@ -427,9 +430,20 @@ export function StudioFirstRunWizard({
                 type="button"
                 variant="ghost"
                 size="sm"
-                onClick={() => void handleCancel(entry)}
+                onClick={() => void handlePause(entry)}
               >
-                {t.modelManagerCancelDownload}
+                {t.modelManagerPauseDownload}
+              </Button>
+            ) : affordance === 'paused' ? (
+              <Button
+                type="button"
+                variant={isPrimary ? 'accent' : 'outline'}
+                size="sm"
+                disabled={!desktop}
+                onClick={() => void handleDownload(entry)}
+              >
+                <Download className="h-3.5 w-3.5" />
+                {t.modelManagerResumeDownload}
               </Button>
             ) : affordance === 'binding' ? (
               <Button type="button" variant="accent" size="sm" disabled>

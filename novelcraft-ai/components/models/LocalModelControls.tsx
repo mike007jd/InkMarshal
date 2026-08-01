@@ -44,7 +44,7 @@ export function DownloadProgressBar({
           {item.percent != null ? ` ${item.percent}%` : ''}
         </span>
         <Button type="button" variant="ghost" size="sm" onClick={() => void cancelKey(dlKey)}>
-          {t.modelManagerCancelDownload}
+          {t.modelManagerPauseDownload}
         </Button>
       </div>
     </div>

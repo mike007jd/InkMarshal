@@ -133,8 +133,8 @@ import {
   type RoleBindingInfo,
 } from '@/components/models/local-model-derived';
 import {
-  downloadCancelledProgress,
   downloadFailedProgress,
+  downloadPausedProgress,
   downloadReadyProgress,
   downloadStartedProgress,
   progressFromDownloadEvent,
@@ -320,6 +320,7 @@ export function LocalModelsPanel({
           normalizeModelDownloadProgress(parsed, {
             interruptedLabel: t.modelManagerStateFailed,
             interruptedError: t.modelManagerRecoveryInterrupted,
+            pausedLabel: t.modelManagerStatePaused,
           }),
         );
       } catch {
@@ -331,7 +332,7 @@ export function LocalModelsPanel({
     return () => {
       cancelled = true;
     };
-  }, [t.modelManagerRecoveryInterrupted, t.modelManagerStateFailed]);
+  }, [t.modelManagerRecoveryInterrupted, t.modelManagerStateFailed, t.modelManagerStatePaused]);
 
   useEffect(() => {
     if (!progressHydrated || typeof localStorage === 'undefined') return;
@@ -568,6 +569,7 @@ export function LocalModelsPanel({
   const downloadProgressLabels: DownloadProgressLabels = useMemo(() => ({
     downloading: t.modelManagerStateDownloading,
     verifying: t.modelManagerStateVerifying,
+    paused: t.modelManagerStatePaused,
     failed: t.modelManagerStateFailed,
     cancelled: t.modelManagerStateCancelled,
     ready: t.modelManagerStateReady,
@@ -575,6 +577,7 @@ export function LocalModelsPanel({
     t.modelManagerStateCancelled,
     t.modelManagerStateDownloading,
     t.modelManagerStateFailed,
+    t.modelManagerStatePaused,
     t.modelManagerStateReady,
     t.modelManagerStateVerifying,
   ]);
@@ -606,7 +609,8 @@ export function LocalModelsPanel({
               progress: prog,
               taskId,
               labels: downloadProgressLabels,
-              cancelled: cancelledTasksRef.current.has(taskId),
+              cancelled: false,
+              paused: cancelledTasksRef.current.has(taskId),
             }));
           },
         );
@@ -617,7 +621,7 @@ export function LocalModelsPanel({
       } catch (err) {
         if (!mountedRef.current) return null;
         if (cancelledTasksRef.current.has(taskId)) {
-          setProgressItem(progressKey, downloadCancelledProgress(downloadProgressLabels, taskId));
+          setProgressItem(progressKey, downloadPausedProgress(downloadProgressLabels, taskId));
           return null;
         }
         setProgressItem(
@@ -667,7 +671,8 @@ export function LocalModelsPanel({
               progress: prog,
               taskId,
               labels: downloadProgressLabels,
-              cancelled: cancelledTasksRef.current.has(taskId),
+              cancelled: false,
+              paused: cancelledTasksRef.current.has(taskId),
             }));
           },
         );
@@ -678,7 +683,7 @@ export function LocalModelsPanel({
       } catch (err) {
         if (!mountedRef.current) return null;
         if (cancelledTasksRef.current.has(taskId)) {
-          setProgressItem(progressKey, downloadCancelledProgress(downloadProgressLabels, taskId));
+          setProgressItem(progressKey, downloadPausedProgress(downloadProgressLabels, taskId));
           return null;
         }
         setProgressItem(
@@ -707,19 +712,18 @@ export function LocalModelsPanel({
     async (progressKey: string) => {
       const taskId = progress[progressKey]?.cancelTaskId ?? progressKey;
       cancelledTasksRef.current.add(taskId);
-      setProgressItem(progressKey, {
-        state: 'cancelled',
-        percent: null,
-        label: t.modelManagerStateCancelled,
-        cancelTaskId: taskId,
-      });
+      setProgressItem(progressKey, downloadPausedProgress(
+        downloadProgressLabels,
+        taskId,
+        progress[progressKey]?.percent ?? null,
+      ));
       try {
         await cancelDownload(taskId);
       } catch {
         // Best-effort cancel; the task may have already finished.
       }
     },
-    [progress, setProgressItem, t.modelManagerStateCancelled],
+    [downloadProgressLabels, progress, setProgressItem],
   );
 
   const startModel = useCallback(
@@ -1146,7 +1150,9 @@ export function LocalModelsPanel({
     // An installed file outranks a stale failed/cancelled progress entry —
     // the reconcile effect prunes these from storage, but the precedence here
     // keeps the very first paint truthful too.
-    const staleFailure = installedModel != null && (item?.state === 'failed' || item?.state === 'cancelled');
+    const staleFailure = installedModel != null && (
+      item?.state === 'failed' || item?.state === 'cancelled' || item?.state === 'paused'
+    );
     const state = staleFailure ? 'ready' : item?.state ?? (installedModel ? 'ready' : 'idle');
     const modelPath = installedModel?.modelPath ?? item?.modelPath;
     const engineUseState = modelPath ? useStates[modelPath]?.state : undefined;
@@ -1217,6 +1223,9 @@ export function LocalModelsPanel({
             {state === 'cancelled' && (
               <Badge variant="muted">{t.modelManagerStateCancelled}</Badge>
             )}
+            {state === 'paused' && (
+              <Badge variant="muted">{t.modelManagerStatePaused}</Badge>
+            )}
             {state === 'idle' && fit.state === 'bad' && (
               <Badge variant="danger">{t.modelManagerFitBad}</Badge>
             )}
@@ -1231,6 +1240,8 @@ export function LocalModelsPanel({
               >
                 {state === 'failed' || state === 'cancelled' ? (
                   <RefreshCw className="h-3.5 w-3.5" />
+                ) : state === 'paused' ? (
+                  <Play className="h-3.5 w-3.5" />
                 ) : engineUseState === 'starting' || state === 'downloading' || state === 'verifying' ? (
                   <Spinner size="sm" />
                 ) : state === 'ready' ? (
@@ -1244,6 +1255,8 @@ export function LocalModelsPanel({
                     ? t.modelManagerStartAndAssign
                     : state === 'failed' || state === 'cancelled'
                       ? t.modelManagerRetry
+                      : state === 'paused'
+                        ? t.modelManagerResumeDownload
                       : installed.length > 0
                         ? t.modelManagerInstallSupplement
                         : t.modelManagerInstallAndUse}
@@ -1280,7 +1293,7 @@ export function LocalModelsPanel({
                 size="sm"
                 onClick={() => void cancelKey(progressKey)}
               >
-                {t.modelManagerCancelDownload}
+                {t.modelManagerPauseDownload}
               </Button>
             )}
           </div>
@@ -1891,14 +1904,18 @@ export function LocalModelsPanel({
                       {activeProgress?.state === 'failed' ||
                       activeProgress?.state === 'cancelled' ? (
                         <RefreshCw className="h-3.5 w-3.5" />
+                      ) : activeProgress?.state === 'paused' ? (
+                        <Play className="h-3.5 w-3.5" />
                       ) : (
                         <Download className="h-3.5 w-3.5" />
                       )}
                       {activeProgress?.state === 'failed'
                         ? t.modelManagerRetry
-                        : activeProgress?.state === 'cancelled'
-                          ? t.modelManagerRedownload
-                          : t.modelManagerDownload}
+                        : activeProgress?.state === 'paused'
+                          ? t.modelManagerResumeDownload
+                          : activeProgress?.state === 'cancelled'
+                            ? t.modelManagerRedownload
+                            : t.modelManagerDownload}
                     </Button>
                     {activeProgress?.state === 'ready' && activeProgress.modelPath && (
                       <UseModelButton
@@ -1957,14 +1974,18 @@ export function LocalModelsPanel({
                       {activeProgress?.state === 'failed' ||
                       activeProgress?.state === 'cancelled' ? (
                         <RefreshCw className="h-3.5 w-3.5" />
+                      ) : activeProgress?.state === 'paused' ? (
+                        <Play className="h-3.5 w-3.5" />
                       ) : (
                         <Download className="h-3.5 w-3.5" />
                       )}
                       {activeProgress?.state === 'failed'
                         ? t.modelManagerRetry
-                        : activeProgress?.state === 'cancelled'
-                          ? t.modelManagerRedownload
-                          : t.modelManagerDownload}
+                        : activeProgress?.state === 'paused'
+                          ? t.modelManagerResumeDownload
+                          : activeProgress?.state === 'cancelled'
+                            ? t.modelManagerRedownload
+                            : t.modelManagerDownload}
                     </Button>
                     {activeProgress?.state === 'ready' && activeProgress.modelPath && hfRepo && (
                       <UseModelButton

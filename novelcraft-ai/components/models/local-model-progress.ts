@@ -4,6 +4,7 @@ import type { DownloadProgress } from '@/lib/model-supply/types';
 export interface DownloadProgressLabels {
   downloading: string;
   verifying: string;
+  paused: string;
   failed: string;
   cancelled: string;
   ready: string;
@@ -29,6 +30,19 @@ export function downloadCancelledProgress(
     state: 'cancelled',
     percent: null,
     label: labels.cancelled,
+    cancelTaskId: taskId,
+  };
+}
+
+export function downloadPausedProgress(
+  labels: Pick<DownloadProgressLabels, 'paused'>,
+  taskId: string,
+  percent: number | null = null,
+): ModelProgress {
+  return {
+    state: 'paused',
+    percent,
+    label: labels.paused,
     cancelTaskId: taskId,
   };
 }
@@ -66,12 +80,19 @@ export function progressFromDownloadEvent({
   taskId,
   labels,
   cancelled,
+  paused = false,
 }: {
   progress: DownloadProgress;
   taskId: string;
-  labels: Pick<DownloadProgressLabels, 'downloading' | 'verifying' | 'failed' | 'cancelled'>;
+  labels: Pick<DownloadProgressLabels, 'downloading' | 'verifying' | 'failed' | 'cancelled' | 'paused'>;
   cancelled: boolean;
+  paused?: boolean;
 }): ModelProgress {
+  if (paused && progress.phase === 'error') {
+    return downloadPausedProgress(labels, taskId, progress.totalBytes > 0
+      ? Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100))
+      : null);
+  }
   if (cancelled && progress.phase === 'error') {
     return downloadCancelledProgress(labels, taskId);
   }

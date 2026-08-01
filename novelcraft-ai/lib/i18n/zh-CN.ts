@@ -303,6 +303,7 @@ export const zhCN = {
   modelManagerCancel: '取消',
   modelManagerStateDownloading: '下载中',
   modelManagerStateVerifying: '校验中',
+  modelManagerStatePaused: '已暂停',
   modelManagerStateReady: '就绪',
   modelManagerStateFailed: '失败',
   modelManagerStateNotStarted: '已下载，未启动',
@@ -316,7 +317,8 @@ export const zhCN = {
     '搜索一个兼容 llama.cpp 的 .gguf 文件。这里切换的是搜索格式，不会切换当前写作模型。',
   modelManagerMlxFormatHelp:
     '搜索完整的 MLX 转换仓库，根目录必须包含 config.json、tokenizer.json 和 .safetensors 权重。',
-  modelManagerCancelDownload: '取消',
+  modelManagerPauseDownload: '暂停',
+  modelManagerResumeDownload: '继续',
   modelManagerRetry: '重试',
   modelManagerUnknown: '未知',
   modelManagerDesktopOnly: '需要桌面版。',

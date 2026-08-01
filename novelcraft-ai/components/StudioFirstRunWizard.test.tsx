@@ -94,6 +94,10 @@ describe('resolveStarterRowAffordance', () => {
     expect(resolveStarterRowAffordance('downloading', true)).toBe('downloading');
   });
 
+  it('offers resume after a paused download', () => {
+    expect(resolveStarterRowAffordance('paused', false)).toBe('paused');
+  });
+
   it('shows the binding spinner while a rebind is in progress', () => {
     expect(resolveStarterRowAffordance('binding', true)).toBe('binding');
     expect(resolveStarterRowAffordance('binding', false)).toBe('binding');

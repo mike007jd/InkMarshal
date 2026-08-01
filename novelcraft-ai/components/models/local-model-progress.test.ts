@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   downloadCancelledProgress,
   downloadFailedProgress,
+  downloadPausedProgress,
   downloadReadyProgress,
   downloadStartedProgress,
   progressFromDownloadEvent,
@@ -12,6 +13,7 @@ import {
 const labels: DownloadProgressLabels = {
   downloading: 'Downloading',
   verifying: 'Verifying',
+  paused: 'Paused',
   failed: 'Failed',
   cancelled: 'Cancelled',
   ready: 'Ready',
@@ -29,6 +31,12 @@ describe('local model download progress mapping', () => {
       state: 'cancelled',
       percent: null,
       label: 'Cancelled',
+      cancelTaskId: 'task-a',
+    });
+    expect(downloadPausedProgress(labels, 'task-a', 42)).toEqual({
+      state: 'paused',
+      percent: 42,
+      label: 'Paused',
       cancelTaskId: 'task-a',
     });
     expect(downloadReadyProgress(labels, 'task-a', '/models/a.gguf')).toEqual({
@@ -94,6 +102,21 @@ describe('local model download progress mapping', () => {
       state: 'cancelled',
       percent: null,
       label: 'Cancelled',
+      cancelTaskId: 'task-a',
+    });
+  });
+
+  it('preserves user pause over late native errors', () => {
+    expect(progressFromDownloadEvent({
+      progress: { phase: 'error', receivedBytes: 42, totalBytes: 100, message: 'paused upstream' },
+      taskId: 'task-a',
+      labels,
+      cancelled: false,
+      paused: true,
+    })).toEqual({
+      state: 'paused',
+      percent: 42,
+      label: 'Paused',
       cancelTaskId: 'task-a',
     });
   });

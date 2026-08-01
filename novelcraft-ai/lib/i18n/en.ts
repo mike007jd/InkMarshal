@@ -303,6 +303,7 @@ export const en = {
   modelManagerCancel: 'Cancel',
   modelManagerStateDownloading: 'Downloading',
   modelManagerStateVerifying: 'Verifying',
+  modelManagerStatePaused: 'Paused',
   modelManagerStateReady: 'Ready',
   modelManagerStateFailed: 'Failed',
   modelManagerStateNotStarted: 'Downloaded, not started',
@@ -316,7 +317,8 @@ export const en = {
     'Search for a single llama.cpp-compatible .gguf file. This filter changes search results, not the active writing model.',
   modelManagerMlxFormatHelp:
     'Search for a complete MLX-converted repository. It must include config.json, tokenizer.json, and .safetensors weights at the root.',
-  modelManagerCancelDownload: 'Cancel',
+  modelManagerPauseDownload: 'Pause',
+  modelManagerResumeDownload: 'Resume',
   modelManagerRetry: 'Retry',
   modelManagerUnknown: 'Unknown',
   modelManagerDesktopOnly: 'Desktop app required.',

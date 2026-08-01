@@ -10,6 +10,7 @@ import {
 const copy = {
   interruptedLabel: 'Failed',
   interruptedError: 'Interrupted',
+  pausedLabel: 'Paused',
 };
 
 describe('normalizeModelDownloadProgress', () => {
@@ -67,20 +68,39 @@ describe('normalizeModelDownloadProgress', () => {
     expect(restored.valid?.error).toHaveLength(500);
     expect(restored.invalid).toBeUndefined();
   });
+
+  it('restores a paused download as resumable state without trusting paths', () => {
+    expect(normalizeModelDownloadProgress({
+      'repo/file.gguf': {
+        state: 'paused',
+        percent: 42,
+        label: 'Pause me',
+        modelPath: '/models/file.gguf',
+        cancelTaskId: 'repo/file.gguf',
+      },
+    }, copy)).toEqual({
+      'repo/file.gguf': {
+        state: 'paused',
+        percent: 42,
+        label: 'Paused',
+      },
+    });
+  });
 });
 
 describe('pruneStaleDownloadFailures', () => {
   const failed: ModelProgress = { state: 'failed', percent: null, label: 'Failed', error: 'Interrupted' };
   const downloading: ModelProgress = { state: 'downloading', percent: 40, label: 'Downloading' };
 
-  it('drops failed/cancelled entries whose target is actually installed', () => {
+  it('drops failed/cancelled/paused entries whose target is actually installed', () => {
     const pruned = pruneStaleDownloadFailures(
       {
         'catalog:qwen:gguf': failed,
         'catalog:other:gguf': { ...failed, state: 'cancelled' },
+        'catalog:paused:gguf': { ...failed, state: 'paused' },
         'catalog:missing:gguf': failed,
       },
-      new Set(['catalog:qwen:gguf', 'catalog:other:gguf']),
+      new Set(['catalog:qwen:gguf', 'catalog:other:gguf', 'catalog:paused:gguf']),
     );
     expect(Object.keys(pruned)).toEqual(['catalog:missing:gguf']);
   });

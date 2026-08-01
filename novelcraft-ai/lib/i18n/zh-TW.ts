@@ -303,6 +303,7 @@ export const zhTW = {
   modelManagerCancel: '取消',
   modelManagerStateDownloading: '下載中',
   modelManagerStateVerifying: '校驗中',
+  modelManagerStatePaused: '已暫停',
   modelManagerStateReady: '就緒',
   modelManagerStateFailed: '失敗',
   modelManagerStateNotStarted: '已下載，未啟動',
@@ -316,7 +317,8 @@ export const zhTW = {
     '搜尋一個相容 llama.cpp 的 .gguf 檔案。這裡切換的是搜尋格式，不會切換目前寫作模型。',
   modelManagerMlxFormatHelp:
     '搜尋完整的 MLX 轉換倉庫，根目錄必須包含 config.json、tokenizer.json 和 .safetensors 權重。',
-  modelManagerCancelDownload: '取消',
+  modelManagerPauseDownload: '暫停',
+  modelManagerResumeDownload: '繼續',
   modelManagerRetry: '重試',
   modelManagerUnknown: '未知',
   modelManagerDesktopOnly: '需要桌面版。',

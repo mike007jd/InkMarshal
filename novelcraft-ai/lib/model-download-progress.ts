@@ -4,6 +4,7 @@ export type DownloadState =
   | 'idle'
   | 'downloading'
   | 'verifying'
+  | 'paused'
   | 'ready'
   | 'failed'
   | 'cancelled';
@@ -27,6 +28,7 @@ export interface InstalledDownloadTarget {
 interface NormalizeProgressCopy {
   interruptedLabel: string;
   interruptedError: string;
+  pausedLabel: string;
 }
 
 const MAX_PROGRESS_ENTRIES = 100;
@@ -71,7 +73,10 @@ export function pruneStaleDownloadFailures(
   let changed = false;
   const out: Record<string, ModelProgress> = {};
   for (const [key, item] of Object.entries(progress)) {
-    if ((item.state === 'failed' || item.state === 'cancelled') && installedTaskIds.has(key)) {
+    if (
+      (item.state === 'failed' || item.state === 'cancelled' || item.state === 'paused') &&
+      installedTaskIds.has(key)
+    ) {
       changed = true;
       continue;
     }
@@ -98,6 +103,15 @@ export function normalizeModelDownloadProgress(
         percent: null,
         label: copy.interruptedLabel,
         error: copy.interruptedError,
+      };
+      continue;
+    }
+
+    if (state === 'paused') {
+      out[cleanKey] = {
+        state,
+        percent: cleanPercent(item.percent),
+        label: copy.pausedLabel,
       };
       continue;
     }
