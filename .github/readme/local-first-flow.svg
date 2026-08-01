@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 620" role="img" aria-labelledby="title desc">
+  <title id="title">InkMarshal local-first writing flow</title>
+  <desc id="desc">A visual diagram showing a writer's manuscript moving through InkMarshal on their Mac with a selected compute path to drafting, revision, and export.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f9f5eb"/>
+      <stop offset="1" stop-color="#e8dbc4"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b6914"/>
+      <stop offset=".5" stop-color="#d2ad5b"/>
+      <stop offset="1" stop-color="#8b6914"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-20%" y="-30%" width="140%" height="170%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#3d2d18" flood-opacity=".13"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="620" fill="url(#bg)"/>
+  <circle cx="1500" cy="50" r="260" fill="#d6b364" opacity=".12"/>
+  <circle cx="95" cy="590" r="210" fill="#806033" opacity=".08"/>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <text x="108" y="102" font-size="16" font-weight="700" letter-spacing="4" fill="#8b6914">LOCAL-FIRST, BY DESIGN</text>
+    <text x="108" y="151" font-size="35" font-weight="600" fill="#2c2b30">Your story, your writing path, your finished book.</text>
+    <text x="108" y="187" font-size="18" fill="#6d6356">InkMarshal keeps the writing workflow on your machine while you choose the capable model route.</text>
+
+    <path d="M438 366h122M890 366h122M1342 366h28" fill="none" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+    <path d="m535 352 24 14-24 14m452-28 24 14-24 14m363-28 18 14-18 14" fill="none" stroke="#ad8434" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <g filter="url(#cardShadow)">
+      <rect x="108" y="250" width="330" height="238" rx="20" fill="#fffdf8" stroke="#d8c7a4"/>
+      <rect x="108" y="250" width="330" height="8" rx="4" fill="url(#accent)"/>
+      <path d="M156 315a21 21 0 0 1 21-21h45a21 21 0 0 1 21 21v93a12 12 0 0 1-12 12h-63a12 12 0 0 1-12-12v-93Z" fill="#f4ead5" stroke="#8b6914" stroke-width="2"/>
+      <path d="M169 338h61m-61 24h61m-61 24h43" stroke="#b38d43" stroke-width="3" stroke-linecap="round" opacity=".75"/>
+      <text x="278" y="318" font-size="13" font-weight="700" letter-spacing="2.2" fill="#8b6914">YOUR WORK</text>
+      <text x="278" y="351" font-size="22" font-weight="700" fill="#29282d">Manuscript</text>
+      <text x="278" y="380" font-size="16" fill="#6d6356">Story, notes,</text>
+      <text x="278" y="404" font-size="16" fill="#6d6356">and working memory.</text>
+      <path d="M156 447h234" stroke="#e1d3bb"/>
+      <text x="156" y="470" font-size="14" font-weight="650" fill="#514a3f">Local data, not a hosted workspace.</text>
+    </g>
+
+    <g filter="url(#cardShadow)">
+      <rect x="560" y="226" width="330" height="286" rx="20" fill="#282a33"/>
+      <rect x="560" y="226" width="330" height="8" rx="4" fill="url(#accent)"/>
+      <text x="600" y="285" font-size="13" font-weight="700" letter-spacing="2.2" fill="#d8b565">ON YOUR MAC</text>
+      <text x="600" y="324" font-size="25" font-weight="700" fill="#fff9ed">InkMarshal Studio</text>
+      <text x="600" y="356" font-size="16" fill="#dad2c4">SQLite, Vault projections,</text>
+      <text x="600" y="381" font-size="16" fill="#dad2c4">recovery, and writing context.</text>
+      <rect x="600" y="412" width="250" height="1" fill="#625c52"/>
+      <circle cx="612" cy="447" r="6" fill="#d5ae59"/>
+      <text x="631" y="453" font-size="15" font-weight="600" fill="#f7efe0">No required account</text>
+      <circle cx="612" cy="480" r="6" fill="#d5ae59"/>
+      <text x="631" y="486" font-size="15" font-weight="600" fill="#f7efe0">No platform credits</text>
+    </g>
+
+    <g filter="url(#cardShadow)">
+      <rect x="1012" y="250" width="330" height="238" rx="20" fill="#fffdf8" stroke="#d8c7a4"/>
+      <rect x="1012" y="250" width="330" height="8" rx="4" fill="url(#accent)"/>
+      <text x="1052" y="304" font-size="13" font-weight="700" letter-spacing="2.2" fill="#8b6914">YOUR COMPUTE PATH</text>
+      <rect x="1052" y="327" width="250" height="38" rx="10" fill="#f1eadc"/>
+      <circle cx="1072" cy="346" r="5" fill="#639050"/>
+      <text x="1088" y="352" font-size="15" font-weight="650" fill="#3b392f">Bundled local engine</text>
+      <rect x="1052" y="377" width="250" height="38" rx="10" fill="#f1eadc"/>
+      <circle cx="1072" cy="396" r="5" fill="#8b6914"/>
+      <text x="1088" y="402" font-size="15" font-weight="650" fill="#3b392f">Compatible local server</text>
+      <rect x="1052" y="427" width="250" height="38" rx="10" fill="#f1eadc"/>
+      <circle cx="1072" cy="446" r="5" fill="#8b6914"/>
+      <text x="1088" y="452" font-size="15" font-weight="650" fill="#3b392f">Your model connection</text>
+    </g>
+
+    <g filter="url(#cardShadow)">
+      <rect x="1370" y="250" width="122" height="238" rx="20" fill="#fffdf8" stroke="#d8c7a4"/>
+      <text x="1431" y="306" text-anchor="middle" font-size="13" font-weight="700" letter-spacing="1.8" fill="#8b6914">OUTCOME</text>
+      <path d="M1409 344h44v28h-44Z" fill="#f3e5c4" stroke="#8b6914" stroke-width="2"/>
+      <path d="M1418 354h26m-26 9h20" stroke="#a78035" stroke-width="2" stroke-linecap="round"/>
+      <text x="1431" y="403" text-anchor="middle" font-size="16" font-weight="700" fill="#2b2a2d">Draft</text>
+      <text x="1431" y="430" text-anchor="middle" font-size="16" font-weight="700" fill="#2b2a2d">Revise</text>
+      <text x="1431" y="457" text-anchor="middle" font-size="16" font-weight="700" fill="#2b2a2d">Export</text>
+    </g>
+  </g>
+</svg>

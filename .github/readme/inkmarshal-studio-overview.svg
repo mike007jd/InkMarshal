@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">InkMarshal illustrated Studio overview</title>
+  <desc id="desc">A calm, parchment-toned illustration of an InkMarshal writing workspace with manuscript, story, knowledge, and local model surfaces.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#fffdf8"/>
+      <stop offset="1" stop-color="#eee4d0"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" x2="1">
+      <stop offset="0" stop-color="#8d641e"/>
+      <stop offset=".48" stop-color="#d4ad54"/>
+      <stop offset="1" stop-color="#9d7227"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#2a2b34"/>
+      <stop offset="1" stop-color="#171920"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="22" flood-color="#3d2d18" flood-opacity=".18"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#paper)"/>
+  <circle cx="140" cy="118" r="270" fill="#e2c27b" opacity=".13"/>
+  <circle cx="1490" cy="852" r="310" fill="#866033" opacity=".08"/>
+  <path d="M150 868c174-85 284-77 446 31M1010 83c125 20 224 79 336 203" fill="none" stroke="#c29d50" stroke-opacity=".19" stroke-width="2"/>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif" fill="#27262b">
+    <text x="120" y="106" font-size="18" font-weight="700" letter-spacing="5" fill="#8b6914">INKMARSHAL</text>
+    <text x="120" y="154" font-size="38" font-weight="600">A quiet place to take a novel all the way through.</text>
+    <text x="120" y="189" font-size="20" fill="#6d6356">Illustrated product overview · local-first writing, planning, and revision</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="120" y="238" width="1360" height="596" rx="28" fill="#fbf8f1" stroke="#d8c7a4" stroke-width="2"/>
+    <path d="M148 238h1304a28 28 0 0 1 28 28v58H120v-58a28 28 0 0 1 28-28Z" fill="url(#ink)"/>
+    <circle cx="160" cy="281" r="7" fill="#d9a84d"/>
+    <circle cx="184" cy="281" r="7" fill="#fff6e1" opacity=".8"/>
+    <circle cx="208" cy="281" r="7" fill="#fff6e1" opacity=".45"/>
+    <text x="800" y="288" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="600" letter-spacing="2" fill="#f7efe0">INKMARSHAL STUDIO</text>
+
+    <rect x="120" y="324" width="282" height="510" fill="#eee7d9"/>
+    <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+      <text x="158" y="382" font-size="13" font-weight="700" letter-spacing="2.4" fill="#8b6914">WORKSPACE</text>
+      <rect x="146" y="412" width="230" height="52" rx="10" fill="#fffdf8"/>
+      <rect x="146" y="412" width="5" height="52" rx="2.5" fill="url(#gold)"/>
+      <rect x="169" y="430" width="16" height="19" rx="3" fill="#9d7227" opacity=".92"/>
+      <text x="202" y="444" font-size="17" font-weight="650" fill="#26262d">Manuscript</text>
+      <path d="M168 493h18v-18h-18Z" fill="none" stroke="#8c836f" stroke-width="2"/>
+      <text x="202" y="508" font-size="17" fill="#4e4a42">Story Deck</text>
+      <circle cx="177" cy="556" r="10" fill="none" stroke="#8c836f" stroke-width="2"/>
+      <path d="M177 550v12m-6-6h12" stroke="#8c836f" stroke-width="2" stroke-linecap="round"/>
+      <text x="202" y="564" font-size="17" fill="#4e4a42">Knowledge</text>
+      <path d="M168 614h18v-18h-18Z" fill="none" stroke="#8c836f" stroke-width="2"/>
+      <path d="M172 600h10M172 606h7" stroke="#8c836f" stroke-width="2" stroke-linecap="round"/>
+      <text x="202" y="614" font-size="17" fill="#4e4a42">Continuity</text>
+      <path d="M158 685h206" stroke="#d5c7ad"/>
+      <text x="158" y="724" font-size="13" font-weight="700" letter-spacing="2.1" fill="#8b6914">PROJECT</text>
+      <text x="158" y="756" font-size="18" font-weight="600" fill="#2b2a2d">The manuscript is central.</text>
+      <text x="158" y="783" font-size="15" fill="#776e61">Everything else serves the work.</text>
+    </g>
+
+    <rect x="402" y="324" width="712" height="510" fill="#f7f2e8"/>
+    <g>
+      <rect x="468" y="369" width="580" height="418" rx="5" fill="#fffdf8" stroke="#e0d4bd"/>
+      <path d="M499 422h518" stroke="#d1a950" stroke-width="2"/>
+      <text x="499" y="402" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="2.3" fill="#987126">MANUSCRIPT · CHAPTER 08</text>
+      <text x="499" y="472" font-family="Georgia, 'Times New Roman', serif" font-size="36" fill="#2f2a23">The line that carries the whole story</text>
+      <g fill="#877c6d" opacity=".85">
+        <rect x="499" y="515" width="470" height="9" rx="4.5"/>
+        <rect x="499" y="540" width="498" height="9" rx="4.5"/>
+        <rect x="499" y="565" width="438" height="9" rx="4.5"/>
+        <rect x="499" y="606" width="491" height="9" rx="4.5"/>
+        <rect x="499" y="631" width="465" height="9" rx="4.5"/>
+        <rect x="499" y="656" width="508" height="9" rx="4.5"/>
+        <rect x="499" y="697" width="410" height="9" rx="4.5"/>
+      </g>
+      <rect x="499" y="737" width="179" height="22" rx="11" fill="#eee0bd"/>
+      <circle cx="516" cy="748" r="5" fill="#8b6914"/>
+      <text x="531" y="753" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="700" fill="#604a20">READY TO REVISE</text>
+    </g>
+
+    <rect x="1114" y="324" width="366" height="510" fill="#e6ddcd"/>
+    <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+      <text x="1152" y="382" font-size="13" font-weight="700" letter-spacing="2.4" fill="#8b6914">WRITING PATH</text>
+      <rect x="1152" y="413" width="290" height="72" rx="12" fill="#fffdf8"/>
+      <circle cx="1184" cy="449" r="14" fill="#dfecd7"/>
+      <path d="m1178 449 4 4 8-9" fill="none" stroke="#4f7f44" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="1210" y="444" font-size="16" font-weight="700" fill="#2b2a2d">Local engine</text>
+      <text x="1210" y="468" font-size="14" fill="#776e61">Ready when you are</text>
+
+      <rect x="1152" y="503" width="290" height="72" rx="12" fill="#fffdf8"/>
+      <path d="M1171 541h25m-12-12v24" stroke="#8b6914" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="1210" y="534" font-size="16" font-weight="700" fill="#2b2a2d">Your connections</text>
+      <text x="1210" y="558" font-size="14" fill="#776e61">Local or user-owned models</text>
+
+      <rect x="1152" y="593" width="290" height="92" rx="12" fill="#272932"/>
+      <text x="1180" y="627" font-size="13" font-weight="700" letter-spacing="2" fill="#d8b565">LOCAL BY DEFAULT</text>
+      <text x="1180" y="656" font-size="16" font-weight="600" fill="#faf4e8">Your manuscript stays yours.</text>
+      <text x="1180" y="678" font-size="13" fill="#d8d0c2">No required InkMarshal account.</text>
+
+      <path d="M1152 728h290" stroke="#ccbfa8"/>
+      <text x="1152" y="763" font-size="14" font-weight="650" fill="#514a3f">Plan · Draft · Read · Revise · Export</text>
+    </g>
+  </g>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <rect x="120" y="882" width="1360" height="2" fill="#c7a052" opacity=".55"/>
+    <text x="120" y="928" font-size="16" font-weight="700" letter-spacing="2.6" fill="#8b6914">MAKE ROOM FOR THE MANUSCRIPT</text>
+    <text x="1480" y="928" text-anchor="end" font-size="16" fill="#6d6356">Local-first AI novel-writing Studio</text>
+  </g>
+</svg>
