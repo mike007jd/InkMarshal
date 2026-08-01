@@ -1,49 +1,64 @@
 # macOS Release Smoke Checklist
 
-Run this checklist on the exact final DMG after automated release gates pass. Keep the completed copy with the release evidence.
+Signed candidate artifacts only, after automated release gates: the exact final
+DMG for install/reinstall and the exact updater artifact for update. Never use
+this list for unsigned daily packages. Human UI checks only; keep the completed
+copy with release evidence. Case detail lives in
+[MANUAL_TEST_CASES.md](MANUAL_TEST_CASES.md) release-only and P0/P1 sections.
 
 ## Record
 
 - Date and operator:
-- Commit and version:
-- DMG path:
-- DMG SHA-256:
+- Release evidence, prefilled: commit / expected version / DMG SHA-256:
+- DMG path / version in **About InkMarshal**:
 - macOS version and hardware:
-- Mounted app executable path:
+- Evidence folder:
+
+Use one new disposable macOS user for install and reinstall. Test update in a
+separate disposable user containing the supported previous signed version and a
+test novel. Every item must pass; `BLOCKED` or `NOT RUN` blocks release.
 
 ## Install and first launch
 
-- [ ] Gatekeeper accepts the app with no damaged/unverified warning.
-- [ ] The first-run flow reaches the Studio.
-- [ ] Quit and relaunch preserves the session and local database.
-- [ ] Only one InkMarshal process runs, and it belongs to the current package.
+- [ ] Gatekeeper accepts the app; no damaged or unverified warning.
+- [ ] First-run reaches My Desk / Studio.
+- [ ] **About InkMarshal** matches the expected version from release evidence.
+- [ ] Quit and relaunch keeps the novel list and **Assistant** content.
+- [ ] Only one InkMarshal window and one matching process in Activity Monitor.
 
 ## Model path
 
-- [ ] The curated starter shelf loads and a real model download completes, including pause/resume.
-- [ ] Use starts the engine; a new novel generates one complete chapter.
-- [ ] A real BYOK connection generates successfully and becomes unavailable after its key is removed.
-- [ ] With physical network access disabled, local generation works and remote paths fail clearly.
-- [ ] Stop a chat response mid-stream; the partial response persists once and retry/continue remains coherent.
+- [ ] Starter **Download** → **Cancel** → **Retry** resumes; then **Use** works.
+- [ ] **Approve & Begin Writing** produces one complete chapter in **Manuscript**.
+- [ ] Bind non-production online AI to **Drafting**; test and generate; **Remove**
+  leaves it absent and Drafting **Unbound**; key text is never shown.
+- [ ] In **Capability Binding**, local Drafting works offline; online Drafting
+  fails clearly with Wi-Fi off.
+- [ ] Mid-stream **Stop**, then **Retry**: partial text once; retry
+  coherent.
 
 ## Writing and data
 
-- [ ] Edit and save a chapter; content survives restart.
-- [ ] Export a Chinese manuscript to EPUB, TXT, DOCX, PDF, and ZIP; every file opens and CJK glyphs render correctly.
-- [ ] Backup and restore preserves manuscript, structure, and knowledge data.
-- [ ] Force-quit and relaunch causes no data loss or migration error.
+- [ ] **Manuscript** save survives relaunch; **New snapshot** → **Restore** works.
+- [ ] **Export Novel** (EPUB, TXT, DOCX, PDF) and **Export ZIP** open; CJK OK.
+- [ ] **Backup and restore** / **Restore a backup** creates a separate copy.
+- [ ] Force-quit while generation streams; saved marker remains and partial/
+  chapter is not duplicated after relaunch.
+- [ ] **Import manuscript** matches preview; a required second import cancelled
+  before confirmation adds no novel.
 
 ## System integration
 
-- [ ] External links open only allowed destinations.
-- [ ] Minimum window size and light/dark appearance remain usable.
-- [ ] Removing the application leaves `~/.inkmarshal/app/` intact.
-- [ ] Update/relaunch flushes manuscript state and returns to a healthy Studio.
+- [ ] **Help → Documentation** and **Help → Report Issue** open
+  `github.com/mike007jd/InkMarshal` and its `/issues/new` page.
+- [ ] Minimum window size and light/dark remain usable.
+- [ ] Remove the app, reinstall from the same DMG; test novels still listed.
+- [ ] From the supported previous signed version, **Update and restart** reaches
+  the expected About version with the test manuscript intact.
 
 ## Result
 
 - [ ] Every item passed.
-- Evidence location:
 - Failures and rerun reference:
 
-Any failed item blocks the release until fixed and the complete checklist is rerun.
+Any failed item blocks release until fixed and this checklist is fully rerun.

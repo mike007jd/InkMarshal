@@ -13,7 +13,8 @@ Keep this map short. Code, manifests, tests, and live release state outrank pros
 | Current routes and surfaces | [LIVE_SURFACE_MATRIX.md](../novelcraft-ai/docs/LIVE_SURFACE_MATRIX.md) |
 | Local setup and gates | [CONTRIBUTING.md](../CONTRIBUTING.md) |
 | macOS release | [LAUNCH_READINESS.md](../novelcraft-ai/docs/LAUNCH_READINESS.md) |
-| Manual release smoke | [RELEASE_SMOKE_CHECKLIST.md](../novelcraft-ai/docs/RELEASE_SMOKE_CHECKLIST.md) |
+| Manual QA handbook (smoke / extended / release-only) | [MANUAL_TEST_CASES.md](../novelcraft-ai/docs/MANUAL_TEST_CASES.md) |
+| Signed macOS release smoke (DMG + updater) | [RELEASE_SMOKE_CHECKLIST.md](../novelcraft-ai/docs/RELEASE_SMOKE_CHECKLIST.md) |
 
 Rules:
 
