@@ -22,6 +22,7 @@ import {
   getKnowledgeIndexRowByPath,
   isVaultRootPending,
   replaceVaultKnowledgeProjection,
+  setKnowledgeIndexMirrorContentHash,
 } from '@/lib/db/queries-vault';
 import { withNovelVaultRootLock } from '@/lib/vault/root-lock';
 import type { VaultRootFence } from '@/lib/vault/types';
@@ -234,8 +235,13 @@ async function reconcileNormalizedVaultChanges(
           change.path,
         );
         if (intent?.operation === 'upsert') {
-          await trySyncKnowledgeEntryToVault(novelId, intent.entryId, 'reconcileVaultChangedFiles.restoreMirror');
-          updated++;
+          const restore = await trySyncKnowledgeEntryToVault(
+            novelId,
+            intent.entryId,
+            'reconcileVaultChangedFiles.restoreMirror',
+          );
+          if (restore === 'conflict') skipped++;
+          else updated++;
           continue;
         }
         if (intent?.operation === 'delete') {
@@ -287,7 +293,19 @@ async function reconcileNormalizedVaultChanges(
         continue;
       }
       if (allowUpsertMirrorReplay && intent?.operation === 'upsert') {
-        await trySyncKnowledgeEntryToVault(novelId, intent.entryId, 'reconcileVaultChangedFiles.replayMirror');
+        const replay = await trySyncKnowledgeEntryToVault(
+          novelId,
+          intent.entryId,
+          'reconcileVaultChangedFiles.replayMirror',
+        );
+        if (replay === 'conflict') {
+          // Preserve both sides: external Markdown stays on disk; the pending
+          // App DB version and exact outbox revision stay intact. Outbox has no
+          // payload snapshot, so absorbing external into SQLite would destroy
+          // the canonical App intent without a durable recovery copy.
+          skipped++;
+          continue;
+        }
         updated++;
         continue;
       }
@@ -320,6 +338,7 @@ async function reconcileNormalizedVaultChanges(
       }
       const contentHash = await hashContent(change.content);
       if (existingIndexForId?.contentHash === contentHash) {
+        setKnowledgeIndexMirrorContentHash(entry.id, contentHash);
         continue;
       }
       if (
@@ -340,7 +359,15 @@ async function reconcileNormalizedVaultChanges(
           updated++;
           continue;
         }
-        await trySyncKnowledgeEntryToVault(novelId, entry.id, 'reconcileVaultChangedFiles.rejectStaleMirror');
+        const staleReplay = await trySyncKnowledgeEntryToVault(
+          novelId,
+          entry.id,
+          'reconcileVaultChangedFiles.rejectStaleMirror',
+        );
+        if (staleReplay === 'conflict') {
+          skipped++;
+          continue;
+        }
         updated++;
         continue;
       }
@@ -390,6 +417,7 @@ async function reconcileNormalizedVaultChanges(
         },
         cleanupUpdates: await buildDanglingRefCleanupUpdates(danglingRefCleanup),
       });
+      setKnowledgeIndexMirrorContentHash(entry.id, contentHash);
       if (replacedPreviousId) {
         invalidateEmbeddingCache(novelId);
         scheduleCleanedDanglingRefRefreshes(novelId, danglingRefCleanup);

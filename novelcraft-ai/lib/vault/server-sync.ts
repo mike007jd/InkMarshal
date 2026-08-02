@@ -1,9 +1,14 @@
 import { getKnowledgeEntryById, getKnowledgeRelationsByEntry } from '@/lib/db';
-import { getNovelVault, isVaultRootPending } from '@/lib/db/queries-vault';
+import {
+  getNovelVault,
+  isVaultRootPending,
+  setKnowledgeIndexMirrorContentHash,
+} from '@/lib/db/queries-vault';
 import { getKnowledgeIndexById } from '@/lib/db/queries-knowledge-vault';
 import { renderEntryToMarkdown, type VaultEntry } from '@/lib/vault/entry';
 import {
   deleteAnchoredVaultEntry,
+  isVaultMarkdownConflictError,
   writeAnchoredVaultEntry,
 } from '@/lib/vault/anchored-fs';
 import { withNovelVaultRootLock } from '@/lib/vault/root-lock';
@@ -78,6 +83,7 @@ async function renderKnowledgeEntryMarkdown(row: KnowledgeEntryRow, relPath: str
 
 export type VaultMirrorWriteResult =
   | 'written'
+  | 'conflict'
   | 'skipped_unbound'
   | 'skipped_missing_entry'
   | 'skipped_stale_root';
@@ -117,12 +123,25 @@ export async function syncKnowledgeEntryToVault(
     const latest = await getNovelVault(novelId);
     if (!latest?.vaultPath || latest.vaultPath !== root) return 'skipped_stale_root';
     if (!fenceMatches(latest, fence)) return 'skipped_stale_root';
-    await writeAnchoredVaultEntry(
-      root,
-      index.path,
-      await renderKnowledgeEntryMarkdown(row, index.path),
-    );
-    return 'written';
+    // Re-read the mirror baseline immediately before I/O so a concurrent import
+    // that advanced knowledge_index.mirror_content_hash is honored.
+    const baselineIndex = await getKnowledgeIndexById(entryId);
+    if (!baselineIndex || baselineIndex.novelId !== novelId) {
+      return 'skipped_missing_entry';
+    }
+    try {
+      const write = await writeAnchoredVaultEntry(
+        root,
+        index.path,
+        await renderKnowledgeEntryMarkdown(row, index.path),
+        baselineIndex.mirrorContentHash,
+      );
+      setKnowledgeIndexMirrorContentHash(entryId, write.contentHash);
+      return 'written';
+    } catch (error) {
+      if (isVaultMarkdownConflictError(error)) return 'conflict';
+      throw error;
+    }
   });
 }
 

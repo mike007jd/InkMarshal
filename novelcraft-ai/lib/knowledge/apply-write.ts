@@ -61,16 +61,16 @@ const vaultEntryWriteTails = new Map<string, Promise<void>>();
  * for one entry so an older write can never finish after a newer upsert/delete
  * and leave Markdown stale even though revision CAS protected the outbox row.
  */
-async function withVaultEntryWriteLock(
+async function withVaultEntryWriteLock<T>(
   entryId: string,
-  task: () => Promise<void>,
-): Promise<void> {
+  task: () => Promise<T>,
+): Promise<T> {
   const previous = vaultEntryWriteTails.get(entryId) ?? Promise.resolve();
   const run = previous.catch(() => undefined).then(task);
   const tail = run.then(() => undefined, () => undefined);
   vaultEntryWriteTails.set(entryId, tail);
   try {
-    await run;
+    return await run;
   } finally {
     if (vaultEntryWriteTails.get(entryId) === tail) {
       vaultEntryWriteTails.delete(entryId);
@@ -82,34 +82,55 @@ async function withVaultEntryWriteLock(
  * Attempt a vault upsert for an already-enqueued intent revision without
  * re-enqueueing (drain / deferred-I/O CAS path).
  */
+export type KnowledgeVaultUpsertAttemptResult =
+  | 'completed'
+  | 'deferred'
+  | 'conflict'
+  | 'failed'
+  | 'stale';
+
 export async function attemptKnowledgeVaultUpsert(
   novelId: string,
   entryId: string,
   intentRevision: number,
   action: string,
   fence?: VaultRootFence,
-): Promise<void> {
-  await withVaultEntryWriteLock(entryId, async () => {
+): Promise<KnowledgeVaultUpsertAttemptResult> {
+  return withVaultEntryWriteLock(entryId, async () => {
     const current = getKnowledgeVaultOutboxRow(entryId);
     if (
       current?.operation !== 'upsert'
       || current.status !== 'pending'
       || current.intentRevision !== intentRevision
     ) {
-      return;
+      return 'stale';
     }
     try {
       const result = await syncKnowledgeEntryToVault(novelId, entryId, fence);
       if (result === 'skipped_unbound' || result === 'skipped_stale_root') {
         // Leave the durable intent pending until a root is configured /
         // the active transition generation matches.
-        return;
+        return 'deferred';
+      }
+      if (result === 'conflict') {
+        // External Markdown diverged from the last observed baseline. Leave
+        // bytes on disk and keep this exact revision pending for reconcile /
+        // retry — never mark the outbox complete.
+        recordKnowledgeVaultFailure(
+          entryId,
+          intentRevision,
+          new Error('Vault markdown conflict: external edit since baseline'),
+        );
+        warnVaultSyncFailure(action, new Error('Vault markdown conflict: external edit since baseline'));
+        return 'conflict';
       }
       // written or skipped_missing_entry (stale intent after hard DB delete)
       completeKnowledgeVaultUpsert(entryId, intentRevision);
+      return 'completed';
     } catch (error) {
       recordKnowledgeVaultFailure(entryId, intentRevision, error);
       warnVaultSyncFailure(action, error);
+      return 'failed';
     }
   });
 }
@@ -154,10 +175,10 @@ export async function trySyncKnowledgeEntryToVault(
   entryId: string,
   action: string,
   fence?: VaultRootFence,
-): Promise<void> {
+): Promise<KnowledgeVaultUpsertAttemptResult> {
   const intentRevision = enqueueKnowledgeVaultUpsertForCurrentEntry(entryId);
-  if (intentRevision == null) return;
-  await attemptKnowledgeVaultUpsert(novelId, entryId, intentRevision, action, fence);
+  if (intentRevision == null) return 'stale';
+  return attemptKnowledgeVaultUpsert(novelId, entryId, intentRevision, action, fence);
 }
 
 /** Attempt the durable delete intent while retaining its tombstone. */

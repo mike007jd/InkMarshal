@@ -1,4 +1,5 @@
-export const sql = `
+/** Frozen exact schema-21 baseline (chat_turns + receipts; pre mirror_content_hash). Do not edit. */
+export const SCHEMA_21_DDL = `
 CREATE TABLE IF NOT EXISTS users (
   id         TEXT PRIMARY KEY,
   email      TEXT NOT NULL UNIQUE,
@@ -207,22 +208,19 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
 );
 
 CREATE TABLE IF NOT EXISTS knowledge_index (
-  id                   TEXT PRIMARY KEY,
-  novel_id             TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
-  type                 TEXT NOT NULL
-                       CHECK (type IN ('character', 'world', 'timeline', 'outline', 'style_reference')),
-  path                 TEXT NOT NULL,
-  title                TEXT NOT NULL,
-  tags                 TEXT NOT NULL DEFAULT '[]',
-  aliases              TEXT NOT NULL DEFAULT '[]',
-  importance           TEXT,
-  data                 TEXT NOT NULL DEFAULT '{}',
-  outgoing_links       TEXT NOT NULL DEFAULT '[]',
-  content_hash         TEXT NOT NULL,
-  -- Last observed/written Vault Markdown SHA-256. NULL = unknown baseline;
-  -- refuse replacing divergent existing files until a successful observe/write.
-  mirror_content_hash  TEXT,
-  updated_at           TEXT NOT NULL,
+  id              TEXT PRIMARY KEY,
+  novel_id        TEXT NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+  type            TEXT NOT NULL
+                  CHECK (type IN ('character', 'world', 'timeline', 'outline', 'style_reference')),
+  path            TEXT NOT NULL,
+  title           TEXT NOT NULL,
+  tags            TEXT NOT NULL DEFAULT '[]',
+  aliases         TEXT NOT NULL DEFAULT '[]',
+  importance      TEXT,
+  data            TEXT NOT NULL DEFAULT '{}',
+  outgoing_links  TEXT NOT NULL DEFAULT '[]',
+  content_hash    TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
   UNIQUE(novel_id, path)
 );
 

@@ -344,6 +344,7 @@ export interface RawKnowledgeIndexRow {
   data: string;
   outgoing_links: string;
   content_hash: string;
+  mirror_content_hash?: string | null;
   updated_at: string;
 }
 
@@ -393,6 +394,16 @@ export function mapKnowledgeIndexRow(r: RawKnowledgeIndexRow): VaultIndexRow {
     data: safeJsonObject(r.data),
     outgoingLinks: safeJsonArray(r.outgoing_links),
     contentHash: r.content_hash,
+    mirrorContentHash: typeof r.mirror_content_hash === 'string' && r.mirror_content_hash.length > 0
+      ? r.mirror_content_hash
+      : null,
     updatedAt: r.updated_at,
   };
+}
+
+/** Persist the last observed/written Vault Markdown SHA-256 for conditional replace. */
+export function setKnowledgeIndexMirrorContentHash(entryId: string, contentHash: string): void {
+  getDb().prepare(
+    'UPDATE knowledge_index SET mirror_content_hash = ? WHERE id = ?',
+  ).run(contentHash, entryId);
 }
