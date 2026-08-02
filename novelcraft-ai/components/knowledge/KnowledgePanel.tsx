@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import {
+  AlertTriangle,
   BookUser,
   Globe,
   Clock,
@@ -10,7 +11,6 @@ import {
   Plus,
   Search,
   Layers,
-  MessageSquare,
 } from 'lucide-react';
 import type { KnowledgeEntry, KnowledgeType, OutlineEntry } from '@/lib/types/knowledge';
 import { KnowledgeEntryForm } from './KnowledgeEntryForm';
@@ -19,16 +19,17 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
   Empty,
-  EmptyContent,
   EmptyDescription,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty';
+import { Spinner } from '@/components/ui/spinner';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/components/Toast';
 import type { StringKey } from '@/lib/i18n';
 import { CardDecoration, type DecorationType } from '@/components/ui/CardDecoration';
+import type { StoryDeckRepairPhase } from '@/components/novel-workspace/types';
 import {
   buildKnowledgeEntriesUrl,
   KNOWLEDGE_FILTER_TABS,
@@ -52,10 +53,18 @@ interface KnowledgePanelProps {
    *  parent (the panel only fetches the active filter). Rendered as count
    *  badges on the internal tabs and on the deck header. */
   coverageCounts?: Partial<Record<'character' | 'world' | 'outline', number>>;
-  /** When provided, empty tabs offer a path back to the Assistant so the
-   *  user can finish the brainstorm instead of hand-authoring cards. */
-  onReturnToAssistant?: () => void;
-  returnToAssistantLabel?: string;
+  /** True while the parent is still resolving coverage — suppresses the
+   *  recovery callout so it never flashes "missing everything" on load. */
+  coverageLoading?: boolean;
+  /** Lifecycle of the deterministic repair turn, owned by the workspace.
+   *  Drives the callout's busy/disabled and failure-retry states. */
+  repairPhase?: StoryDeckRepairPhase;
+  /** Disables deck recovery while any Assistant turn is active. */
+  assistantBusy?: boolean;
+  /** When provided (and coverage is incomplete), the deck shows a recovery
+   *  callout that names the missing categories and completes the Story Deck
+   *  with the Assistant in one explicit action. */
+  onCompleteDeck?: () => void;
   /** Fired once after a successful entry save/edit from the inline form. The
    *  panel refreshes its own list; this callback lets the parent refresh the
    *  coverage/CTA derived from the same entries WITHOUT round-tripping the
@@ -171,8 +180,10 @@ export function KnowledgePanel({
   refreshToken = 0,
   variant = 'workspace',
   coverageCounts,
-  onReturnToAssistant,
-  returnToAssistantLabel,
+  coverageLoading = false,
+  repairPhase = 'idle',
+  assistantBusy = false,
+  onCompleteDeck,
   onEntriesMutated,
 }: KnowledgePanelProps) {
   const { t } = useLocale();
@@ -301,8 +312,54 @@ export function KnowledgePanel({
   const isOutlineDeck = isDeck && activeTab === 'outline';
   const outlineRows = isOutlineDeck ? buildOutlineDeckRows(entries) : [];
 
+  // Deck recovery: name the missing card categories and offer one explicit
+  // "complete with Assistant" action. The callout is deck-level (not
+  // per-tab) so a populated tab still surfaces gaps elsewhere in the deck.
+  const missingDeckCategories = isDeck && coverageCounts
+    ? [
+        (coverageCounts.character ?? 0) === 0 ? t.storyDeckCharacters : null,
+        (coverageCounts.world ?? 0) === 0 ? t.storyDeckWorld : null,
+        (coverageCounts.outline ?? 0) === 0 ? t.storyDeckOutline : null,
+      ].filter((value): value is string => Boolean(value))
+    : [];
+  const repairBusy = repairPhase === 'queued' || repairPhase === 'running';
+  const showDeckRecovery = isDeck
+    && !!onCompleteDeck
+    && !coverageLoading
+    && missingDeckCategories.length > 0;
+
   return (
     <div className="flex h-full flex-col">
+      {showDeckRecovery && (
+        <div
+          role="status"
+          className="mx-3 mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-book-warning-border bg-book-warning-light px-3 py-2"
+        >
+          <AlertTriangle size={14} className="shrink-0 text-book-warning" aria-hidden />
+          <p className={`min-w-40 flex-1 text-xs leading-5 ${repairPhase === 'failed' ? 'text-book-danger' : 'text-book-ink-secondary'}`}>
+            {repairPhase === 'failed'
+              ? t.storyDeckRepairFailed
+              : repairBusy
+                ? t.storyDeckRepairRunning
+                : t.storyDeckMissingSummary.replace('{missing}', missingDeckCategories.join(' · '))}
+          </p>
+          <Button
+            variant="ink"
+            type="button"
+            onClick={onCompleteDeck}
+            disabled={repairBusy || assistantBusy}
+            aria-busy={repairBusy || assistantBusy || undefined}
+            className="h-auto shrink-0 gap-1.5 px-3 py-1.5 text-xs font-medium"
+          >
+            {repairBusy ? <Spinner size="sm" /> : null}
+            {repairBusy
+              ? t.storyDeckRepairRunning
+              : repairPhase === 'failed'
+                ? t.toastRetry
+                : t.storyDeckCompleteAction}
+          </Button>
+        </div>
+      )}
       {/* Search + Add on one row. The old standalone "Knowledge Base" heading row
           was dropped — the outer subview nav (Characters/World/Style) already
           labels this section, so the caption was a redundant ~48px chrome row
@@ -429,8 +486,8 @@ export function KnowledgePanel({
 
         {/* Empty state — distinguish "no matches for this search" from the
             genuine first-run "nothing here yet". Every tab names what is
-            missing and, when the brainstorm is the intended source, offers a
-            path back to the Assistant to finish it. */}
+            missing; the deck-level recovery callout above carries the single
+            complete-with-Assistant action. */}
         {!loading && !loadError && !entries.length && !creating && (
           <Empty className="border-0 p-0 py-12 md:p-0 md:py-12">
             <EmptyHeader>
@@ -458,19 +515,6 @@ export function KnowledgePanel({
                 </>
               )}
             </EmptyHeader>
-            {!debouncedQuery.trim() && onReturnToAssistant && (
-              <EmptyContent className="mt-3">
-                <Button
-                  variant="outline"
-                  type="button"
-                  onClick={onReturnToAssistant}
-                  className="h-auto gap-1.5 px-3 py-2 text-xs font-medium"
-                >
-                  <MessageSquare size={14} />
-                  {returnToAssistantLabel ?? t.storyDeckReturnAssistant}
-                </Button>
-              </EmptyContent>
-            )}
           </Empty>
         )}
 

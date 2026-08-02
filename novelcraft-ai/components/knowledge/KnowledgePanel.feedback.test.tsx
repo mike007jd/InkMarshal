@@ -36,6 +36,10 @@ function entry(id: string, title: string) {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.localStorage.clear();
+  // Hydrated renders persist the resolved locale into the locale cookie, which
+  // outranks localStorage on the next mount — reset it between tests.
+  document.cookie = 'locale=;path=/;max-age=0';
 });
 
 describe('KnowledgePanel feedback states', () => {
@@ -114,9 +118,9 @@ describe('KnowledgePanel feedback states', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 
-  it('offers a return-to-assistant path from an empty tab', async () => {
+  it('names the missing deck categories and offers one complete-with-Assistant action', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
-    const onReturnToAssistant = vi.fn();
+    const onCompleteDeck = vi.fn();
 
     render(
       <LocaleProvider>
@@ -125,17 +129,166 @@ describe('KnowledgePanel feedback states', () => {
             novelId="novel-1"
             controlledFilter="character"
             variant="deck"
-            onReturnToAssistant={onReturnToAssistant}
+            coverageCounts={{ character: 0, world: 2, outline: 0 }}
+            onCompleteDeck={onCompleteDeck}
           />
         </ToastProvider>
       </LocaleProvider>,
     );
 
-    const back = await screen.findByRole('button', { name: 'Return to Assistant to finish the brainstorm' });
-    await act(async () => {
-      back.click();
+    const status = await screen.findByRole('status');
+    expect(status.textContent).toContain('Still missing: Characters · Outline.');
+    expect(status.textContent).not.toContain('World ·');
+    const action = within(status).getByRole('button', {
+      name: 'Complete Story Deck with Assistant',
     });
-    expect(onReturnToAssistant).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      action.click();
+    });
+    expect(onCompleteDeck).toHaveBeenCalledTimes(1);
+  });
+
+  it('hides the recovery callout while coverage is loading or complete', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
+    const view = render(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 0, world: 0, outline: 0 }}
+            coverageLoading
+            onCompleteDeck={vi.fn()}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+    await screen.findByText('No entries yet');
+    expect(screen.queryByRole('button', { name: /Complete Story Deck/ })).toBeNull();
+
+    view.rerender(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 1, world: 1, outline: 1 }}
+            onCompleteDeck={vi.fn()}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+    expect(screen.queryByRole('button', { name: /Complete Story Deck/ })).toBeNull();
+  });
+
+  it('disables the recovery action and announces the running state while the repair is in flight', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
+
+    render(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 0, world: 0, outline: 0 }}
+            repairPhase="running"
+            onCompleteDeck={vi.fn()}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+
+    const action = await screen.findByRole('button', {
+      name: 'Assistant is completing the Story Deck…',
+    });
+    expect(action).toHaveProperty('disabled', true);
+    expect(action.getAttribute('aria-busy')).toBe('true');
+    expect(screen.getByRole('status').textContent).toContain(
+      'Assistant is completing the Story Deck…',
+    );
+  });
+
+  it('shows a localized failure with a retry action that does not resend automatically', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
+    const onCompleteDeck = vi.fn();
+
+    render(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 0, world: 0, outline: 0 }}
+            repairPhase="failed"
+            onCompleteDeck={onCompleteDeck}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+
+    const status = await screen.findByRole('status');
+    expect(status.textContent).toContain(
+      'The Assistant could not complete the Story Deck. Your chat and draft are unchanged.',
+    );
+    const retry = within(status).getByRole('button', { name: 'Retry' });
+    expect(retry).toHaveProperty('disabled', false);
+    await act(async () => {
+      retry.click();
+    });
+    expect(onCompleteDeck).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables failed-repair recovery while another Assistant turn is active', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
+
+    render(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 0, world: 0, outline: 0 }}
+            repairPhase="failed"
+            assistantBusy
+            onCompleteDeck={vi.fn()}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+
+    const retry = await screen.findByRole('button', { name: 'Retry' });
+    expect(retry).toHaveProperty('disabled', true);
+    expect(retry.getAttribute('aria-busy')).toBe('true');
+  });
+
+  it('localizes the recovery callout and action in zh-CN', async () => {
+    document.cookie = 'locale=zh-CN;path=/';
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okResponse([])));
+
+    render(
+      <LocaleProvider>
+        <ToastProvider>
+          <KnowledgePanel
+            novelId="novel-1"
+            controlledFilter="character"
+            variant="deck"
+            coverageCounts={{ character: 0, world: 2, outline: 0 }}
+            onCompleteDeck={vi.fn()}
+          />
+        </ToastProvider>
+      </LocaleProvider>,
+    );
+
+    const action = await screen.findByRole('button', {
+      name: '让 Assistant 补齐故事卡组',
+    });
+    expect(action).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toContain('还缺少：角色 · 蓝图。');
   });
 
   it('gives the inline form close control an accessible name', async () => {

@@ -268,9 +268,12 @@ export function bindChatTurnBrainstormReceipt(
 
 export function resolveMainChatTurnMode(args: {
   repairStoryDeck: boolean;
+  isConfirmedFinalPlan: boolean;
   isExplicitApproval: boolean;
 }): ChatTurnMode {
-  if (args.repairStoryDeck) return 'repair_story_deck';
+  // Confirmed final-plan requests reuse the existing Story Deck finalization path.
+  // They must not widen explicit_approval / approve-to-write semantics.
+  if (args.repairStoryDeck || args.isConfirmedFinalPlan) return 'repair_story_deck';
   if (args.isExplicitApproval) return 'explicit_approval';
   return 'ordinary';
 }

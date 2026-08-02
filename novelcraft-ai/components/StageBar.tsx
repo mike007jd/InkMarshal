@@ -48,6 +48,9 @@ export interface StageBarProps {
   /** Required Story Deck coverage. False replaces Approve with the repair CTA. */
   storyDeckComplete?: boolean;
   onCompleteDeck?: () => void;
+  /** True while the deterministic repair turn is queued or in flight — the
+   *  repair CTA is disabled and announces the running state. */
+  repairBusy?: boolean;
   /** Secondary action at the approval step — review the Story Deck first. */
   onReviewDeck?: () => void;
   /** Primary action once the book is export-ready. */
@@ -122,6 +125,7 @@ export function StageBar({
   onApprove,
   storyDeckComplete = true,
   onCompleteDeck,
+  repairBusy = false,
   onReviewDeck,
   onDownloadBundle,
   isStreaming = false,
@@ -217,11 +221,12 @@ export function StageBar({
               variant="ink"
               type="button"
               onClick={onCompleteDeck}
-              disabled={approveDisabled}
+              disabled={approveDisabled || repairBusy}
+              aria-busy={repairBusy || undefined}
               className="h-auto gap-2 px-4 py-2 text-sm font-medium shadow-sm"
             >
-              <NibIcon className="h-4 w-4" />
-              {t.storyDeckCompleteAction}
+              {repairBusy ? <Spinner size="sm" /> : <NibIcon className="h-4 w-4" />}
+              {repairBusy ? t.storyDeckRepairRunning : t.storyDeckCompleteAction}
             </Button>
           )}
           {isReady && storyDeckComplete && onApprove && (

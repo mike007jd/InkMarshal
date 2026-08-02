@@ -11,12 +11,6 @@ import { Spinner } from '@/components/ui/spinner';
 import { requestManuscriptFlush } from '@/lib/desktop-shell-bus';
 import { isTauriRuntime, readLocalFile } from '@/lib/desktop-runtime';
 import { parseDownloadFilename, saveBlob } from '@/lib/download';
-import {
-  buildLibraryBackupPackage,
-  type LibraryBackupItem,
-  type LibraryBackupNovel,
-} from '@/lib/backup/build-library-package';
-import { verifyBackupPackage } from '@/lib/backup/verify';
 
 function decodeBase64(value: string): Uint8Array {
   const binary = atob(value);
@@ -84,34 +78,32 @@ export function BackupSettings({ novelId }: { novelId: string | null }) {
         const saveOutcome = await requestManuscriptFlush();
         if (!saveOutcome.ok) throw new Error(t.editorSaveError);
       }
-      const novelsResponse = await fetch('/api/novels');
-      if (!novelsResponse.ok) throw new Error(t.backupAllCreateFailed);
-      const novels = await novelsResponse.json() as LibraryBackupNovel[];
-      if (novels.length === 0) {
+      const response = await fetch('/api/backups/library', { method: 'POST' });
+      if (response.status === 204) {
         toast(t.backupAllEmpty, 'info');
         return;
       }
-
-      setLibraryProgress({ completed: 0, total: novels.length });
-      const items: LibraryBackupItem[] = [];
-      for (const novel of novels) {
-        const response = await fetch(`/api/novels/${novel.id}/backup`, { method: 'POST' });
-        if (!response.ok) throw new Error(t.backupAllCreateFailed);
-        const backupBytes = new Uint8Array(await response.arrayBuffer());
-        const verification = await verifyBackupPackage(backupBytes);
-        if (!verification.ok) throw new Error(t.backupAllVerificationFailed);
-        items.push({ novel, backupBytes });
-        setLibraryProgress({ completed: items.length, total: novels.length });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { code?: string } | null;
+        throw new Error(
+          body?.code === 'backup_verification_failed'
+            ? t.backupAllVerificationFailed
+            : t.backupAllCreateFailed,
+        );
       }
-
-      const built = buildLibraryBackupPackage(items);
-      const date = new Date().toISOString().slice(0, 10);
+      const count = Number(response.headers.get('X-InkMarshal-Novel-Count'));
+      if (!Number.isSafeInteger(count) || count <= 0) throw new Error(t.backupAllCreateFailed);
+      setLibraryProgress({ completed: count, total: count });
+      const filename = parseDownloadFilename(
+        response.headers.get('Content-Disposition'),
+        `InkMarshal-library-${new Date().toISOString().slice(0, 10)}.zip`,
+      );
       const saved = await saveBlob(
-        new Blob([built.bytes.slice().buffer], { type: 'application/zip' }),
-        `InkMarshal-library-${date}.zip`,
+        await response.blob(),
+        filename,
       );
       if (saved === null) return;
-      toast(t.backupAllCreateSuccess.replace('{count}', String(items.length)), 'success');
+      toast(t.backupAllCreateSuccess.replace('{count}', String(count)), 'success');
     } catch (error) {
       toast(error instanceof Error ? error.message : t.backupAllCreateFailed, 'error');
     } finally {

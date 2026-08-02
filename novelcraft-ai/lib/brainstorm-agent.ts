@@ -685,6 +685,194 @@ export function isExplicitWritingApproval(text: string): boolean {
   });
 }
 
+/** Normalize compatibility characters while preserving quote punctuation. */
+function normalizeFinalPlanText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .trim();
+}
+
+/**
+ * Remove paired quote / code spans before signal matching. Prefer false
+ * negatives: leftover unpaired markers still veto the deterministic path.
+ */
+function stripPairedQuoteAndCodeSpans(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`\n]*`/g, ' ')
+    .replace(/“[^”]*”/g, ' ')
+    .replace(/"[^"]*"/g, ' ')
+    .replace(/「[^」]*」/g, ' ')
+    .replace(/『[^』]*』/g, ' ')
+    .replace(/‘[^’]*’/g, ' ')
+    .replace(/(^|[\s(:：])'[^'\n]{4,}'(?=$|[\s).。!！?？,，;；])/g, '$1 ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasUnresolvedQuoteOrCodeMarker(text: string): boolean {
+  return /```/.test(text)
+    || /`/.test(text)
+    || /[“”「」『』‘’"]/.test(text);
+}
+
+function hasFinalPlanMetaInstructionVeto(text: string): boolean {
+  // Translation / rewrite / example / reporting contexts are never actionable
+  // confirmation, even when they embed the exact QA phrase.
+  return (
+    /(?:翻译|翻譯|译成|譯成|译为|譯為|改写|改寫|润色|潤色|重写|重寫)/.test(text)
+    || /(?:例如|示例|举例|舉例|当作(?:一个)?例子|當作(?:一個)?例子|作为示例|作為示例)/.test(text)
+    || /(?:测试|測試|试试|試試|检查|檢查|清单|清單|待办|待辦).{0,48}(?:确认|確認|生成最终|生成最終)/.test(text)
+    || /\b(?:translate|translation|rewrite|rephrase|paraphrase)\b/i.test(text)
+    || /\b(?:test|testing|checklist|to-?do)\b.{0,64}\b(?:confirm|generate|final)\b/i.test(text)
+    || /\b(?:for\s+example|as\s+an\s+example|example\s+of|sample\s+(?:phrase|sentence|text|request))\b/i.test(text)
+    || /\b(?:shown|displayed|written|appears?)\b.{0,32}\b(?:code\s*block|quote|quoted|ui|screen|label|interface)\b/i.test(text)
+    || /\b(?:repeat|quote|recite|retell|document|text|note|source|content)\b.{0,48}\b(?:confirm|generate|final)\b/i.test(text)
+    || /\b(?:in\s+a\s+)?code\s*block\b/i.test(text)
+    || /(?:代码块|程式碼塊|程式码块|引号|引號|引用).{0,16}(?:里|裡|中|内|內|显示|顯示)/.test(text)
+    || /(?:复述|複述|转述|轉述|引用|抄写|抄寫|朗读|朗讀|文档|文檔|内容|內容).{0,32}(?:确认|確認|生成最终|生成最終)/.test(text)
+    || /(?:把|将|將).{0,48}(?:翻译|翻譯|改写|改寫|重写|重寫|译成|譯成)/.test(text)
+  );
+}
+
+function hasConfirmedFinalPlanVeto(text: string): boolean {
+  if (/[?？]/.test(text)) return true;
+  if (/(?:^|\n)\s*>/.test(text)) return true;
+  if (/(?:^|\n)\s*[-*+]\s*\[[ xX]?\]/.test(text)) return true;
+  if (/(?:吗|嗎|么|麼|呢)\s*[。.!！]*\s*$/u.test(text)) return true;
+  if (
+    /(?:什么时候|什麼時候|何时|何時).{0,24}(?:确认|確認|生成最终|生成最終|final\s+story)/i.test(text)
+    || /^(?:请问|請問|when\b)/i.test(text)
+    || /\b(?:can|could|should|may)\s+(?:i|we)\b/i.test(text)
+    || /\bdo\s+we\b.+\b(?:confirm|generate|finalize)\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  if (
+    /(?:明天|以后|以後|之后|之後|稍后|稍後|可能|也许|也許|或许|或許|考虑|考慮|想想|不是要|并非要|並非要).{0,24}(?:确认|確認|生成最终|生成最終)/.test(text)
+    || /(?:还没|還沒|尚未|还未|還未|未)(?:决定|決定)|(?:还在|還在|仍在)(?:考虑|考慮)/.test(text)
+    || /(?:如果|假如|倘若|若是|只要|除非|等到|待到).{0,48}(?:确认|確認|生成最终|生成最終)/.test(text)
+    || /(?:等|等待|待).{0,20}(?:通知|答复|答覆|决定|決定|准备|準備|确认|確認)?.{0,8}(?:再|才)(?:生成|完成|产出|產出).{0,8}(?:最终|最終)/.test(text)
+    || /(?:告诉我|告訴我|解释|解釋|说明|說明).{0,24}(?:如何|怎么|怎麼).{0,24}(?:确认|確認|生成最终|生成最終)/.test(text)
+    || /\b(?:might|maybe|perhaps|consider|considering|wonder|wondering|intend|planning|tomorrow|later|eventually|someday)\b.{0,40}\b(?:confirm|generate|finalize)\b/i.test(text)
+    || /\b(?:undecided|not\s+(?:yet\s+)?decided|haven[’']?t\s+decided|have\s+not\s+decided|still\s+(?:deciding|considering)|(?:have\s+not|haven[’']?t)\s+made\s+up\s+(?:my|our)\s+mind)\b/i.test(text)
+    || /\b(?:if|unless|provided|assuming|once|when)\b.{0,64}\b(?:confirm|generate|finalize)\b/i.test(text)
+    || /\b(?:confirm|generate|finalize)\b.{0,24}\b(?:tomorrow|later|eventually|someday)\b/i.test(text)
+    || /\b(?:tell|show|explain)\b.{0,24}\bhow\s+to\s+(?:confirm|generate|finalize)\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  if (
+    /(?:不要|不用|不能|不可|无法|無法|没法|沒法|未能|没能|沒能|先别|先別|暂不|暫不|还没|還沒|尚未|没有|沒有|并没有|並沒有|从未|從未|别急|別急|先不)\s*(?:再|现在|現在|马上|馬上)?\s*(?:确认|確認|(?:生成|完成)最终|(?:生成|完成)最終)/.test(text)
+    || /(?:不想|不愿|不願|不愿意|不願意|拒绝|拒絕|不要|别|別|不能|不可|无法|無法|没法|沒法|暂不|暫不|先不|还不|還不).{0,16}(?:生成|完成|产出|產出|创建|創建).{0,8}(?:最终|最終)/.test(text)
+    || /不(?:再)?(?:确认|確認)/.test(text)
+    || /(?:条目|條目|设定|設定|方案|卡片).{0,12}不是.{0,12}(?:没问题|沒問題|无误|無誤|可以)/.test(text)
+    || /(?:\b(?:cannot|can[’']?t|never|won[’']?t|will\s+not|unable\s+to|refuse(?:d|s)?\s+to)\b.{0,16}\b(?:confirm|generate|finalize)\b)/i.test(text)
+    || /don[’']?t\s+(?:yet\s+)?(?:confirm|generate\s+(?:the\s+)?final|finalize)/i.test(text)
+    || /\b(?:do\s+not|don[’']?t|cannot|can[’']?t|will\s+not|won[’']?t|refuse(?:d|s)?\s+to|not\s+(?:yet\s+)?(?:want|ready|willing)\s+to)\b.{0,24}\b(?:generate|create|build|finalize)\b/i.test(text)
+    || /(?:do\s+not|not\s+(?:yet\s+)?ready\s+to)\s+(?:confirm|generate|finalize)/i.test(text)
+    || /\bnot\s+(?:yet\s+)?(?:confirm|generate\s+(?:the\s+)?final|finalize)\b/i.test(text)
+    || /(?:before|without)\s+confirming/i.test(text)
+  ) {
+    return true;
+  }
+
+  // Quoted / UI-attributed text is never an actionable confirmation.
+  if (
+    /\b(?:ui|interface|screen|button|label|editor|document|note)\b.{0,24}\b(?:says?|shows?|reads?|wrote|states?)\b/i.test(text)
+    || /(?:界面|介面|按钮|按鈕|标签|標籤|编辑|編輯|文档|文檔|笔记|筆記).{0,16}(?:显示|顯示|写着|寫著|说|說|标注|標註)/.test(text)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasEntryConfirmationContradiction(text: string): boolean {
+  return (
+    /(?:还|還|仍|依然|其实|其實)?(?:需要|需|要|应该|應該)(?:再)?(?:调整|調整|修改|更改|改动|改動)/.test(text)
+    || /(?:有|存在)(?:问题|問題|错误|錯誤|遗漏|遺漏|矛盾)/.test(text)
+    || /(?:不对|不對|不正确|不正確|不准确|不準確|不完整|不能用|不可用)/.test(text)
+    || /\b(?:are|look|seem)?\s*(?:incorrect|wrong|incomplete|inaccurate|not\s+(?:correct|ready|good|fine|ok|okay)|aren[’']?t\s+(?:correct|ready|good|fine|ok|okay))\b/i.test(text)
+    || /\b(?:still\s+)?(?:need|require)\s+(?:changes?|adjustments?|revisions?)\b/i.test(text)
+    || /\b(?:have|contain)\s+(?:problems?|errors?|issues?|omissions?)\b/i.test(text)
+  );
+}
+
+function hasEntryConfirmationSignal(text: string): boolean {
+  if (hasEntryConfirmationContradiction(text)) return false;
+  return (
+    /^(?:(?:好|好的|可以)[，,\s]*)*(?:我(?:已|已经|已經)?\s*)?(?:确认|確認)(?:这些|這些)?(?:条目|條目|设定|設定|方案|卡片)/u.test(text)
+    || /^(?:这些|這些)?(?:条目|條目|设定|設定|方案|卡片).{0,16}(?:没问题|沒問題|无误|無誤|可以)/.test(text)
+    || /^(?:没有需要调整|沒有需要調整|无需(?:再)?调整|無需(?:再)?調整|不用(?:再)?调整|不用(?:再)?調整|不需要(?:再)?调整|不需要(?:再)?調整)/.test(text)
+    || /^(?:i\s+)?confirm(?:s|ed)?\s+these\s+(?:entries|items|cards)\b/i.test(text)
+    || /^(?:these\s+)?(?:entries|items|cards)\s+(?:look\s+)?(?:good|fine|correct|ok|okay)\b/i.test(text)
+    || /^nothing\s+needs\s+(?:to\s+be\s+)?adjust(?:ing|ment|ed)\b/i.test(text)
+    || /^no\s+(?:further\s+)?(?:adjustments?|changes?)\s+(?:are\s+)?needed\b/i.test(text)
+  );
+}
+
+function hasGenerateFinalFrameworkRequest(text: string): boolean {
+  return (
+    /^(?:(?:好|好的|那么|那麼|那就|并|並|然后|然後|接着|接著)[，,\s]*)*(?:请|請)?(?:现在|現在|马上|馬上)?(?:生成|产出|產出|完成)(?:最终|最終)(?:的)?故事框架/.test(text)
+    || /^(?:(?:then|now|and)\s+)*(?:please\s+)?(?:generate|create|build|finalize)\s+(?:the\s+)?final\s+story\s+(?:framework|plan|deck)\b/i.test(text)
+  );
+}
+
+/**
+ * True when the user explicitly confirms proposed brainstorm entries and asks
+ * to generate the final story framework / Story Deck. Distinct from
+ * isExplicitWritingApproval — this never authorizes manuscript writing.
+ *
+ * Prefer false negatives over deterministic side effects: negated, quoted,
+ * code-block, translation, rewrite, and example/meta text must stay ordinary.
+ */
+export function isConfirmedFinalPlanRequest(text: string): boolean {
+  const raw = normalizeFinalPlanText(text);
+  if (!raw) return false;
+  if (
+    hasAffirmativePlanChangeIntent(raw)
+    || hasFinalPlanMetaInstructionVeto(raw)
+    || hasConfirmedFinalPlanVeto(raw)
+  ) {
+    return false;
+  }
+
+  // Strip paired quote/code spans first; leftover markers fail closed.
+  const actionable = stripPairedQuoteAndCodeSpans(raw);
+  if (
+    !actionable
+    || hasUnresolvedQuoteOrCodeMarker(actionable)
+    || hasFinalPlanMetaInstructionVeto(actionable)
+    || hasConfirmedFinalPlanVeto(actionable)
+  ) {
+    return false;
+  }
+
+  const clauses = actionable
+    .split(/[。.!！?？；;，,\n]+/)
+    .map(clause => clause.trim())
+    .filter(Boolean);
+  if (clauses.length === 0) return false;
+
+  let cleanConfirm = false;
+  let cleanGenerate = false;
+  for (const [index, clause] of clauses.entries()) {
+    const previousClause = clauses[index - 1];
+    if (
+      previousClause
+      && (isReportedApprovalLead(previousClause) || isDeferredApprovalLead(previousClause))
+    ) {
+      continue;
+    }
+    if (hasEntryConfirmationSignal(clause)) cleanConfirm = true;
+    if (hasGenerateFinalFrameworkRequest(clause)) cleanGenerate = true;
+  }
+  return cleanConfirm && cleanGenerate;
+}
+
 export function brainstormAgentSystemAddon(locale: Locale, stage?: NovelStage): string {
   const zh = locale !== 'en';
   if (stage === 'ready_for_greenlight') {

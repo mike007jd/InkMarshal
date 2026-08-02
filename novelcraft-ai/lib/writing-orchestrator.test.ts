@@ -365,6 +365,28 @@ describe('writeChapter', () => {
     expect(outcome.savedChapter?.processingStatus).toBe('complete');
   });
 
+  it('finalizes saved prose with deterministic fallbacks when optional post-processing fails', async () => {
+    const h = harness({
+      summarize: async () => {
+        throw new Error('summarize timed out');
+      },
+      validate: async () => {
+        throw new Error('validate timed out');
+      },
+    });
+
+    const outcome = await writeChapter(h.deps, input());
+
+    expect(outcome.status).toBe('written');
+    expect(outcome.savedChapter?.processingStatus).toBe('complete');
+    expect(outcome.summary).toBe(outcome.content.slice(-600).trim());
+    expect(h.deps.updateChapterMeta).toHaveBeenCalledWith(1, expect.objectContaining({
+      summary: outcome.content.slice(-600).trim(),
+      keyFacts: null,
+      processingStatus: 'complete',
+    }));
+  });
+
   it('keeps content_saved when usage recording throws after the initial content save', async () => {
     const h = harness();
     h.recordUsage.mockRejectedValueOnce(new Error('usage ledger unavailable'));

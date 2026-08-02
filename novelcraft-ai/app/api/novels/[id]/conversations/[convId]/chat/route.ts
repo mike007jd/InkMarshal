@@ -7,7 +7,10 @@ import {
   findNovelMessageById,
   hashChatTurnRequest,
 } from '@/lib/db';
-import { persistChatTurnAssistantMessage } from '@/lib/db/queries-chat-turns';
+import {
+  persistChatTurnAssistantMessage,
+  persistChatTurnStoppedAssistantMessage,
+} from '@/lib/db/queries-chat-turns';
 import { type ChatMessage } from '@/lib/ai';
 import { buildAIContext } from '@/lib/ai-context-builder';
 import { formatTokensHeader } from '@/lib/token-budget';
@@ -101,7 +104,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
   let aiUsage;
   try {
-    aiUsage = await createAIUsageSession(req, { userId: user.id, operation: 'chat' });
+    aiUsage = await createAIUsageSession(req, {
+      userId: user.id,
+      operation: 'chat',
+      novelId,
+    });
     aiUsage.addPromptText(content);
   } catch (error) {
     failChatTurn({
@@ -198,7 +205,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return message;
       },
       persistStoppedAssistant: async (messageId, text) => {
-        const message = persistChatTurnAssistantMessage({
+        const message = persistChatTurnStoppedAssistantMessage({
           novelId,
           userMessageId: userMessage.id,
           claimToken,

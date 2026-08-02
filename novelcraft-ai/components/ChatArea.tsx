@@ -9,7 +9,10 @@ import { joinLocalizedDisplayList } from '@/lib/i18n';
 import { EmptyChatInterviewGuide } from '@/components/EmptyChatInterviewGuide';
 import { useToast } from '@/components/Toast';
 import { NovelThread } from '@/components/assistant-ui/thread';
-import { useNovelChatRuntime } from '@/components/assistant-ui/useNovelChatRuntime';
+import {
+  stoppedPersistenceLabel,
+  useNovelChatRuntime,
+} from '@/components/assistant-ui/useNovelChatRuntime';
 import { CreativityPicker } from '@/components/writing/CreativityPicker';
 import { ChatModelPicker } from '@/components/writing/ChatModelPicker';
 import { useNovelCreativity } from '@/hooks/useNovelCreativity';
@@ -23,6 +26,7 @@ export function ChatArea({
   completionContent,
   autoSubmitRequest = 0,
   autoSubmitText,
+  onRepairPhaseChange,
 }: {
   novelId: string;
   onUpdate: () => void;
@@ -31,6 +35,11 @@ export function ChatArea({
   completionContent?: ReactNode;
   autoSubmitRequest?: number;
   autoSubmitText?: string;
+  /** Lifecycle of the auto-submitted Story Deck repair turn. `running` fires
+   *  once the request is consumed and sent; `succeeded`/`failed` fire when
+   *  that same turn settles. An aborted (Stop) turn settles as `failed` —
+   *  never `succeeded`. No other turn reports through this callback. */
+  onRepairPhaseChange?: (phase: 'running' | 'succeeded' | 'failed') => void;
 }) {
   const { t, locale } = useLanguage();
   const { toast } = useToast();
@@ -96,11 +105,19 @@ export function ChatArea({
     }
   }, [locale, novelId, onUpdate, t, toast]);
 
-  const { runtime, status, loading, refresh, errorMessage, retry, sendMessage } = useNovelChatRuntime({
+  const submittedRequestRef = useRef(0);
+  const [modelSelectionPending, setModelSelectionPending] = useState(false);
+  // Repair-turn lifecycle. `repairInFlightRef` becomes true the moment the
+  // auto-submit is consumed; the turn then settles exclusively through the
+  // AI SDK finish outcome (onTurnFinish) or a pre-send rejection — never
+  // through status transitions, because an aborted (Stop) turn returns to
+  // `ready` exactly like a successful one.
+  const repairInFlightRef = useRef(false);
+  const { runtime, status, loading, recovering, refresh, errorMessage, retryKind, retry, sendMessage } = useNovelChatRuntime({
     novelId,
     locale,
     creativity,
-    stoppedLabel: t.writingStopped,
+    stoppedLabel: stoppedPersistenceLabel(locale),
     streamFailedLabel: t.errorSendFailed,
     loadFailedLabel: t.errorLoadMessages,
     autoStartLastUserTurn: searchParams.get('autostart') === '1',
@@ -111,6 +128,11 @@ export function ChatArea({
     onTurnComplete: () => {
       onUpdate();
       void revealBrainstormReceipt();
+    },
+    onTurnFinish: (outcome) => {
+      if (!repairInFlightRef.current) return;
+      repairInFlightRef.current = false;
+      onRepairPhaseChange?.(outcome === 'succeeded' ? 'succeeded' : 'failed');
     },
     onLoadError: () =>
       toast(t.errorLoadMessages, 'error', {
@@ -123,27 +145,55 @@ export function ChatArea({
   useEffect(() => {
     onStatusChange?.(status);
   }, [onStatusChange, status]);
-  const submittedRequestRef = useRef(0);
-  const [modelSelectionPending, setModelSelectionPending] = useState(false);
   useEffect(() => {
     if (
       autoSubmitRequest <= 0
       || autoSubmitRequest === submittedRequestRef.current
       || !autoSubmitText
       || loading
-      || status !== 'ready'
+      // `error` is an idle state here: sendMessage clears it before the new
+      // turn, so a failed repair can be retried by the next request.
+      || (status !== 'ready' && status !== 'error')
       || modelSelectionPending
     ) return;
     submittedRequestRef.current = autoSubmitRequest;
-    void sendMessage(autoSubmitText, { repairStoryDeck: true });
+    repairInFlightRef.current = true;
+    onRepairPhaseChange?.('running');
+    // A rejection here means the turn never reached the server (no finish
+    // outcome will follow), so the send itself is the settle signal.
+    void sendMessage(autoSubmitText, { repairStoryDeck: true }).catch(() => {
+      if (!repairInFlightRef.current) return;
+      repairInFlightRef.current = false;
+      onRepairPhaseChange?.('failed');
+    });
   }, [
     autoSubmitRequest,
     autoSubmitText,
     loading,
     modelSelectionPending,
+    onRepairPhaseChange,
     sendMessage,
     status,
   ]);
+
+  const handleRetry = useCallback(() => {
+    const retriesRepair = retryKind === 'repair';
+    if (
+      retriesRepair
+      && (repairInFlightRef.current || status === 'submitted' || status === 'streaming')
+    ) {
+      return;
+    }
+    if (retriesRepair) {
+      repairInFlightRef.current = true;
+      onRepairPhaseChange?.('running');
+    }
+    void retry().catch(() => {
+      if (!retriesRepair || !repairInFlightRef.current) return;
+      repairInFlightRef.current = false;
+      onRepairPhaseChange?.('failed');
+    });
+  }, [onRepairPhaseChange, retry, retryKind, status]);
 
   return (
     <div className="flex-1 flex flex-col h-full book-texture-parchment relative overflow-hidden">
@@ -159,9 +209,9 @@ export function ChatArea({
             placeholder={t.typeMessage}
             emptyState={<EmptyChatInterviewGuide />}
             composerControls={<ChatModelPicker onSavingChange={setModelSelectionPending} />}
-            composerSendDisabled={modelSelectionPending}
+            composerSendDisabled={modelSelectionPending || recovering}
             errorMessage={errorMessage}
-            onRetry={() => void retry()}
+            onRetry={handleRetry}
             completionContent={completionContent}
           />
         </AssistantRuntimeProvider>

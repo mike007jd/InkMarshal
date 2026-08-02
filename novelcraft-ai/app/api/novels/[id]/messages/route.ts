@@ -12,7 +12,10 @@ import {
   hashChatTurnRequest,
   type ChatTurn,
 } from '@/lib/db';
-import { persistChatTurnAssistantMessage } from '@/lib/db/queries-chat-turns';
+import {
+  persistChatTurnAssistantMessage,
+  persistChatTurnStoppedAssistantMessage,
+} from '@/lib/db/queries-chat-turns';
 import { type ChatMessage } from '@/lib/ai';
 import { buildAIContext } from '@/lib/ai-context-builder';
 import { formatTokensHeader } from '@/lib/token-budget';
@@ -29,6 +32,7 @@ import {
   brainstormAgentSystemAddon,
   createBrainstormTools,
   finalizeApprovedStoryDeckForClaim,
+  isConfirmedFinalPlanRequest,
   isExplicitWritingApproval,
 } from '@/lib/brainstorm-agent';
 import { buildUserMessageContentWithAttachments } from '@/lib/chat-attachments.server';
@@ -46,6 +50,11 @@ import {
   persistOrReplayDeterministicAssistantText,
   resolveMainChatTurnMode,
 } from '@/lib/chat-turn-helpers';
+import { CHAT_TURN_STATUS_HEADER } from '@/lib/chat-turn-recovery';
+import {
+  resolveChatTurnRecoveryStatus,
+  resolveLatestChatTurnRecoveryStatus,
+} from '@/lib/chat-turn-recovery.server';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -77,7 +86,7 @@ function incompleteDeckApprovalText(locale: Locale): string {
 }
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
@@ -85,7 +94,13 @@ export async function GET(
   if (ownerCheck instanceof NextResponse) return ownerCheck;
 
   const messages = await getMessages(id);
-  return NextResponse.json(messages);
+  const pendingTurnId = new URL(request.url).searchParams.get('pendingTurnId');
+  const turnStatus = pendingTurnId && pendingTurnId.length <= 128
+    ? resolveChatTurnRecoveryStatus(id, pendingTurnId, messages)
+    : resolveLatestChatTurnRecoveryStatus(id, messages);
+  return NextResponse.json(messages, turnStatus ? {
+    headers: { [CHAT_TURN_STATUS_HEADER]: turnStatus },
+  } : undefined);
 }
 
 export async function POST(
@@ -148,6 +163,7 @@ export async function POST(
 
   const mode = resolveMainChatTurnMode({
     repairStoryDeck,
+    isConfirmedFinalPlan: isConfirmedFinalPlanRequest(approvalText),
     isExplicitApproval: isExplicitWritingApproval(approvalText),
   });
   const requestHash = hashChatTurnRequest({ content, mode });
@@ -268,7 +284,11 @@ export async function POST(
 
   let aiUsage;
   try {
-    aiUsage = await createAIUsageSession(request, { userId: user.id, operation: 'chat' });
+    aiUsage = await createAIUsageSession(request, {
+      userId: user.id,
+      operation: 'chat',
+      novelId: id,
+    });
   } catch (error) {
     failChatTurn({
       novelId: id,
@@ -362,7 +382,7 @@ export async function POST(
         return message;
       },
       persistStoppedAssistant: async (messageId, text) => {
-        const message = persistChatTurnAssistantMessage({
+        const message = persistChatTurnStoppedAssistantMessage({
           novelId: id,
           userMessageId: userMessage.id,
           claimToken,

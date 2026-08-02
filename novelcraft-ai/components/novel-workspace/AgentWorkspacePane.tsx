@@ -8,7 +8,7 @@ import { ChatArea } from '@/components/ChatArea';
 import { ConversationList } from '@/components/conversations/ConversationList';
 import { ConversationThread } from '@/components/conversations/ConversationThread';
 import { useLanguage } from '@/components/LanguageProvider';
-import type { DeckCounts } from '@/components/novel-workspace/types';
+import type { DeckCounts, StoryDeckRepairPhase } from '@/components/novel-workspace/types';
 import { ProposalReviewPanel } from '@/components/ProposalReviewPanel';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -29,7 +29,9 @@ export function AgentWorkspacePane({
   onStartWriting,
   onReviewDeck,
   onCompleteDeck,
-  proposalAdjustRequest,
+  storyDeckRepairRequest,
+  repairPhase,
+  onRepairPhaseChange,
   initialCreativity,
 }: {
   novelId: string;
@@ -45,27 +47,29 @@ export function AgentWorkspacePane({
   onStartWriting: () => void;
   onReviewDeck: () => void;
   onCompleteDeck: () => void;
-  proposalAdjustRequest: number;
+  storyDeckRepairRequest: number;
+  repairPhase: StoryDeckRepairPhase;
+  onRepairPhaseChange: (phase: 'running' | 'succeeded' | 'failed') => void;
   initialCreativity?: CreativityLevel | null;
 }) {
   const { t } = useLanguage();
   const showConversationList = true;
   const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
+  // Manual proposal adjustment only. The repair lifecycle (queued → running
+  // → failed) deliberately does NOT touch this flag: the ProposalReviewPanel
+  // owns the recovery UI and must stay mounted and visible while a repair is
+  // in flight, separate from the user choosing to adjust the proposal by
+  // hand (which reveals the bare chat until the next turn settles).
   const [adjustingProposalLocally, setAdjustingProposalLocally] = useState(false);
-  const [acknowledgedAdjustRequest, setAcknowledgedAdjustRequest] = useState(
-    proposalAdjustRequest,
-  );
   const proposalReview = novel?.stage === 'ready_for_greenlight';
-  const adjustingProposal = adjustingProposalLocally
-    || proposalAdjustRequest !== acknowledgedAdjustRequest;
+  const adjustingProposal = adjustingProposalLocally;
 
   const handleChatStatusChange = useCallback((nextStatus: ChatStatus) => {
     onStatusChange(nextStatus);
     if (proposalReview && nextStatus === 'ready') {
       setAdjustingProposalLocally(false);
-      setAcknowledgedAdjustRequest(proposalAdjustRequest);
     }
-  }, [onStatusChange, proposalAdjustRequest, proposalReview]);
+  }, [onStatusChange, proposalReview]);
 
   useEffect(() => {
     const wide = window.matchMedia('(min-width: 1024px)');
@@ -135,7 +139,11 @@ export function AgentWorkspacePane({
         )}
         {showConversationList && activeConvId ? (
           <div className="min-h-0 flex-1">
-            <ConversationThread novelId={novelId} conversationId={activeConvId} />
+            <ConversationThread
+              key={`${novelId}:${activeConvId}`}
+              novelId={novelId}
+              conversationId={activeConvId}
+            />
           </div>
         ) : null}
         <div className={showConversationList && activeConvId ? 'hidden' : 'flex min-h-0 flex-1'}>
@@ -144,8 +152,9 @@ export function AgentWorkspacePane({
             onUpdate={onUpdate}
             onStatusChange={handleChatStatusChange}
             initialCreativity={initialCreativity ?? null}
-            autoSubmitRequest={proposalAdjustRequest}
+            autoSubmitRequest={storyDeckRepairRequest}
             autoSubmitText={t.storyDeckCompletePrompt}
+            onRepairPhaseChange={onRepairPhaseChange}
             completionContent={proposalReview && !adjustingProposal && novel ? (
               <ProposalReviewPanel
                 novel={novel}
@@ -155,6 +164,7 @@ export function AgentWorkspacePane({
                 onReviewDeck={onReviewDeck}
                 onAdjustProposal={() => setAdjustingProposalLocally(true)}
                 onCompleteDeck={onCompleteDeck}
+                repairPhase={repairPhase}
                 busy={chatStatus === 'submitted' || chatStatus === 'streaming'}
               />
             ) : null}

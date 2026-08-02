@@ -11,6 +11,7 @@ import { StoryDeckWorkspacePane } from '@/components/novel-workspace/StoryDeckWo
 import { useNovelBundleExport } from '@/components/novel-workspace/useNovelBundleExport';
 import { useNovelWorkspaceNavigation } from '@/components/novel-workspace/useNovelWorkspaceNavigation';
 import { useStoryDeckCoverage } from '@/components/novel-workspace/useStoryDeckCoverage';
+import type { StoryDeckRepairPhase } from '@/components/novel-workspace/types';
 import { NovelTopBar } from '@/components/NovelTopBar';
 import { StageBar } from '@/components/StageBar';
 import { LocalLibraryRecovery } from '@/components/LocalLibraryRecovery';
@@ -73,7 +74,10 @@ export function NovelWorkspace({
     useState<KnowledgeFilterTab>('character');
   const [assistantStatus, setAssistantStatus] =
     useState<ChatStatus>('ready');
-  const [proposalAdjustRequest, setProposalAdjustRequest] = useState(0);
+  const [storyDeckRepairRequest, setStoryDeckRepairRequest] = useState(0);
+  const [repairPhase, setRepairPhase] =
+    useState<StoryDeckRepairPhase>('idle');
+  const assistantBusy = assistantStatus === 'submitted' || assistantStatus === 'streaming';
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
@@ -178,9 +182,23 @@ export function NovelWorkspace({
   }, [selectView, startManuscriptWriting]);
 
   const handleCompleteStoryDeck = useCallback(() => {
-    setProposalAdjustRequest(current => current + 1);
+    setActiveConvId(null);
     selectView('agent');
-  }, [selectView]);
+    // One repair at a time: while a request is queued or in flight, repeated
+    // activation only brings the user to the Assistant to watch — it must
+    // never enqueue a second repairStoryDeck turn.
+    if (assistantBusy || repairPhase === 'queued' || repairPhase === 'running') return;
+    setRepairPhase('queued');
+    setStoryDeckRepairRequest(current => current + 1);
+  }, [assistantBusy, repairPhase, selectView]);
+
+  const handleRepairPhaseChange = useCallback((
+    phase: 'running' | 'succeeded' | 'failed',
+  ) => {
+    // `succeeded` returns to idle: the normal onUpdate coverage refresh then
+    // decides whether the deck is complete and the recovery CTA disappears.
+    setRepairPhase(phase === 'succeeded' ? 'idle' : phase);
+  }, []);
 
   const showUnification = !!liveNovel
     && isInStages(liveNovel.stage, STAGES_THAT_SHOW_UNIFICATION_PANEL);
@@ -232,6 +250,7 @@ export function NovelWorkspace({
         onApprove={handleStartWriting}
         storyDeckComplete={deckComplete}
         onCompleteDeck={handleCompleteStoryDeck}
+        repairBusy={assistantBusy || repairPhase === 'queued' || repairPhase === 'running'}
         onReviewDeck={() => selectView('story-deck')}
         onDownloadBundle={downloadBundle}
         isStreaming={manuscript.isStreaming}
@@ -265,7 +284,9 @@ export function NovelWorkspace({
               onStartWriting={handleStartWriting}
               onReviewDeck={() => selectView('story-deck')}
               onCompleteDeck={handleCompleteStoryDeck}
-              proposalAdjustRequest={proposalAdjustRequest}
+              storyDeckRepairRequest={storyDeckRepairRequest}
+              repairPhase={repairPhase}
+              onRepairPhaseChange={handleRepairPhaseChange}
               initialCreativity={liveNovel?.settings?.creativity ?? null}
             />
           </div>
@@ -277,7 +298,10 @@ export function NovelWorkspace({
               onTabChange={setStoryDeckTab}
               refreshToken={panelRefreshToken}
               coverageCounts={deckCounts}
-              onReturnToAssistant={handleCompleteStoryDeck}
+              coverageLoading={deckLoading}
+              repairPhase={repairPhase}
+              assistantBusy={assistantBusy}
+              onCompleteDeck={handleCompleteStoryDeck}
               onEntriesMutated={refreshCoverage}
             />
           )}

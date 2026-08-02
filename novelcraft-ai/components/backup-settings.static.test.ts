@@ -7,10 +7,15 @@ describe('backup settings surface', () => {
     const source = readFileSync(join(process.cwd(), 'components', 'BackupSettings.tsx'), 'utf8');
     expect(source).toContain('await requestManuscriptFlush()');
     expect(source).toContain("fetch(`/api/novels/${novelId}/backup`");
-    expect(source).toContain("fetch('/api/novels')");
-    expect(source).toContain('await verifyBackupPackage(backupBytes)');
-    expect(source).toContain('buildLibraryBackupPackage(items)');
-    expect(source).toContain("`InkMarshal-library-${date}.zip`");
+    expect(source).toContain("fetch('/api/backups/library', { method: 'POST' })");
+    expect(source).not.toContain("from '@/lib/backup/verify'");
+    expect(source).not.toContain("from '@/lib/backup/build-library-package'");
+    const route = readFileSync(
+      join(process.cwd(), 'app', 'api', 'backups', 'library', 'route.ts'),
+      'utf8',
+    );
+    expect(route).toContain('await verifyBackupPackage(built.bytes)');
+    expect(route).toContain('buildLibraryBackupPackage(items)');
     expect(source).toContain("readLocalFile(['inkmarshal'])");
     expect(source).toContain("fetch('/api/backups/restore'");
     expect(source).toContain('router.push(`/novel/${restored.novelId}?view=read-edit`)');

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { NovelWorkspace } from '@/components/NovelWorkspace';
@@ -19,6 +19,18 @@ const mocks = vi.hoisted(() => ({
   patchNovelLocal: vi.fn(),
   toast: vi.fn(),
   flush: vi.fn(async (): Promise<{ ok: boolean }> => ({ ok: true })),
+  deckCoverage: {
+    counts: { character: 1, world: 1, outline: 1 },
+    complete: true,
+  },
+  agentPaneProps: null as {
+    activeConvId: string | null;
+    setActiveConvId: (id: string | null) => void;
+    storyDeckRepairRequest: number;
+    repairPhase: string;
+    onStatusChange: (status: 'submitted' | 'streaming' | 'ready' | 'error') => void;
+    onRepairPhaseChange: (phase: 'running' | 'succeeded' | 'failed') => void;
+  } | null,
   manuscriptNovel: {
     id: 'novel-a',
     title: 'Stale Manuscript Title',
@@ -106,8 +118,8 @@ vi.mock('@/lib/use-manuscript-session', () => ({
 }));
 vi.mock('@/components/novel-workspace/useStoryDeckCoverage', () => ({
   useStoryDeckCoverage: () => ({
-    counts: { character: 1, world: 1, outline: 1 },
-    complete: true,
+    counts: mocks.deckCoverage.counts,
+    complete: mocks.deckCoverage.complete,
     loading: false,
     panelRefreshToken: 7,
     refreshCoverage: mocks.refreshCoverage,
@@ -166,18 +178,40 @@ vi.mock('@/components/StageBar', () => ({
   StageBar: ({
     onApprove,
     onReviewDeck,
+    onCompleteDeck,
   }: {
     onApprove: () => void;
     onReviewDeck: () => void;
+    onCompleteDeck?: () => void;
   }) => (
     <div>
       <button type="button" onClick={onApprove}>Approve</button>
       <button type="button" onClick={onReviewDeck}>Review deck</button>
+      <button type="button" onClick={onCompleteDeck}>Complete deck</button>
     </div>
   ),
 }));
 vi.mock('@/components/novel-workspace/AgentWorkspacePane', () => ({
-  AgentWorkspacePane: () => <div data-testid="agent-pane">Agent pane</div>,
+  AgentWorkspacePane: (props: {
+    activeConvId: string | null;
+    setActiveConvId: (id: string | null) => void;
+    storyDeckRepairRequest: number;
+    repairPhase: string;
+    onStatusChange: (status: 'submitted' | 'streaming' | 'ready' | 'error') => void;
+    onRepairPhaseChange: (phase: 'running' | 'succeeded' | 'failed') => void;
+  }) => {
+    mocks.agentPaneProps = props;
+    return (
+      <div
+        data-testid="agent-pane"
+        data-repair-request={props.storyDeckRepairRequest}
+        data-repair-phase={props.repairPhase}
+        data-active-conversation={props.activeConvId ?? ''}
+      >
+        Agent pane
+      </div>
+    );
+  },
 }));
 vi.mock('@/components/novel-workspace/StoryDeckWorkspacePane', () => ({
   StoryDeckWorkspacePane: ({
@@ -202,6 +236,11 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   mocks.params = new URLSearchParams();
+  mocks.deckCoverage = {
+    counts: { character: 1, world: 1, outline: 1 },
+    complete: true,
+  };
+  mocks.agentPaneProps = null;
   mocks.manuscriptNovel = {
     id: 'novel-a',
     title: 'Stale Manuscript Title',
@@ -357,5 +396,87 @@ describe('NovelWorkspace mode orchestration', () => {
       expect(screen.getByTestId('active-view').textContent).toBe('agent');
     });
     expect(screen.queryByTestId('manuscript-pane')).toBeNull();
+  });
+});
+
+describe('NovelWorkspace Story Deck repair orchestration', () => {
+  function agentPane() {
+    return screen.getByTestId('agent-pane');
+  }
+
+  it('switches to the assistant and queues exactly one repair request', () => {
+    mocks.deckCoverage = {
+      counts: { character: 0, world: 0, outline: 0 },
+      complete: false,
+    };
+    render(<NovelWorkspace novelId="novel-a" initialView="story-deck" />);
+    expect(screen.getByTestId('active-view').textContent).toBe('story-deck');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Complete deck' }));
+
+    expect(screen.getByTestId('active-view').textContent).toBe('agent');
+    expect(agentPane().getAttribute('data-repair-request')).toBe('1');
+    expect(agentPane().getAttribute('data-repair-phase')).toBe('queued');
+  });
+
+  it('returns to the main Assistant thread before queuing a Story Deck repair', () => {
+    mocks.deckCoverage = {
+      counts: { character: 0, world: 0, outline: 0 },
+      complete: false,
+    };
+    render(<NovelWorkspace novelId="novel-a" initialView="story-deck" />);
+    act(() => mocks.agentPaneProps?.setActiveConvId('side-thread'));
+    expect(agentPane().getAttribute('data-active-conversation')).toBe('side-thread');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Complete deck' }));
+
+    expect(agentPane().getAttribute('data-active-conversation')).toBe('');
+    expect(agentPane().getAttribute('data-repair-request')).toBe('1');
+  });
+
+  it('never enqueues a duplicate repair while queued or running, retries after failure, and resets after success', () => {
+    mocks.deckCoverage = {
+      counts: { character: 0, world: 2, outline: 0 },
+      complete: false,
+    };
+    render(<NovelWorkspace novelId="novel-a" />);
+    const completeDeck = () => screen.getByRole('button', { name: 'Complete deck' });
+
+    fireEvent.click(completeDeck());
+    fireEvent.click(completeDeck());
+    expect(agentPane().getAttribute('data-repair-request')).toBe('1');
+
+    act(() => mocks.agentPaneProps?.onRepairPhaseChange('running'));
+    expect(agentPane().getAttribute('data-repair-phase')).toBe('running');
+    fireEvent.click(completeDeck());
+    expect(agentPane().getAttribute('data-repair-request')).toBe('1');
+
+    act(() => mocks.agentPaneProps?.onRepairPhaseChange('failed'));
+    expect(agentPane().getAttribute('data-repair-phase')).toBe('failed');
+    fireEvent.click(completeDeck());
+    expect(agentPane().getAttribute('data-repair-request')).toBe('2');
+    expect(agentPane().getAttribute('data-repair-phase')).toBe('queued');
+
+    act(() => mocks.agentPaneProps?.onRepairPhaseChange('succeeded'));
+    expect(agentPane().getAttribute('data-repair-phase')).toBe('idle');
+    fireEvent.click(completeDeck());
+    expect(agentPane().getAttribute('data-repair-request')).toBe('3');
+  });
+
+  it('does not enqueue recovery while another Assistant turn is active', () => {
+    mocks.deckCoverage = {
+      counts: { character: 0, world: 0, outline: 0 },
+      complete: false,
+    };
+    render(<NovelWorkspace novelId="novel-a" initialView="story-deck" />);
+
+    act(() => mocks.agentPaneProps?.onRepairPhaseChange('failed'));
+    act(() => mocks.agentPaneProps?.onStatusChange('streaming'));
+    fireEvent.click(screen.getByRole('button', { name: 'Complete deck' }));
+    expect(agentPane().getAttribute('data-repair-request')).toBe('0');
+
+    act(() => mocks.agentPaneProps?.onStatusChange('ready'));
+    fireEvent.click(screen.getByRole('button', { name: 'Complete deck' }));
+    expect(agentPane().getAttribute('data-repair-request')).toBe('1');
   });
 });

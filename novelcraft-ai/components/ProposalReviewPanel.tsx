@@ -5,7 +5,9 @@ import { AlertCircle } from 'lucide-react';
 import { ReadyCompletionCard, type ReadyRunDetails } from '@/components/ReadyCompletionCard';
 import { useCapabilityBinding } from '@/components/WritingModelStatusBar';
 import { useLanguage } from '@/components/LanguageProvider';
+import type { StoryDeckRepairPhase } from '@/components/novel-workspace/types';
 import { Button } from '@/components/ui/button';
+import { Spinner } from '@/components/ui/spinner';
 import type { Novel } from '@/lib/db-types';
 import { isOnDeviceRuntimeConnection } from '@/lib/model-supply/readiness';
 import { resolvePricing } from '@/lib/pricing';
@@ -32,6 +34,7 @@ export function ProposalReviewPanel({
   onReviewDeck,
   onAdjustProposal,
   onCompleteDeck,
+  repairPhase = 'idle',
   busy,
 }: {
   novel: Novel;
@@ -41,12 +44,14 @@ export function ProposalReviewPanel({
   onReviewDeck: () => void;
   onAdjustProposal: () => void;
   onCompleteDeck: () => void;
+  repairPhase?: StoryDeckRepairPhase;
   busy: boolean;
 }) {
   const { t, locale } = useLanguage();
   const planning = useCapabilityBinding('outline');
   const drafting = useCapabilityBinding('chapter');
   const complete = counts.character > 0 && counts.world > 0 && counts.outline > 0;
+  const repairBusy = repairPhase === 'queued' || repairPhase === 'running';
 
   if (!coverageLoading && !complete) {
     const missing = [
@@ -61,11 +66,26 @@ export function ProposalReviewPanel({
           <div className="min-w-0 flex-1">
             <h3 className="font-serif text-lg font-semibold text-book-ink-primary">{t.storyDeckIncompleteTitle}</h3>
             <p className="mt-1 text-sm leading-6 text-book-ink-secondary">
-              {t.storyDeckIncompleteDescription.replace('{missing}', missing.join(' · '))}
+              {repairPhase === 'failed'
+                ? t.storyDeckRepairFailed
+                : repairBusy
+                  ? t.storyDeckRepairRunning
+                  : t.storyDeckIncompleteDescription.replace('{missing}', missing.join(' · '))}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
-              <Button variant="ink" type="button" onClick={onCompleteDeck}>
-                {t.storyDeckCompleteAction}
+              <Button
+                variant="ink"
+                type="button"
+                onClick={onCompleteDeck}
+                disabled={repairBusy || busy}
+                aria-busy={repairBusy || busy || undefined}
+              >
+                {repairBusy ? <Spinner size="sm" /> : null}
+                {repairBusy
+                  ? t.storyDeckRepairRunning
+                  : repairPhase === 'failed'
+                    ? t.toastRetry
+                    : t.storyDeckCompleteAction}
               </Button>
               <Button variant="outline" type="button" onClick={onReviewDeck}>
                 {t.storyDeckReviewAction}

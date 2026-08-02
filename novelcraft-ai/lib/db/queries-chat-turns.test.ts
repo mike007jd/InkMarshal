@@ -20,6 +20,88 @@ afterAll(async () => {
 });
 
 describe('chat_turns persistence primitives', () => {
+  it('classifies only an unambiguous novel-scoped v0.1.5 Stop receipt', async () => {
+    const { createNovel, deleteNovelCascade } = await import('@/lib/db');
+    const { insertAiRun } = await import('@/lib/db/queries-ai-runs');
+    const { getDb } = await import('@/lib/db/connection');
+    const { countWords } = await import('@/lib/utils');
+    const {
+      beginChatTurn,
+      getChatTurn,
+      hasLegacyStoppedChatTurn,
+      hashChatTurnRequest,
+      persistChatTurnAssistantMessage,
+    } = await import('@/lib/db/queries-chat-turns');
+    const novel = await createNovel({ userId: 'local-user', title: 'Legacy Stop Scope' });
+    const otherNovel = await createNovel({ userId: 'local-user', title: 'Other Legacy Scope' });
+
+    const persistSucceeded = (userMessageId: string, assistantMessageId: string, text: string) => {
+      const claim = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({ content: userMessageId, mode: 'conversation' }),
+        assistantMessageId,
+      });
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected legacy test claim');
+      }
+      persistChatTurnAssistantMessage({
+        novelId: novel.id,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+        assistantMessageId,
+        responseText: text,
+      });
+      const turn = getChatTurn(novel.id, userMessageId);
+      if (!turn) throw new Error('Expected persisted legacy test turn');
+      return turn;
+    };
+
+    try {
+      const partial = 'A durable partial from the old conversation Stop path.';
+      let turn = persistSucceeded('legacy-user', 'legacy-assistant', partial);
+      const legacyAt = '2042-03-04T05:06:07.000Z';
+      getDb().prepare(
+        'UPDATE chat_turns SET updated_at = ? WHERE novel_id = ? AND user_message_id = ?',
+      ).run(legacyAt, novel.id, turn.userMessageId);
+      turn = getChatTurn(novel.id, turn.userMessageId) ?? turn;
+      insertAiRun({
+        novelId: otherNovel.id,
+        operation: 'chat',
+        outcome: 'cancelled',
+        generatedWords: countWords(partial),
+      });
+      expect(hasLegacyStoppedChatTurn(turn)).toBe(false);
+
+      const legacyRunId = insertAiRun({
+        operation: 'chat',
+        outcome: 'cancelled',
+        generatedWords: countWords(partial) + 4,
+      });
+      getDb().prepare('UPDATE ai_runs SET created_at = ? WHERE id = ?')
+        .run(legacyAt, legacyRunId);
+      expect(hasLegacyStoppedChatTurn(turn)).toBe(true);
+
+      const ambiguousRunId = insertAiRun({
+        operation: 'chat',
+        outcome: 'cancelled',
+        generatedWords: countWords(partial) + 8,
+      });
+      getDb().prepare('UPDATE ai_runs SET created_at = ? WHERE id = ?')
+        .run(legacyAt, ambiguousRunId);
+      expect(hasLegacyStoppedChatTurn(turn)).toBe(false);
+
+      const competing = persistSucceeded('competing-user', 'competing-assistant', 'Concurrent response');
+      getDb().prepare(
+        'UPDATE chat_turns SET updated_at = ? WHERE novel_id = ? AND user_message_id = ?',
+      ).run(legacyAt, novel.id, competing.userMessageId);
+      expect(hasLegacyStoppedChatTurn(turn)).toBe(false);
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+      await deleteNovelCascade(otherNovel.id, 'local-user');
+    }
+  });
+
   it('acquires via INSERT ON CONFLICT, rejects collisions, and reclaims failed turns', async () => {
     const { createNovel, deleteNovelCascade } = await import('@/lib/db');
     const {

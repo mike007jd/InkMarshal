@@ -23,6 +23,177 @@ type ExecutableTool = {
   execute(input: Record<string, unknown>, options?: unknown): Promise<unknown>;
 };
 
+describe('confirmed final-plan request detection', () => {
+  it('accepts the exact zh-CN QA turn and zh-TW / English equivalents', async () => {
+    const { isConfirmedFinalPlanRequest, isExplicitWritingApproval } = await import('@/lib/brainstorm-agent');
+
+    const zhCnQa = '确认这些条目，没有需要调整的地方，请生成最终故事框架。';
+    expect(isConfirmedFinalPlanRequest(zhCnQa)).toBe(true);
+    expect(isExplicitWritingApproval(zhCnQa)).toBe(false);
+
+    expect(isConfirmedFinalPlanRequest('確認這些條目，沒有需要調整的地方，請生成最終故事框架。')).toBe(true);
+    expect(isConfirmedFinalPlanRequest(
+      'Confirm these entries, nothing needs adjusting, please generate the final story framework.',
+    )).toBe(true);
+    expect(isConfirmedFinalPlanRequest(
+      'These entries look good. No changes needed. Please generate the final story plan.',
+    )).toBe(true);
+    expect(isConfirmedFinalPlanRequest(
+      '确认这些条目没问题，请生成最终故事框架',
+    )).toBe(true);
+  });
+
+  it('rejects questions, negation, deferred confirmation, plan changes, quoted UI, and ordinary turns', async () => {
+    const { isConfirmedFinalPlanRequest, isExplicitWritingApproval } = await import('@/lib/brainstorm-agent');
+
+    expect(isConfirmedFinalPlanRequest('确认这些条目，没有需要调整的地方吗？')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('什么时候可以生成最终故事框架？')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('我们可以生成最终故事框架了吗？')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('不要确认这些条目，请生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('还没确认这些条目，请生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('我明天可能确认这些条目并生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('I might confirm these entries and generate the final story framework tomorrow.')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('先调整条目，再生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('确认这些条目，但先改结局，请生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'Confirm these entries, but change the outline first, please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'The UI says, Confirm these entries. Nothing needs adjusting. Please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '界面显示，确认这些条目，没有需要调整的地方，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest('请生成最终故事框架。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('确认这些条目，没有需要调整的地方。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('写一个短篇悬疑故事：调查员林澈在雾港档案馆发现会自行改写的失踪索引。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('批准写作。请开始生成完整第一章。')).toBe(false);
+    expect(isConfirmedFinalPlanRequest('大纲无误，开始动笔')).toBe(false);
+    expect(isExplicitWritingApproval('大纲无误，开始动笔')).toBe(true);
+  });
+
+  it('rejects negated confirmation that still embeds positive substrings', async () => {
+    const { isConfirmedFinalPlanRequest } = await import('@/lib/brainstorm-agent');
+
+    expect(isConfirmedFinalPlanRequest(
+      '我无法确认这些条目，但请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我不确认这些条目，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '尚未确认这些条目，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我無法確認這些條目，但請生成最終故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I cannot confirm these entries, but please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      "I can't confirm these entries, but please generate the final story framework.",
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I can\u2019t confirm these entries, but please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I never confirm these entries, but please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我没有确认这些条目，但请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我並沒有確認這些條目，但請生成最終故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I am unable to confirm these entries, but please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I refuse to confirm these entries, but please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '这些条目不是没问题，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '确认这些条目，但我不想生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '确认这些条目，等我通知再生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '如果我确认这些条目，就请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'If I confirm these entries, please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'Confirm these entries, but do not generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '需要我确认这些条目，然后请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '确认这些条目，我只是想看看你会不会生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'Could you confirm these entries and generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我是在测试：确认这些条目，没有需要调整的地方，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '- [ ] Confirm these entries, nothing needs adjusting, please generate the final story framework.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我确认这些条目还需要调整，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我确认这些条目有问题，请生成最终故事框架。',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I confirm these entries are incorrect. Please generate the final story plan.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I have not decided; these entries look good, please generate the final story plan.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'I am undecided. These entries look good. Please generate the final story plan.',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      '我还没决定。这些条目没问题，请生成最终故事框架。',
+    )).toBe(false);
+  });
+
+  it('rejects quoted, code-block, translation, rewrite, and example/meta instruction variants', async () => {
+    const { isConfirmedFinalPlanRequest } = await import('@/lib/brainstorm-agent');
+    const qaZh = '确认这些条目，没有需要调整的地方，请生成最终故事框架。';
+    const qaTw = '確認這些條目，沒有需要調整的地方，請生成最終故事框架。';
+    const qaEn = 'Confirm these entries, nothing needs adjusting, please generate the final story framework.';
+
+    expect(isConfirmedFinalPlanRequest(`请把“${qaZh}”翻译成英文。`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`請把「${qaTw}」翻譯成英文。`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`Please translate "${qaEn}" into Chinese.`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`请改写下面这句话：${qaZh}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`請改寫下面這句話：${qaTw}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`Rewrite this as a clearer request: ${qaEn}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`例如：${qaZh}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`例如：${qaTw}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`For example: ${qaEn}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      `\`\`\`\n${qaEn}\n\`\`\`\nPlease explain this sample request.`,
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      `\`${qaZh}\` 出现在代码块里，请解释这个示例请求。`,
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(
+      'confirm these entries is shown in a code block and followed by a meta request',
+    )).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`请复述‘${qaZh}’`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`> ${qaZh}`)).toBe(false);
+    expect(isConfirmedFinalPlanRequest(`The document contains: ${qaEn}`)).toBe(false);
+  });
+});
+
 describe('explicit writing approval detection', () => {
   it('accepts clear zh-CN, zh-TW, and English approve-to-write phrasing', async () => {
     const { isExplicitWritingApproval } = await import('@/lib/brainstorm-agent');

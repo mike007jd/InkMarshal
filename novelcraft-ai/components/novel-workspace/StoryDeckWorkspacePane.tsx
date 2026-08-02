@@ -4,7 +4,7 @@ import { FileText, Globe, Users } from 'lucide-react';
 
 import { KnowledgePanel } from '@/components/knowledge/KnowledgePanel';
 import { useLanguage } from '@/components/LanguageProvider';
-import type { DeckCounts } from '@/components/novel-workspace/types';
+import type { DeckCounts, StoryDeckRepairPhase } from '@/components/novel-workspace/types';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import type { KnowledgeFilterTab } from '@/lib/knowledge-workspace';
 
@@ -14,7 +14,10 @@ export function StoryDeckWorkspacePane({
   onTabChange,
   refreshToken,
   coverageCounts,
-  onReturnToAssistant,
+  coverageLoading = false,
+  repairPhase = 'idle',
+  assistantBusy = false,
+  onCompleteDeck,
   onEntriesMutated,
 }: {
   novelId: string;
@@ -22,7 +25,10 @@ export function StoryDeckWorkspacePane({
   onTabChange: (tab: KnowledgeFilterTab) => void;
   refreshToken: number;
   coverageCounts: DeckCounts;
-  onReturnToAssistant: () => void;
+  coverageLoading?: boolean;
+  repairPhase?: StoryDeckRepairPhase;
+  assistantBusy?: boolean;
+  onCompleteDeck?: () => void;
   onEntriesMutated: () => void;
 }) {
   const { t } = useLanguage();
@@ -71,8 +77,10 @@ export function StoryDeckWorkspacePane({
           variant="deck"
           refreshToken={refreshToken}
           coverageCounts={coverageCounts}
-          onReturnToAssistant={onReturnToAssistant}
-          returnToAssistantLabel={t.storyDeckReturnAssistant}
+          coverageLoading={coverageLoading}
+          repairPhase={repairPhase}
+          assistantBusy={assistantBusy}
+          onCompleteDeck={onCompleteDeck}
           onEntriesMutated={onEntriesMutated}
         />
       </div>

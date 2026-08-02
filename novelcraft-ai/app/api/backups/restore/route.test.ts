@@ -71,4 +71,33 @@ describe('backup UI routes', () => {
     expect(response.status).toBe(422);
     expect(await db.getNovels('local-user')).toHaveLength(before.length);
   });
+
+  it('builds and verifies the whole library on the server', async () => {
+    const db = await import('@/lib/db');
+    const { LIBRARY_MANIFEST_PATH } = await import('@/lib/backup/build-library-package');
+    const { verifyBackupPackage } = await import('@/lib/backup/verify');
+    const { POST: exportLibrary } = await import('@/app/api/backups/library/route');
+    const { strFromU8, unzipSync } = await import('fflate');
+
+    const first = await db.createNovel({ userId: 'local-user', title: 'Library One' });
+    const second = await db.createNovel({ userId: 'local-user', title: 'Library Two' });
+    await db.upsertChapter(first.id, 1, 'One', 'First library chapter.');
+    await db.upsertChapter(second.id, 1, 'Two', 'Second library chapter.');
+
+    const response = await exportLibrary();
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Disposition')).toContain('InkMarshal-library-');
+    const expectedCount = (await db.getActiveNovels('local-user')).length;
+    expect(response.headers.get('X-InkMarshal-Novel-Count')).toBe(String(expectedCount));
+
+    const entries = unzipSync(new Uint8Array(await response.arrayBuffer()));
+    const manifest = JSON.parse(strFromU8(entries[LIBRARY_MANIFEST_PATH])) as {
+      novelCount: number;
+      novels: Array<{ path: string }>;
+    };
+    expect(manifest.novelCount).toBe(expectedCount);
+    for (const novel of manifest.novels) {
+      expect((await verifyBackupPackage(entries[novel.path])).ok).toBe(true);
+    }
+  });
 });

@@ -5,7 +5,10 @@ import { GitFork, ListPlus, X } from 'lucide-react';
 import { AssistantRuntimeProvider, useAuiState } from '@assistant-ui/react';
 import { FeatherIcon } from '@/components/Icons';
 import { NovelThread } from '@/components/assistant-ui/thread';
-import { useNovelChatRuntime } from '@/components/assistant-ui/useNovelChatRuntime';
+import {
+  stoppedPersistenceLabel,
+  useNovelChatRuntime,
+} from '@/components/assistant-ui/useNovelChatRuntime';
 import { useConversationExtract } from '@/components/conversations/useConversationExtract';
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button';
 import type { Conversation } from '@/lib/types/conversation';
@@ -78,10 +81,11 @@ export function ConversationThread({ novelId, conversationId }: ConversationThre
     onDegraded: () => toast(t.extractDegraded as string, 'info'),
   });
 
-  const { runtime, loading, errorMessage, retry } = useNovelChatRuntime({
+  const { runtime, loading, recovering, errorMessage, retry } = useNovelChatRuntime({
     novelId,
     conversationId,
     locale,
+    stoppedLabel: stoppedPersistenceLabel(locale),
     streamFailedLabel: t.errorSendFailed,
     requestFailedLabel: t.errorSendFailed,
     loadFailedLabel: t.errorLoadMessages,
@@ -175,6 +179,7 @@ export function ConversationThread({ novelId, conversationId }: ConversationThre
           <NovelThread
             placeholder={t.conversationInputPlaceholder}
             emptyState={emptyState}
+            composerSendDisabled={recovering}
             errorMessage={errorMessage}
             onRetry={() => void retry()}
             assistantActions={

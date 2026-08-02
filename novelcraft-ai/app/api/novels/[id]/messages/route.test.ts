@@ -211,6 +211,157 @@ describe('novel messages API', () => {
       });
 
       expect((await response.json()).map((message: { id: string }) => message.id)).toEqual([globalMessage.id]);
+      expect(response.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('missing');
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('reports the latest durable turn status for reload recovery', async () => {
+    const {
+      addMessageWithId,
+      beginChatTurn,
+      cancelChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { GET } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Turn Recovery Status' });
+
+    try {
+      const userMessageId = 'recovery-user';
+      const assistantMessageId = 'recovery-assistant';
+      await addMessageWithId(novel.id, userMessageId, 'user', 'continue');
+      const claim = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({ content: 'continue', mode: 'ordinary' }),
+        assistantMessageId,
+      });
+      expect(claim.kind).toBe('acquired');
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected an acquired recovery test turn');
+      }
+
+      const running = await GET(new Request(`http://localhost/api/novels/${novel.id}/messages`), {
+        params: Promise.resolve({ id: novel.id }),
+      });
+      expect(running.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('running');
+
+      const { getDb } = await import('@/lib/db/connection');
+      getDb().prepare(
+        'UPDATE chat_turns SET updated_at = ? WHERE novel_id = ? AND user_message_id = ?',
+      ).run('2000-01-01T00:00:00.000Z', novel.id, userMessageId);
+      const stale = await GET(new Request(`http://localhost/api/novels/${novel.id}/messages`), {
+        params: Promise.resolve({ id: novel.id }),
+      });
+      expect(stale.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('stale');
+
+      cancelChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+        responseText: 'partial',
+      });
+      await addMessageWithId(novel.id, assistantMessageId, 'assistant', 'partial');
+      const cancelled = await GET(new Request(`http://localhost/api/novels/${novel.id}/messages`), {
+        params: Promise.resolve({ id: novel.id }),
+      });
+      expect(cancelled.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('cancelled');
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('reports an exact pending claim before its user message is persisted', async () => {
+    const {
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { GET } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Pending Claim Status' });
+
+    try {
+      const userMessageId = 'claimed-before-user-persist';
+      const claim = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({ content: 'pending', mode: 'ordinary' }),
+        assistantMessageId: 'pending-assistant',
+      });
+      expect(claim.kind).toBe('acquired');
+
+      const response = await GET(new Request(
+        `http://localhost/api/novels/${novel.id}/messages?pendingTurnId=${userMessageId}`,
+      ), { params: Promise.resolve({ id: novel.id }) });
+
+      expect(await response.json()).toEqual([]);
+      expect(response.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('running');
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('recognizes a v0.1.5 unmarked conversation-style Stop from its cancelled usage receipt', async () => {
+    const {
+      addMessageWithId,
+      beginChatTurn,
+      createNovel,
+      deleteNovelCascade,
+      hashChatTurnRequest,
+    } = await import('@/lib/db');
+    const { insertAiRun } = await import('@/lib/db/queries-ai-runs');
+    const { persistChatTurnAssistantMessage } = await import('@/lib/db/queries-chat-turns');
+    const { countWords } = await import('@/lib/utils');
+    const { GET } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'Legacy Stop Recovery' });
+
+    try {
+      const userMessageId = 'legacy-stop-user';
+      const assistantMessageId = 'legacy-stop-assistant';
+      const partial = 'Legacy conversation partial without a visible Stop suffix.';
+      await addMessageWithId(novel.id, userMessageId, 'user', 'Write a long response');
+      const claim = beginChatTurn({
+        novelId: novel.id,
+        userMessageId,
+        requestHash: hashChatTurnRequest({
+          content: 'Write a long response',
+          mode: 'conversation',
+          conversationId: 'legacy-conversation',
+        }),
+        assistantMessageId,
+      });
+      if (claim.kind !== 'acquired' || !claim.turn.claimToken) {
+        throw new Error('Expected an acquired legacy Stop test turn');
+      }
+      expect(persistChatTurnAssistantMessage({
+        novelId: novel.id,
+        userMessageId,
+        claimToken: claim.turn.claimToken,
+        assistantMessageId,
+        responseText: partial,
+      })).toBeTruthy();
+      const runId = insertAiRun({
+        operation: 'chat',
+        outcome: 'cancelled',
+        // Core onFinish may have observed more text than the UI partial that
+        // v0.1.5 ultimately persisted.
+        generatedWords: countWords(partial) + 3,
+      });
+      const { getDb } = await import('@/lib/db/connection');
+      const legacyAt = '2041-02-03T04:05:06.000Z';
+      getDb().prepare('UPDATE ai_runs SET created_at = ? WHERE id = ?').run(legacyAt, runId);
+      getDb().prepare(
+        'UPDATE chat_turns SET updated_at = ? WHERE novel_id = ? AND user_message_id = ?',
+      ).run(legacyAt, novel.id, userMessageId);
+
+      const response = await GET(new Request(`http://localhost/api/novels/${novel.id}/messages`), {
+        params: Promise.resolve({ id: novel.id }),
+      });
+      expect(response.headers.get('X-InkMarshal-Chat-Turn-Status')).toBe('stopped');
     } finally {
       await deleteNovelCascade(novel.id, 'local-user');
     }
@@ -1106,6 +1257,183 @@ describe('novel messages API', () => {
     }
   });
 
+  it('finalizes from the exact zh-CN QA confirmation without calling the model', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions, 'model prose that must not appear');
+
+    const {
+      createNovel,
+      deleteNovelCascade,
+      getKnowledgeEntries,
+      getMessages,
+      getNovel,
+      updateNovel,
+    } = await import('@/lib/db');
+    const { consumeLatestBrainstormReceipt } = await import('@/lib/brainstorm-receipts');
+    const { deterministicAssistantMessageId, POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'QA Confirm Final Plan' });
+    const qaText = '确认这些条目，没有需要调整的地方，请生成最终故事框架。';
+    const userMessageId = 'qa-confirm-final-plan';
+
+    try {
+      await updateNovel(novel.id, {
+        genre: '悬疑',
+        storySummary: '调查员林澈在雾港档案馆发现会自行改写的失踪索引。',
+        characterSummary: '林澈保持理性，档案却开始抹去活人。',
+        arcSummary: '第一章把他困进索引改写规则。',
+      });
+      expect(await getKnowledgeEntries(novel.id)).toEqual([]);
+      expect((await getNovel(novel.id))?.stage).toBe('discovery_interview');
+
+      const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          language: 'zh-CN',
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            parts: [{ type: 'text', text: qaText }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      const body = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(streamOptions).toHaveLength(0);
+      expect(body).toContain('Story Deck 已补全');
+      expect(body).not.toContain('model prose');
+      expect(body).not.toContain('Approve & Begin Writing');
+      expect((await getNovel(novel.id))?.stage).toBe('ready_for_greenlight');
+
+      const entries = await getKnowledgeEntries(novel.id);
+      expect(entries.map(entry => entry.type).sort()).toEqual(['character', 'outline', 'world']);
+      expect(entries.some(entry => entry.summary.includes('林澈') || entry.summary.includes('雾港'))).toBe(true);
+
+      const messages = await getMessages(novel.id);
+      expect(messages.map(message => ({ id: message.id, role: message.role }))).toEqual([
+        { id: userMessageId, role: 'user' },
+        { id: deterministicAssistantMessageId(userMessageId), role: 'assistant' },
+      ]);
+      const receipt = consumeLatestBrainstormReceipt(novel.id);
+      expect(receipt).not.toBeNull();
+      expect(consumeLatestBrainstormReceipt(novel.id)).toBeNull();
+
+      const retry = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          language: 'zh-CN',
+          messages: [{
+            id: userMessageId,
+            role: 'user',
+            metadata: { persisted: true, conversationId: null },
+            parts: [{ type: 'text', text: qaText }],
+          }],
+        }),
+      }), { params: Promise.resolve({ id: novel.id }) });
+      const retryBody = await retry.text();
+
+      expect(retry.status).toBe(200);
+      expect(streamOptions).toHaveLength(0);
+      expect(retryBody).toContain('Story Deck 已补全');
+      expect(await getKnowledgeEntries(novel.id)).toHaveLength(entries.length);
+      expect((await getMessages(novel.id)).map(message => message.role)).toEqual(['user', 'assistant']);
+      expect(consumeLatestBrainstormReceipt(novel.id)).toBeNull();
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
+  it('does not force Story Deck finalization on false-positive confirmation phrasing', async () => {
+    mockUsage();
+    mockContext();
+    const streamOptions: unknown[] = [];
+    mockCapturedStream(streamOptions);
+
+    const { createNovel, deleteNovelCascade, getKnowledgeEntries, getNovel, updateNovel } = await import('@/lib/db');
+    const { POST } = await import('./route');
+    const novel = await createNovel({ userId: 'local-user', title: 'False Positive Confirm' });
+    const qaZh = '确认这些条目，没有需要调整的地方，请生成最终故事框架。';
+    const qaEn = 'Confirm these entries, nothing needs adjusting, please generate the final story framework.';
+
+    try {
+      await updateNovel(novel.id, {
+        genre: 'Mystery',
+        storySummary: 'An investigator finds a self-rewriting index.',
+        characterSummary: 'Lin Che stays rational.',
+        arcSummary: 'Chapter one traps him inside the rewrite rule.',
+      });
+
+      for (const text of [
+        '确认这些条目，没有需要调整的地方吗？',
+        '不要确认这些条目，请生成最终故事框架。',
+        '我明天可能确认这些条目并生成最终故事框架。',
+        '先调整条目，再生成最终故事框架。',
+        '界面显示，确认这些条目，没有需要调整的地方，请生成最终故事框架。',
+        '请生成最终故事框架。',
+        '写一个短篇悬疑故事：调查员林澈在雾港档案馆发现会自行改写的失踪索引。',
+        '我无法确认这些条目，但请生成最终故事框架。',
+        '我不确认这些条目，请生成最终故事框架。',
+        '尚未确认这些条目，请生成最终故事框架。',
+        'I cannot confirm these entries, but please generate the final story framework.',
+        "I can't confirm these entries, but please generate the final story framework.",
+        'I can\u2019t confirm these entries, but please generate the final story framework.',
+        'I never confirm these entries, but please generate the final story framework.',
+        '我没有确认这些条目，但请生成最终故事框架。',
+        '我並沒有確認這些條目，但請生成最終故事框架。',
+        'I am unable to confirm these entries, but please generate the final story framework.',
+        'I refuse to confirm these entries, but please generate the final story framework.',
+        '这些条目不是没问题，请生成最终故事框架。',
+        '确认这些条目，但我不想生成最终故事框架。',
+        '确认这些条目，等我通知再生成最终故事框架。',
+        '如果我确认这些条目，就请生成最终故事框架。',
+        'If I confirm these entries, please generate the final story framework.',
+        'Confirm these entries, but do not generate the final story framework.',
+        '需要我确认这些条目，然后请生成最终故事框架。',
+        '确认这些条目，我只是想看看你会不会生成最终故事框架。',
+        'Could you confirm these entries and generate the final story framework.',
+        '我是在测试：确认这些条目，没有需要调整的地方，请生成最终故事框架。',
+        '- [ ] Confirm these entries, nothing needs adjusting, please generate the final story framework.',
+        '我确认这些条目还需要调整，请生成最终故事框架。',
+        '我确认这些条目有问题，请生成最终故事框架。',
+        'I confirm these entries are incorrect. Please generate the final story plan.',
+        'I have not decided; these entries look good, please generate the final story plan.',
+        'I am undecided. These entries look good. Please generate the final story plan.',
+        '我还没决定。这些条目没问题，请生成最终故事框架。',
+        `请把“${qaZh}”翻译成英文。`,
+        `Please translate "${qaEn}" into Chinese.`,
+        `请改写下面这句话：${qaZh}`,
+        `Rewrite this as a clearer request: ${qaEn}`,
+        `例如：${qaZh}`,
+        `For example: ${qaEn}`,
+        `\`\`\`\n${qaEn}\n\`\`\`\nPlease explain this sample request.`,
+        'confirm these entries is shown in a code block and followed by a meta request',
+        `请复述‘${qaZh}’`,
+        `> ${qaZh}`,
+        `The document contains: ${qaEn}`,
+      ]) {
+        streamOptions.length = 0;
+        const response = await POST(new Request(`http://localhost/api/novels/${novel.id}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            language: 'zh-CN',
+            messages: [{ id: crypto.randomUUID(), role: 'user', parts: [{ type: 'text', text }] }],
+          }),
+        }), { params: Promise.resolve({ id: novel.id }) });
+        await response.text();
+        expect(streamOptions, text).toHaveLength(1);
+        expect((await getNovel(novel.id))?.stage, text).toBe('discovery_interview');
+        expect(await getKnowledgeEntries(novel.id), text).toEqual([]);
+      }
+    } finally {
+      await deleteNovelCascade(novel.id, 'local-user');
+    }
+  });
+
   it('does not duplicate an already-persisted autostart user turn in model history', async () => {
     mockUsage();
     mockContext();
@@ -1901,7 +2229,7 @@ describe('novel messages API', () => {
       await response.text();
 
       expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
-        status: 'succeeded',
+        status: 'cancelled',
         responseText: 'partial reply\n\nStopped',
       });
       expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([
@@ -1981,7 +2309,7 @@ describe('novel messages API', () => {
       await response.text();
 
       expect(getChatTurn(novel.id, userMessageId)).toMatchObject({
-        status: 'succeeded',
+        status: 'cancelled',
         responseText: 'partial reply\n\nStopped',
       });
       expect((await getMessages(novel.id)).map(m => ({ id: m.id, role: m.role, content: m.content }))).toEqual([

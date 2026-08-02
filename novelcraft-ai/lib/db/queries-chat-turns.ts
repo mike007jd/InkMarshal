@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getDb } from '@/lib/db/connection';
 import { mapMessage, type Message } from '@/lib/db-types';
 import { touchNovelUpdatedAt } from '@/lib/db/transactions';
-import { nowIso } from '@/lib/utils';
+import { countWords, nowIso } from '@/lib/utils';
 
 const CHAT_TURN_STATUSES = [
   'running',
@@ -219,6 +219,51 @@ export function getChatTurn(
     )
     .get(novelId, userMessageId) as ChatTurnRow | undefined;
   return row ? mapChatTurn(row) : null;
+}
+
+/**
+ * Read-compatible classifier for v0.1.5 Stop partials. That release completed
+ * the turn receipt as `succeeded`, but its append-only AI run was correctly
+ * settled as `cancelled`. Old ledger rows have no turn id, so classify only
+ * when one cancelled run fits the terminal window and there is
+ * no competing chat turn or successful run in that window. Ambiguity stays a
+ * normal success rather than risking a destructive false-positive Retry. The
+ * NULL novel scope is required for rows written by the published v0.1.5 routes.
+ */
+export function hasLegacyStoppedChatTurn(turn: ChatTurn): boolean {
+  if (turn.status !== 'succeeded' || !turn.responseText?.trim()) return false;
+  const updatedAtMs = Date.parse(turn.updatedAt);
+  if (!Number.isFinite(updatedAtMs)) return false;
+  const toleranceMs = 1_000;
+  const from = new Date(updatedAtMs - toleranceMs).toISOString();
+  const to = new Date(updatedAtMs + toleranceMs).toISOString();
+  const db = getDb();
+  const runs = db.prepare(
+    `SELECT outcome, generated_words
+       FROM ai_runs
+      WHERE (novel_id = ? OR novel_id IS NULL)
+        AND operation = 'chat'
+        AND created_at BETWEEN ? AND ?
+      LIMIT 3`,
+  ).all(turn.novelId, from, to) as Array<{
+    outcome: string | null;
+    generated_words: number | null;
+  }>;
+  const responseWords = countWords(turn.responseText);
+  const cancelled = runs.filter(run =>
+    run.outcome === 'cancelled'
+    && run.generated_words !== null
+    && run.generated_words >= responseWords,
+  );
+  if (runs.length !== 1 || cancelled.length !== 1) return false;
+  const competingTurn = db.prepare(
+    `SELECT 1
+       FROM chat_turns
+      WHERE NOT (novel_id = ? AND user_message_id = ?)
+        AND updated_at BETWEEN ? AND ?
+      LIMIT 1`,
+  ).get(turn.novelId, turn.userMessageId, from, to);
+  return !competingTurn;
 }
 
 /**
@@ -454,13 +499,14 @@ export function cancelChatTurn(args: {
  * fenced transaction. A reclaimed worker can neither win the message id nor
  * stamp the newer generation complete.
  */
-export function persistChatTurnAssistantMessage(args: {
+function persistTerminalChatTurnAssistantMessage(args: {
   novelId: string;
   userMessageId: string;
   claimToken: string;
   assistantMessageId: string;
   responseText: string;
   conversationId?: string | null;
+  terminalStatus: 'succeeded' | 'cancelled';
 }): Message | null {
   const db = getDb();
   const now = nowIso();
@@ -508,13 +554,14 @@ export function persistChatTurnAssistantMessage(args: {
 
     const completed = db.prepare(
       `UPDATE chat_turns
-          SET status = 'succeeded',
+          SET status = ?,
               response_text = ?,
               error_code = NULL,
               updated_at = ?
         WHERE novel_id = ? AND user_message_id = ?
           AND status = 'running' AND error_code = ?`,
     ).run(
+      args.terminalStatus,
       args.responseText,
       now,
       args.novelId,
@@ -556,6 +603,29 @@ export function persistChatTurnAssistantMessage(args: {
       created_at: row.created_at as string,
     });
   })();
+}
+
+export function persistChatTurnAssistantMessage(args: {
+  novelId: string;
+  userMessageId: string;
+  claimToken: string;
+  assistantMessageId: string;
+  responseText: string;
+  conversationId?: string | null;
+}): Message | null {
+  return persistTerminalChatTurnAssistantMessage({ ...args, terminalStatus: 'succeeded' });
+}
+
+/** Persist a visible Stop partial and its cancelled receipt atomically. */
+export function persistChatTurnStoppedAssistantMessage(args: {
+  novelId: string;
+  userMessageId: string;
+  claimToken: string;
+  assistantMessageId: string;
+  responseText: string;
+  conversationId?: string | null;
+}): Message | null {
+  return persistTerminalChatTurnAssistantMessage({ ...args, terminalStatus: 'cancelled' });
 }
 
 /**

@@ -31,6 +31,7 @@ import { type Locale } from '@/lib/i18n';
 import { START_WRITING_EVENTS } from '@/lib/start-writing-logging';
 import { countWords } from '@/lib/utils';
 import { createAIUsageSession, type AIUsageSession } from '@/lib/ai-usage';
+import { postGenerationAbortSignal } from '@/lib/ai/timeout-signal';
 
 // Trigger a volume summary once we accumulate enough chapters + words past the
 // last summary boundary. The thresholds keep early novels (<=100k words) on
@@ -48,6 +49,7 @@ interface PostChapterArgsBase {
   systemPrompt: string;
   chapterNumber: number;
   log: (event: string, fields?: Record<string, string | number | boolean | undefined>) => void;
+  postGenerationTimeoutMs?: number;
 }
 
 interface RunSummarizeArgs extends PostChapterArgsBase {
@@ -77,6 +79,7 @@ export async function runSummarize(args: RunSummarizeArgs): Promise<{
     }
   };
   try {
+    const stepSignal = postGenerationAbortSignal(args.signal, args.postGenerationTimeoutMs);
     usage.addPromptText(args.chapterContent.slice(0, 4000));
     const result = await summarizeChapter({
       model: usage.model,
@@ -85,11 +88,11 @@ export async function runSummarize(args: RunSummarizeArgs): Promise<{
       blueprint: args.plan,
       language: args.language,
       systemPrompt: args.systemPrompt,
-      signal: args.signal,
+      signal: stepSignal,
     });
     usage.addPartialOutput(result.result.summary);
-    if (args.signal?.aborted) {
-      throw new Error('summarize cancelled');
+    if (stepSignal.aborted) {
+      throw new Error(args.signal?.aborted ? 'summarize cancelled' : 'summarize timed out');
     }
     const recordUsage = async () => {
       try {
@@ -152,6 +155,7 @@ export async function runValidate(args: RunValidateArgs): Promise<{
     }
   };
   try {
+    const stepSignal = postGenerationAbortSignal(args.signal, args.postGenerationTimeoutMs);
     usage.addPromptText(args.chapterContent.slice(0, 4000));
     const result = await validateChapter({
       model: usage.model,
@@ -162,11 +166,11 @@ export async function runValidate(args: RunValidateArgs): Promise<{
       targetWords: args.targetWords,
       language: args.language,
       systemPrompt: args.systemPrompt,
-      signal: args.signal,
+      signal: stepSignal,
     });
     usage.addPartialOutput(JSON.stringify(result.result));
-    if (args.signal?.aborted) {
-      throw new Error('validate cancelled');
+    if (stepSignal.aborted) {
+      throw new Error(args.signal?.aborted ? 'validate cancelled' : 'validate timed out');
     }
     const recordUsage = async () => {
       try {
@@ -229,6 +233,7 @@ export async function runRalphRevision(args: RunRalphRevisionArgs): Promise<{
     }
   };
   try {
+    const stepSignal = postGenerationAbortSignal(args.signal, args.postGenerationTimeoutMs);
     usage.addPromptText(args.revisionBrief);
     usage.addPromptText(args.chapterContent.slice(0, 6000));
     const result = await reviseChapterForRalphLoop({
@@ -240,11 +245,11 @@ export async function runRalphRevision(args: RunRalphRevisionArgs): Promise<{
       revisionBrief: args.revisionBrief,
       language: args.language,
       systemPrompt: args.systemPrompt,
-      signal: args.signal,
+      signal: stepSignal,
     });
     usage.addPartialOutput(result.text.slice(0, 4000));
-    if (args.signal?.aborted) {
-      throw new Error('ralph revision cancelled');
+    if (stepSignal.aborted) {
+      throw new Error(args.signal?.aborted ? 'ralph revision cancelled' : 'ralph revision timed out');
     }
     const recordUsage = async () => {
       try {
@@ -382,6 +387,7 @@ interface VolumeSummaryArgs {
   language: Locale;
   signal?: AbortSignal;
   log: (event: string, fields?: Record<string, string | number | boolean | undefined>) => void;
+  postGenerationTimeoutMs?: number;
 }
 
 export async function maybeRunVolumeSummary(args: VolumeSummaryArgs): Promise<void> {
@@ -431,6 +437,7 @@ export async function maybeRunVolumeSummary(args: VolumeSummaryArgs): Promise<vo
   };
 
   try {
+    const stepSignal = postGenerationAbortSignal(args.signal, args.postGenerationTimeoutMs);
     usage.addPromptText(args.systemPrompt);
     const result = await summarizeVolume({
       model: usage.model,
@@ -441,11 +448,12 @@ export async function maybeRunVolumeSummary(args: VolumeSummaryArgs): Promise<vo
       })),
       language: args.language,
       systemPrompt: args.systemPrompt,
-      signal: args.signal,
+      signal: stepSignal,
     });
     usage.addPartialOutput(result.result.summary);
-    if (args.signal?.aborted) {
-      await cancelUsageOnce();
+    if (stepSignal.aborted) {
+      if (args.signal?.aborted) await cancelUsageOnce();
+      else await failUsageOnce();
       return;
     }
     await appendVolumeSummary(args.novelId, result.result);

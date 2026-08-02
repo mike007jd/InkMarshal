@@ -118,9 +118,31 @@ describe('StageBar stage surface contract', () => {
       .querySelector('[aria-current="step"]');
     expect(currentStep?.textContent).toContain('Story Ready');
     expect(screen.queryByRole('button', { name: /Approve & Begin Writing/ })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /Complete Story Deck/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Complete Story Deck with Assistant' }));
     expect(onCompleteDeck).toHaveBeenCalledOnce();
     expect(onApprove).not.toHaveBeenCalled();
+  });
+
+  it('disables the repair action and announces the running state while a repair is in flight', () => {
+    const onCompleteDeck = vi.fn();
+    render(
+      <LocaleProvider>
+        <StageBar
+          stage="ready_for_greenlight"
+          storyDeckComplete={false}
+          onCompleteDeck={onCompleteDeck}
+          repairBusy
+        />
+      </LocaleProvider>,
+    );
+
+    const action = screen.getByRole('button', {
+      name: 'Assistant is completing the Story Deck…',
+    });
+    expect(action).toHaveProperty('disabled', true);
+    expect(action.getAttribute('aria-busy')).toBe('true');
+    fireEvent.click(action);
+    expect(onCompleteDeck).not.toHaveBeenCalled();
   });
 
   it('keeps the narrow-window step disclosure keyboard-reachable with aria state', () => {
