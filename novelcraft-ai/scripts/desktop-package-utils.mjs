@@ -11,6 +11,10 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 
+function isForbiddenMacMetadataEntry(name) {
+  return name === '.DS_Store' || name === '__MACOSX' || name.startsWith('._');
+}
+
 export function readPackageIdentity(packageDir) {
   const manifestPath = path.join(packageDir, 'package.json');
   if (!existsSync(manifestPath)) {
@@ -66,6 +70,7 @@ export function copyDereferenced(source, target, options = {}) {
   if (stat.isDirectory()) {
     mkdirSync(target, { recursive: true });
     for (const entry of readdirSync(source)) {
+      if (isForbiddenMacMetadataEntry(entry)) continue;
       copyDereferenced(path.join(source, entry), path.join(target, entry), options);
     }
     return;

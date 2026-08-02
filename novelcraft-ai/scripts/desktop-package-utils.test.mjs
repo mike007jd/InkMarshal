@@ -121,6 +121,26 @@ describe('desktop pnpm package hydration', () => {
     expect(existsSync(path.join(target, 'index.js'))).toBe(true);
   });
 
+  it('excludes Finder and AppleDouble metadata from the packaged runtime', () => {
+    const root = fixtureRoot();
+    const source = path.join(root, 'standalone');
+    const target = path.join(root, 'copied-runtime');
+    mkdirSync(path.join(source, 'nested'), { recursive: true });
+    mkdirSync(path.join(source, '__MACOSX'), { recursive: true });
+    writeFileSync(path.join(source, 'server.js'), 'module.exports = true;\n');
+    writeFileSync(path.join(source, '.DS_Store'), 'finder metadata');
+    writeFileSync(path.join(source, '._server.js'), 'appledouble metadata');
+    writeFileSync(path.join(source, 'nested', '.DS_Store'), 'finder metadata');
+
+    copyDereferenced(source, target, { projectRoot: root });
+
+    expect(existsSync(path.join(target, 'server.js'))).toBe(true);
+    expect(existsSync(path.join(target, '.DS_Store'))).toBe(false);
+    expect(existsSync(path.join(target, '._server.js'))).toBe(false);
+    expect(existsSync(path.join(target, '__MACOSX'))).toBe(false);
+    expect(existsSync(path.join(target, 'nested', '.DS_Store'))).toBe(false);
+  });
+
   it('synthesizes an absent top-level runtime dependency from the exact parent graph', () => {
     const root = fixtureRoot();
     const nextSource = packageDir(root, 'next', '16.2.6', {
