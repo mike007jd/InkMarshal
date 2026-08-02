@@ -23,6 +23,9 @@ import {
   SCHEMA_20_DDL,
   SCHEMA_20_VERSION,
   SCHEMA_21_CHAT_TURNS_DDL,
+  SCHEMA_21_DDL,
+  SCHEMA_21_VERSION,
+  SCHEMA_22_MIRROR_CONTENT_HASH_DDL,
   currentSchemaSql,
 } from '@/lib/db/schema';
 
@@ -189,6 +192,7 @@ let cachedPublished18Fingerprint: SchemaFingerprint | null = null;
 let cachedLegacy1Fingerprint: SchemaFingerprint | null = null;
 let cachedPublished19Fingerprint: SchemaFingerprint | null = null;
 let cachedSchema20Fingerprint: SchemaFingerprint | null = null;
+let cachedSchema21Fingerprint: SchemaFingerprint | null = null;
 let cachedKnownLegacyReviewItemsFingerprint: SchemaFingerprint | null = null;
 let cachedKnownLegacyReviewItemsSqlOracle: ReturnType<typeof computeSqliteSchemaSqlOracle> | null = null;
 let cachedCurrentFingerprint: SchemaFingerprint | null = null;
@@ -227,6 +231,15 @@ export function schema20Fingerprint(): SchemaFingerprint {
     'current_epoch_v20',
   );
   return cachedSchema20Fingerprint;
+}
+
+export function schema21Fingerprint(): SchemaFingerprint {
+  cachedSchema21Fingerprint ??= buildReferenceFingerprint(
+    SCHEMA_21_DDL,
+    SCHEMA_21_VERSION,
+    'current_epoch_v21',
+  );
+  return cachedSchema21Fingerprint;
 }
 
 export function knownLegacyReviewItemsFingerprint(): SchemaFingerprint {
@@ -321,11 +334,12 @@ export function assertCurrentSchema(db: Database.Database): void {
 
 export type SchemaOpenPlan =
   | 'current'
-  | 'schema18_to_21'
-  | 'misstamped1_to_21'
-  | 'schema19_to_21'
-  | 'schema20_to_21'
-  | 'known_legacy_review_items_to_21';
+  | 'schema18_to_22'
+  | 'misstamped1_to_22'
+  | 'schema19_to_22'
+  | 'schema20_to_22'
+  | 'schema21_to_22'
+  | 'known_legacy_review_items_to_22';
 
 /**
  * Read-only classification for an existing database. Throws without mutating
@@ -379,7 +393,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'the obsolete review_items table contains data and cannot be discarded automatically.',
       );
     }
-    return 'known_legacy_review_items_to_21';
+    return 'known_legacy_review_items_to_22';
   }
 
   if (markers.length !== 1) {
@@ -408,7 +422,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 18 structural fingerprint does not match the published v0.1.0/v0.1.1 shape.',
       );
     }
-    return 'schema18_to_21';
+    return 'schema18_to_22';
   }
 
   if (version === MISSTAMPED_CURRENT_SHAPE_VERSION) {
@@ -417,7 +431,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 1 structural fingerprint is not the already-distributed legacy outbox shape.',
       );
     }
-    return 'misstamped1_to_21';
+    return 'misstamped1_to_22';
   }
 
   if (version === PUBLISHED_SCHEMA_19_VERSION) {
@@ -426,7 +440,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 19 structural fingerprint does not match the exact pre-lifecycle shape.',
       );
     }
-    return 'schema19_to_21';
+    return 'schema19_to_22';
   }
 
   if (version === SCHEMA_20_VERSION) {
@@ -435,7 +449,16 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
         'schema 20 structural fingerprint does not match the exact pre-chat-turns shape.',
       );
     }
-    return 'schema20_to_21';
+    return 'schema20_to_22';
+  }
+
+  if (version === SCHEMA_21_VERSION) {
+    if (!fingerprintsMatch(actual, schema21Fingerprint())) {
+      throw new IncompatibleDatabaseSchemaError(
+        'schema 21 structural fingerprint does not match the exact pre-mirror-hash shape.',
+      );
+    }
+    return 'schema21_to_22';
   }
 
   throw new IncompatibleDatabaseSchemaError(
@@ -443,6 +466,7 @@ export function inspectSchemaOpenPlan(db: Database.Database): SchemaOpenPlan {
       `mis-stamped legacy-outbox schema ${MISSTAMPED_CURRENT_SHAPE_VERSION}, ` +
       `exact schema ${PUBLISHED_SCHEMA_19_VERSION}, ` +
       `exact schema ${SCHEMA_20_VERSION}, ` +
+      `exact schema ${SCHEMA_21_VERSION}, ` +
       `the known dual-marker review_items legacy shape, ` +
       `or current schema ${CURRENT_SCHEMA_VERSION} can be opened.`,
   );
@@ -456,7 +480,7 @@ function applyPromotion(
   try {
     db.exec('BEGIN IMMEDIATE');
     transactionOpen = true;
-    if (kind === 'known_legacy_review_items_to_21') {
+    if (kind === 'known_legacy_review_items_to_22') {
       const revalidatedKind = inspectSchemaOpenPlan(db);
       if (revalidatedKind !== kind) {
         throw new IncompatibleDatabaseSchemaError(
@@ -464,31 +488,38 @@ function applyPromotion(
         );
       }
     }
-    if (kind === 'schema18_to_21') {
+    if (kind === 'schema18_to_22') {
       db.exec(SCHEMA_19_OUTBOX_DDL);
       db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
       db.exec(SCHEMA_21_CHAT_TURNS_DDL);
-    } else if (kind === 'known_legacy_review_items_to_21') {
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
+    } else if (kind === 'known_legacy_review_items_to_22') {
       db.exec(SCHEMA_19_OUTBOX_DDL);
       db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
       db.exec(SCHEMA_21_CHAT_TURNS_DDL);
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
       // Obsolete feature table: no current owner. Drop only after additive
       // structures land in the same transaction.
       db.exec('DROP TABLE IF EXISTS review_items');
-    } else if (kind === 'misstamped1_to_21') {
+    } else if (kind === 'misstamped1_to_22') {
       db.exec(SCHEMA_19_OUTBOX_STATUS_PROMOTION_DDL);
       db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
       db.exec(SCHEMA_21_CHAT_TURNS_DDL);
-    } else if (kind === 'schema19_to_21') {
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
+    } else if (kind === 'schema19_to_22') {
       db.exec(SCHEMA_20_CHAPTER_PROCESSING_STATUS_DDL);
       db.exec(SCHEMA_21_CHAT_TURNS_DDL);
-    } else {
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
+    } else if (kind === 'schema20_to_22') {
       db.exec(SCHEMA_21_CHAT_TURNS_DDL);
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
+    } else {
+      db.exec(SCHEMA_22_MIRROR_CONTENT_HASH_DDL);
     }
     stampSchemaVersion(
       db,
       CURRENT_SCHEMA_DESCRIPTION,
-      kind === 'known_legacy_review_items_to_21',
+      kind === 'known_legacy_review_items_to_22',
     );
     db.exec('COMMIT');
     transactionOpen = false;
@@ -501,20 +532,22 @@ function applyPromotion(
 }
 
 function fromVersionForPlan(kind: Exclude<SchemaOpenPlan, 'current'>): number {
-  if (kind === 'schema18_to_21' || kind === 'known_legacy_review_items_to_21') {
+  if (kind === 'schema18_to_22' || kind === 'known_legacy_review_items_to_22') {
     return PUBLISHED_SCHEMA_18_VERSION;
   }
-  if (kind === 'misstamped1_to_21') return MISSTAMPED_CURRENT_SHAPE_VERSION;
-  if (kind === 'schema19_to_21') return PUBLISHED_SCHEMA_19_VERSION;
-  return SCHEMA_20_VERSION;
+  if (kind === 'misstamped1_to_22') return MISSTAMPED_CURRENT_SHAPE_VERSION;
+  if (kind === 'schema19_to_22') return PUBLISHED_SCHEMA_19_VERSION;
+  if (kind === 'schema20_to_22') return SCHEMA_20_VERSION;
+  return SCHEMA_21_VERSION;
 }
 
 /**
  * Validate an existing nonempty database and, when it is an exact published
  * schema 18, exact known dual-marker review_items legacy shape, exact legacy
- * schema-1 outbox, exact schema 19, or exact schema 20 database, promote it
- * transactionally to schema 21. Unknown legacy shapes and future versions fail
- * closed. Never reinterprets speculative intermediate versions.
+ * schema-1 outbox, exact schema 19, exact schema 20, or exact schema 21
+ * database, promote it transactionally to schema 22. Unknown legacy shapes and
+ * future versions fail closed. Never reinterprets speculative intermediate
+ * versions.
  */
 export function ensureCurrentSchema(
   db: Database.Database,

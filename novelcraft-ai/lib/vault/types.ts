@@ -27,6 +27,11 @@ export interface VaultIndexRow {
   data: Record<string, unknown>;
   outgoingLinks: OutgoingLink[];
   contentHash: string;
+  /**
+   * SHA-256 of the last observed/written Vault Markdown bytes.
+   * Null/empty means unknown baseline — refuse replacing divergent existing files.
+   */
+  mirrorContentHash: string | null;
   updatedAt: string; // ISO-8601
 }
 

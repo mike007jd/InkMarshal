@@ -24,6 +24,7 @@ import {
   publishedSchema19Fingerprint,
   currentSchemaFingerprint,
   schema20Fingerprint,
+  schema21Fingerprint,
 } from '@/lib/db/migrations';
 import {
   computeSchemaFingerprint,
@@ -49,6 +50,9 @@ import {
   SCHEMA_20_DDL,
   SCHEMA_20_VERSION,
   SCHEMA_21_CHAT_TURNS_DDL,
+  SCHEMA_21_DDL,
+  SCHEMA_21_VERSION,
+  SCHEMA_22_MIRROR_CONTENT_HASH_DDL,
   currentSchemaSql,
 } from '@/lib/db/schema';
 
@@ -128,6 +132,16 @@ function seedSchema20(db: Database.Database): void {
   stampVersion(db, SCHEMA_20_VERSION, 'current_epoch_v20');
 }
 
+/** Exact schema-21 shape (chat_turns present; no mirror_content_hash). */
+function seedSchema21(db: Database.Database): void {
+  expect(SCHEMA_21_DDL).toContain('chat_turns');
+  expect(SCHEMA_21_DDL).not.toContain('mirror_content_hash');
+  expect(SCHEMA_22_MIRROR_CONTENT_HASH_DDL).toContain('mirror_content_hash');
+  db.exec(SCHEMA_21_DDL);
+  stampVersion(db, SCHEMA_21_VERSION, 'current_epoch_v21');
+}
+
+
 /** Schema-only known dual-marker legacy: published-18 + obsolete review_items. */
 function seedKnownLegacyReviewItems(db: Database.Database): void {
   expect(PUBLISHED_SCHEMA_18_DDL).not.toContain('review_items');
@@ -192,6 +206,11 @@ describe('release-oracle schema fingerprints', () => {
     expect(computeSchemaFingerprint(schema20).digest).toBe(schema20Fingerprint().digest);
     schema20.close();
 
+    const schema21 = new Database(':memory:');
+    seedSchema21(schema21);
+    expect(computeSchemaFingerprint(schema21).digest).toBe(schema21Fingerprint().digest);
+    schema21.close();
+
     const current = new Database(':memory:');
     initializeCurrentSchema(current);
     expect(computeSchemaFingerprint(current).digest).toBe(currentSchemaFingerprint().digest);
@@ -215,10 +234,10 @@ describe('release-oracle schema fingerprints', () => {
   });
 });
 
-describe('current schema epoch 21', () => {
-  it('initializes a fresh database at schema 21 with chat_turns and chapter processing_status', () => {
+describe('current schema epoch 22', () => {
+  it('initializes a fresh database at schema 22 with chat_turns and chapter processing_status', () => {
     const db = getDb();
-    expect(CURRENT_SCHEMA_VERSION).toBe(21);
+    expect(CURRENT_SCHEMA_VERSION).toBe(22);
     expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
     expect(tables(db)).toEqual([...CURRENT_SCHEMA_TABLES]);
     expect(db.prepare('SELECT COUNT(*) AS count FROM _schema_version').get()).toEqual({ count: 1 });
@@ -245,6 +264,11 @@ describe('current schema epoch 21', () => {
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'brainstorm_receipts'").get(),
     ).toEqual({ name: 'brainstorm_receipts' });
+    expect(
+      db.prepare('PRAGMA table_info(knowledge_index)').all() as Array<{ name: string }>,
+    ).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'mirror_content_hash' }),
+    ]));
   });
 
   it('opens a current-schema database without DDL and idempotently provisions seed rows', () => {
@@ -289,7 +313,7 @@ describe('current schema epoch 21', () => {
   });
 });
 
-describe('published schema 18 → 21', () => {
+describe('published schema 18 → 22', () => {
   it('migrates transactionally, preserves rows, and creates a verified backup', () => {
     const setup = new Database(dbPath());
     seedPublishedSchema18(setup);
@@ -362,7 +386,7 @@ describe('published schema 18 → 21', () => {
     db.close();
   });
 
-  it('warns and proceeds when pre-migration backup fails for additive 18→21', () => {
+  it('warns and proceeds when pre-migration backup fails for additive 18→22', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const db = new Database(':memory:');
     seedPublishedSchema18(db);
@@ -377,7 +401,7 @@ describe('published schema 18 → 21', () => {
   });
 });
 
-describe('mis-stamped schema 1 legacy-outbox → 21', () => {
+describe('mis-stamped schema 1 legacy-outbox → 22', () => {
   it('promotes with status backfill, preserves rows, and creates a verified backup', () => {
     const setup = new Database(dbPath());
     seedMisstampedLegacyOutbox(setup);
@@ -421,7 +445,7 @@ describe('mis-stamped schema 1 legacy-outbox → 21', () => {
 });
 
 
-describe('published schema 19 → 21', () => {
+describe('published schema 19 → 22', () => {
   it('adds processing_status, defaults existing rows to complete, and preserves chapter prose', () => {
     const setup = new Database(dbPath());
     seedPublishedSchema19(setup);
@@ -454,7 +478,7 @@ describe('published schema 19 → 21', () => {
   });
 });
 
-describe('schema 20 → 21', () => {
+describe('schema 20 → 22', () => {
   it('adds chat_turns, preserves chapter processing_status, and creates a verified backup', () => {
     const setup = new Database(dbPath());
     seedSchema20(setup);
@@ -493,7 +517,46 @@ describe('schema 20 → 21', () => {
   });
 });
 
-describe('known dual-marker review_items legacy → 21', () => {
+
+describe('schema 21 → 22', () => {
+  it('adds mirror_content_hash, preserves chat_turns, and creates a verified backup', () => {
+    const setup = new Database(dbPath());
+    seedSchema21(setup);
+    const now = new Date().toISOString();
+    setup.prepare(
+      `INSERT INTO users (id, email, created_at, updated_at) VALUES ('u1', 'u@test', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO novels (id, user_id, title, created_at, updated_at)
+       VALUES ('n1', 'u1', 'Schema21 Book', ?, ?)`,
+    ).run(now, now);
+    setup.prepare(
+      `INSERT INTO knowledge_index
+         (id, novel_id, type, path, title, tags, aliases, importance, data, outgoing_links, content_hash, updated_at)
+       VALUES ('e1', 'n1', 'character', 'characters/e1.md', 'Hero', '[]', '[]', NULL, '{}', '[]', 'abc', ?)`,
+    ).run(now);
+    setup.close();
+
+    const db = getDb();
+    expect(db.pragma('user_version', { simple: true })).toBe(CURRENT_SCHEMA_VERSION);
+    expect(
+      db.prepare('PRAGMA table_info(knowledge_index)').all() as Array<{ name: string }>,
+    ).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'mirror_content_hash' }),
+    ]));
+    expect(db.prepare('SELECT content_hash, mirror_content_hash FROM knowledge_index WHERE id = ?').get('e1')).toEqual({
+      content_hash: 'abc',
+      mirror_content_hash: null,
+    });
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'").get(),
+    ).toEqual({ name: 'chat_turns' });
+    const backups = readdirSync(dataDir).filter(name => name.includes('.pre-migration-v21-') && name.endsWith('.bak'));
+    expect(backups.length).toBe(1);
+  });
+});
+
+describe('known dual-marker review_items legacy → 22', () => {
   it('migrates an exact empty review_items legacy shape and preserves supported rows', () => {
     const setup = new Database(dbPath());
     seedKnownLegacyReviewItems(setup);

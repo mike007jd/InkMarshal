@@ -4,6 +4,7 @@ import { LEGACY_SCHEMA_1_DDL } from '@/lib/db/schema/frozen/legacy-schema-1.sql'
 import { PUBLISHED_SCHEMA_18_DDL } from '@/lib/db/schema/frozen/published-schema-18.sql';
 import { PUBLISHED_SCHEMA_19_DDL } from '@/lib/db/schema/frozen/published-schema-19.sql';
 import { SCHEMA_20_DDL } from '@/lib/db/schema/frozen/schema-20.sql';
+import { SCHEMA_21_DDL } from '@/lib/db/schema/frozen/schema-21.sql';
 import {
   CURRENT_SCHEMA_DESCRIPTION,
   CURRENT_SCHEMA_VERSION,
@@ -30,6 +31,8 @@ export const KNOWN_LEGACY_REVIEW_ITEMS_MARKERS = [
  * Schema 20 adds an explicit chapter `processing_status` lifecycle.
  * Schema 21 adds durable ordinary-chat turn receipts (`chat_turns`),
  * import confirmation receipts, and durable brainstorm undo receipts.
+ * Schema 22 adds `knowledge_index.mirror_content_hash` for conditional Vault
+ * replacement against the last observed Markdown bytes.
  */
 /** Exact published v0.1.0 / v0.1.1 schema marker. */
 export const PUBLISHED_SCHEMA_18_VERSION = 18;
@@ -39,6 +42,9 @@ export const PUBLISHED_SCHEMA_19_VERSION = 19;
 
 /** Exact schema-20 marker (processing_status present; no chat_turns). */
 export const SCHEMA_20_VERSION = 20;
+
+/** Exact schema-21 marker (chat_turns present; no mirror_content_hash). */
+export const SCHEMA_21_VERSION = 21;
 
 /**
  * Mis-stamped interim builds that already carry the pre-status-column outbox
@@ -215,6 +221,16 @@ CREATE INDEX IF NOT EXISTS idx_brainstorm_receipts_novel
   ON brainstorm_receipts(novel_id, created_at_ms DESC);
 `;
 
+/**
+ * Additive DDL for schema 21 → 22. Existing rows keep NULL mirror hashes
+ * (unknown baseline: refuse replacing divergent existing Markdown). Successful
+ * mirror I/O and matching imports populate the hash for later conditional replaces.
+ */
+export const SCHEMA_22_MIRROR_CONTENT_HASH_DDL = `
+ALTER TABLE knowledge_index
+  ADD COLUMN mirror_content_hash TEXT;
+`;
+
 export {
   currentSchemaSql,
   KNOWN_LEGACY_REVIEW_ITEMS_DDL,
@@ -222,4 +238,5 @@ export {
   PUBLISHED_SCHEMA_18_DDL,
   PUBLISHED_SCHEMA_19_DDL,
   SCHEMA_20_DDL,
+  SCHEMA_21_DDL,
 };

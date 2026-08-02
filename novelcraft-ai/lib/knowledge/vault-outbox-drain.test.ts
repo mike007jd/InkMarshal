@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const vaultSync = vi.hoisted(() => ({
-  sync: vi.fn<() => Promise<'written' | 'skipped_unbound' | 'skipped_missing_entry'>>(),
-  remove: vi.fn<() => Promise<'written' | 'skipped_unbound' | 'skipped_missing_entry'>>(),
+  sync: vi.fn<() => Promise<'written' | 'conflict' | 'skipped_unbound' | 'skipped_missing_entry' | 'skipped_stale_root'>>(),
+  remove: vi.fn<() => Promise<'written' | 'conflict' | 'skipped_unbound' | 'skipped_missing_entry' | 'skipped_stale_root'>>(),
 }));
 
 vi.mock('@/lib/vault/server-sync', () => ({

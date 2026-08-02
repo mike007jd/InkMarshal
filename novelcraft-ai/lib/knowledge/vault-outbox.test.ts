@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const vaultSync = vi.hoisted(() => ({
-  sync: vi.fn<() => Promise<'written' | 'skipped_unbound' | 'skipped_missing_entry'>>(),
-  remove: vi.fn<() => Promise<'written' | 'skipped_unbound' | 'skipped_missing_entry'>>(),
+  sync: vi.fn<() => Promise<'written' | 'conflict' | 'skipped_unbound' | 'skipped_missing_entry' | 'skipped_stale_root'>>(),
+  remove: vi.fn<() => Promise<'written' | 'conflict' | 'skipped_unbound' | 'skipped_missing_entry' | 'skipped_stale_root'>>(),
 }));
 
 vi.mock('@/lib/vault/server-sync', () => ({
@@ -116,6 +116,26 @@ describe('knowledge vault durable outbox', () => {
         { ...index, contentHash: 'updated', updatedAt: new Date(Date.parse(now) + 1_000).toISOString() },
       );
       await trySyncKnowledgeEntryToVault(novel.id, entryId, 'test.retry');
+      expect(await outboxRow(entryId)).toBeUndefined();
+    } finally {
+      await db.deleteNovelCascade(novel.id, 'vault-outbox-user');
+    }
+  });
+
+  it('keeps the exact upsert revision pending on conditional-write conflict', async () => {
+    const { db, novel, entryId } = await createIndexedEntry();
+    const { trySyncKnowledgeEntryToVault } = await import('@/lib/knowledge/apply-write');
+    try {
+      vaultSync.sync.mockResolvedValueOnce('conflict');
+      expect(await trySyncKnowledgeEntryToVault(novel.id, entryId, 'test.conflict')).toBe('conflict');
+      expect(await outboxRow(entryId)).toMatchObject({
+        operation: 'upsert',
+        status: 'pending',
+        attempt_count: 1,
+        last_error: expect.stringContaining('external edit since baseline'),
+      });
+      vaultSync.sync.mockResolvedValueOnce('written');
+      expect(await trySyncKnowledgeEntryToVault(novel.id, entryId, 'test.conflict.retry')).toBe('completed');
       expect(await outboxRow(entryId)).toBeUndefined();
     } finally {
       await db.deleteNovelCascade(novel.id, 'vault-outbox-user');
